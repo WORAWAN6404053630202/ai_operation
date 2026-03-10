@@ -16,11 +16,11 @@ Persona Supervisor (Hybrid Routing + FSM) — Option A (Supervisor owns ALL visi
    confirm/switch/intake lock > pending_slot > greeting/noise > legal routing
 
 ✅ NEW (this change request): Option A production-ready menu
-7) Make menu topics look like “หัวข้อ” more, by prioritizing metadata fields that correspond to:
+7) Make menu topics look like "หัวข้อ" more, by prioritizing metadata fields that correspond to:
    - ใบอนุญาต
    - การดำเนินการตามหน่วยงาน
    - หัวข้อการดำเนินการย่อย
-   and de-prioritizing pure “หน่วยงาน/department” labels unless needed as backfill.
+   and de-prioritizing pure "หน่วยงาน/department" labels unless needed as backfill.
 
 ✅ NEW (your latest request): "quality gate + level separation + safe fallback"
 - Quality gate:
@@ -43,7 +43,7 @@ Persona Supervisor (Hybrid Routing + FSM) — Option A (Supervisor owns ALL visi
 
 ✅ BUGFIX (this request):
 - pending_slot ที่เป็นตัวเลือก 2-5 ข้อ (เช่น location: กรุงเทพฯ/ต่างจังหวัด)
-  ต้อง “รับคำตอบแบบข้อความ” ได้ด้วย (เช่น "กทม", "กรุงเทพ", "ต่างจังหวัด", "จังหวัด")
+  ต้อง "รับคำตอบแบบข้อความ" ได้ด้วย (เช่น "กทม", "กรุงเทพ", "ต่างจังหวัด", "จังหวัด")
   โดย *ไม่ hardcode* — ใช้ LLM map user_text -> option ที่ใกล้ที่สุดแบบ deterministic (temp=0)
 """
 
@@ -198,7 +198,9 @@ class PersonaSupervisor:
     _ACADEMIC_RESUME_RE = re.compile(
         r"(ทั้งหมด|ขอทั้งหมด|ดูทั้งหมด|ส่วนที่เหลือ|ขอส่วนอื่น|อยากรู้ส่วนอื่น"
         r"|อยากรู้ต่อ|อยากดูต่อ|ขอต่อจากเดิม|อยากรู้เพิ่มเรื่องนี้|ยังอยากรู้"
-        r"|อยากได้ส่วน|อยากถามต่อ|ต้องการทราบเพิ่ม|ต้องการเพิ่มเติม)",
+        r"|อยากได้ส่วน|อยากถามต่อ|ต้องการทราบเพิ่ม|ต้องการเพิ่มเติม"
+        r"|กลับไปเรื่องเดิม|กลับไปเรื่องเก่า|เรื่องเก่า|ขอกลับไป|ต่อจากที่แล้ว"
+        r"|อยากรู้เพิ่มเกี่ยวกับ|ขอรายละเอียดเพิ่ม|ขอข้อมูลเพิ่มเติม)",
         re.IGNORECASE,
     )
     _NEW_TOPIC_RE = re.compile(
@@ -466,7 +468,7 @@ class PersonaSupervisor:
                 "ข้อกำหนดร่วม:\n"
                 "- 1 ประโยคสั้นๆ + ปิดท้ายด้วยคำถามสั้นๆ 1 ข้อ\n"
                 "- ห้ามใส่รายการหัวข้อ/เลขข้อ/เมนู\n"
-                "- ห้ามสั่ง user ว่า ‘เลือก/พิมพ์/กด’\n"
+                "- ห้ามสั่ง user ว่า 'เลือก/พิมพ์/กด'\n"
                 "- ต้องลงท้ายด้วย 'ครับ'\n"
                 "โทนตาม persona:\n"
                 "  - practical: ตรง กระชับ\n"
@@ -1000,7 +1002,11 @@ class PersonaSupervisor:
 
         low = raw.lower()
 
-        if re.search(r"(ทั้งหมด|all\b|ทุกข้อ|ทุกอย่าง)", low):
+        if re.search(r"(ทั้งหมด|เล่าทั้งหมด|ขอทั้งหมด|ทุกข้อ|ทุกอย่าง|all\b)", low):
+            # "ทั้งหมด" might be a literal named option — treat it as selecting that option
+            for opt in options:
+                if str(opt).strip() == "ทั้งหมด":
+                    return "ทั้งหมด", None
             if allow_multi and options:
                 return ", ".join([str(x).strip() for x in options if str(x).strip()]), None
             return None, "ตัวเลือกนี้ใช้ได้เฉพาะกรณีที่เลือกได้หลายข้อครับ"
@@ -1124,7 +1130,7 @@ class PersonaSupervisor:
             return state, msg
 
         if not mapped:
-            msg = self._normalize_male("กรุณาตอบเป็นตัวเลขตามตัวเลือกครับ")
+            msg = self._normalize_male("🙏 กรุณาตอบเป็นตัวเลขตามตัวเลือกครับ")
             self._add_assistant(state, msg)
             state.last_action = "pending_slot_invalid_reply"
             return state, msg
@@ -1146,8 +1152,8 @@ class PersonaSupervisor:
 
         state.context.pop("pending_slot", None)
 
-        # Pre-retrieve docs for topic slots so the LLM has documents when called
-        # with _internal=True (which skips the retrieval block inside persona.handle)
+        # Pre-retrieve docs so the LLM has documents when called with _internal=True
+        # (_internal=True skips the retrieval block inside persona.handle)
         if isinstance(pending, dict) and pending.get("key") == "topic" and mapped:
             try:
                 state.current_docs = self._practical._retrieve_docs(str(mapped))
@@ -1156,6 +1162,36 @@ class PersonaSupervisor:
             except Exception as e:
                 _LOG.warning("[Supervisor] pre-retrieve failed for topic=%r: %s", str(mapped)[:40], e)
                 state.current_docs = []
+
+        elif isinstance(pending, dict) and pending.get("key") and mapped and (
+            "นิติบุคคล" in str(mapped) or "บุคคลธรรมดา" in str(mapped)
+        ):
+            # Entity-type slot: normalize to clean value (handles verbose options like "นิติบุคคล (บริษัท / ห้างหุ้นส่วน)")
+            _raw = str(mapped).strip()
+            slot_val = "นิติบุคคล" if "นิติบุคคล" in _raw else "บุคคลธรรมดา"
+            base_q = (
+                getattr(state, "last_retrieval_query", None)
+                or (state.context or {}).get("last_retrieval_query")
+                or (state.context or {}).get("last_user_legal_query")
+                or ""
+            ).strip()
+            enriched_q = f"{base_q} {slot_val}" if base_q else slot_val
+            entity_filter = {"entity_type_normalized": slot_val}
+            try:
+                state.current_docs = self._practical._retrieve_docs(enriched_q, metadata_filter=entity_filter)
+                state.last_retrieval_query = enriched_q
+                _LOG.info("[Supervisor] pre-retrieved %d docs for entity_type=%r query=%r", len(state.current_docs), slot_val, enriched_q[:60])
+            except Exception as e:
+                _LOG.warning("[Supervisor] pre-retrieve failed for entity_type=%r: %s", slot_val, e)
+                state.current_docs = []
+
+            # Answer directly — no Phase 3 section menu in Practical mode
+            topic_label = str((state.context or {}).get("last_topic") or "").strip()
+            query = f"{topic_label} {slot_val}".strip() if topic_label else (base_q or slot_val)
+            st2, reply = self._practical.handle(state, query, _internal=True)
+            reply = self._normalize_male(reply)
+            self._add_assistant(st2, reply)
+            return st2, reply
 
         pid = normalize_persona_id(state.persona_id)
         if pid == "academic":
@@ -1175,40 +1211,9 @@ class PersonaSupervisor:
     # --------------------------
     def _build_auto_return_followup(self, state: ConversationState) -> str:
         ctx = state.context or {}
-        topic_hint = str(ctx.get("auto_return_topic_context") or "").strip()
-
-        orig_hint = ctx.get("last_user_legal_query")
-        if topic_hint:
-            ctx["last_user_legal_query"] = topic_hint
-            state.context = ctx
-
-        try:
-            topics = self._compose_menu_topics(state, size=self._MENU_SIZE)
-        except Exception:
-            topics = []
-
-        if topic_hint:
-            if orig_hint is not None:
-                ctx["last_user_legal_query"] = orig_hint
-            else:
-                ctx.pop("last_user_legal_query", None)
-            state.context = ctx
-
-        if not topics:
-            return ""
-
-        lines = ["กลับมาโหมด Practical แล้วครับ มีเรื่องอื่นที่อยากสอบถามไหมครับ"]
-        for i, topic in enumerate(topics, 1):
-            lines.append(f"{i}) {topic}")
-        lines.append("หรือพิมพ์คำถามได้เลยครับ")
-
-        state.context["pending_slot"] = {"key": "topic", "options": topics, "allow_multi": False}
-        state.context["main_menu_shown"] = True
-        state.context["last_menu_topics"] = topics
         ctx.pop("auto_return_topic_context", None)
-
-        _LOG.info("[Supervisor] auto_return_followup topics=%d hint=%r", len(topics), topic_hint[:40] if topic_hint else "")
-        return "\n".join(lines)
+        state.context = ctx
+        return "ถ้ามีอะไรสงสัยเพิ่มหรืออยากถามเรื่องอื่น บอกผมได้เลยครับ 😊"
 
     def _post_route_academic_auto_return(self, state: ConversationState, reply: str) -> Tuple[ConversationState, str]:
         ctx = state.context or {}
@@ -1762,15 +1767,91 @@ class PersonaSupervisor:
 
         if not prefix:
             if include_intro:
-                prefix = "สวัสดีครับ ผมคือ Restbiz ผู้ช่วยเรื่องกฎหมาย ใบอนุญาต และภาษีสำหรับร้านอาหารครับ อยากให้ช่วยเรื่องไหนครับ"
+                prefix = "👋 สวัสดีครับ! ผม 'น้องสุดยอด Consult Restbiz' ยินดีให้บริการครับ!"
             else:
                 prefix = "ตอนนี้อยากให้ช่วยเรื่องไหนครับ"
 
         prefix = re.sub(r"\s+", " ", prefix).strip()
         return self._normalize_male(prefix)
 
+    def _generate_topic_descriptions(self, topics: List[str]) -> List[str]:
+        """Retrieve real docs for each topic, then summarize into a 1-sentence description."""
+        if not topics:
+            return []
+
+        # Step 1: Retrieve real documents for each topic from vector store
+        topic_contexts: List[str] = []
+        for t in topics:
+            try:
+                docs = self.retriever.invoke(t)[:2]
+                content = "\n".join(d.page_content[:150] for d in docs if d.page_content)
+                _LOG.info(f"[topic_desc] '{t}' → {len(docs)} docs retrieved")
+                topic_contexts.append(content)
+            except Exception:
+                _LOG.warning(f"[topic_desc] retrieval failed for '{t}'", exc_info=True)
+                topic_contexts.append("")
+
+        # Step 2: Build context block from real docs
+        context_block = ""
+        for i, (t, ctx) in enumerate(zip(topics, topic_contexts)):
+            if ctx:
+                context_block += f"=== หัวข้อ {i+1}: {t} ===\n{ctx}\n\n"
+
+        if not context_block.strip():
+            return [f"ผมจะแนะนำ{t} ตั้งแต่ต้นจนจบ พร้อมเอกสารที่ต้องใช้ ให้คุณทำตามได้ง่ายที่สุดครับ" for t in topics]
+
+        # Step 3: LLM summarizes from real doc content
+        topic_model = getattr(conf, "OPENROUTER_MODEL_TOPIC_PICKER", getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL))
+        timeout = int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8))
+        llm = ChatOpenAI(
+            model=topic_model,
+            openai_api_key=conf.OPENROUTER_API_KEY,
+            openai_api_base=conf.OPENROUTER_BASE_URL,
+            temperature=0.3,
+            max_tokens=600,
+            request_timeout=timeout,
+            model_kwargs={"response_format": {"type": "json_object"}},
+        )
+        topic_list = "\n".join([f"{i+1}. {t}" for i, t in enumerate(topics)])
+        prompt = (
+            "คุณคือ AI ที่ปรึกษาร้านอาหาร สร้างคำอธิบายสั้น 1 ประโยค (ไม่เกิน 20 คำ) สำหรับแต่ละหัวข้อ\n"
+            "โทน: บอกจากมุมบอทว่า ผมจะแนะนำ/สอน/บอกอะไรคุณได้บ้างในหัวข้อนี้\n"
+            "สำคัญ: ใช้เฉพาะข้อมูลที่มีอยู่ในเอกสารด้านล่าง ห้ามสร้างข้อมูลที่ไม่มี\n"
+            "ห้ามขึ้นต้นด้วย 'ถ้าเลือกหัวข้อนี้' หรือ 'ผมจด' หรือ 'ผมทำ'\n\n"
+            f"หัวข้อ:\n{topic_list}\n\n"
+            f"เอกสารอ้างอิง:\n{context_block}"
+            'ตอบ JSON เท่านั้น รูปแบบ: {"descriptions": ["คำอธิบาย1", "คำอธิบาย2"]}'
+        )
+        try:
+            resp = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/topic_desc")
+            text = self._strip_code_fences(resp.content.strip())
+            obj = json.loads(text)
+            descs = obj.get("descriptions") if isinstance(obj, dict) else obj
+            if isinstance(descs, list) and descs:
+                return [str(d).strip() for d in descs[:len(topics)]]
+        except Exception:
+            _LOG.warning("_generate_topic_descriptions failed, using fallback", exc_info=True)
+        return [f"ผมจะแนะนำ{t} ตั้งแต่ต้นจนจบ พร้อมเอกสารที่ต้องใช้ ให้คุณทำตามได้ง่ายที่สุดครับ" for t in topics]
+
     def _render_greeting_with_menu(self, state: ConversationState, kind: str, menu_topics: List[str], include_intro: bool) -> str:
-        prefix = self._get_prefix_llm(kind, state, include_intro=include_intro)
+        if include_intro:
+            intro = (
+                "👋 สวัสดีครับ! ผม \"น้องสุดยอด Consult Restbiz\" ยินดีให้บริการครับ!\n"
+                "น้องสุดยอดพร้อมเป็นที่ปรึกษาเรื่องการจัดการร้านอาหาร การจดเอกสารขอใบอนุญาติ ที่จำเป็นสำหรับร้านอาหาร\n"
+                "💡 อยากให้น้องสุดยอดช่วยอะไรครับ?"
+            )
+            _EMOJI_NUM = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+            selected = (menu_topics or [])[:2]
+            descs = (state.context or {}).get("last_menu_topic_descs") or []
+            topic_lines = []
+            for i, t in enumerate(selected):
+                num = _EMOJI_NUM[i] if i < len(_EMOJI_NUM) else f"{i+1}."
+                desc = descs[i] if i < len(descs) else f"ผมจะแนะนำ{t} ตั้งแต่ต้นจนจบ พร้อมเอกสารที่ต้องใช้ ให้คุณทำตามได้ง่ายที่สุดครับ"
+                topic_lines.append(f"{num} {t} - {desc}")
+            footer = "พิมพ์ตัวเลข หรือบอกผมได้เลยว่าต้องการข้อมูลใบอนุญาติ หรือ ทริคการจัดการร้านอาหารด้านใดสำหรับร้านของคุณครับ 😊"
+            msg = intro + "\n" + "\n".join(topic_lines) + "\n" + footer
+            return self._normalize_male(msg)
+        prefix = self._get_prefix_llm(kind, state, include_intro=False)
         menu = self._format_numbered_options(menu_topics, max_items=9)
         msg = (prefix.rstrip() + "\n" + menu).strip()
         return self._normalize_male(msg)
@@ -1792,10 +1873,12 @@ class PersonaSupervisor:
         include_intro = turns == 0
 
         topics = self._compose_menu_topics(state, size=self._MENU_SIZE)
+        topic_descs = self._generate_topic_descriptions(topics[:2])
 
         state.context["pending_slot"] = {"key": "topic", "options": topics, "allow_multi": False}
         state.context["main_menu_shown"] = True
         state.context["last_menu_topics"] = topics
+        state.context["last_menu_topic_descs"] = topic_descs
 
         msg = self._render_greeting_with_menu(state, kind=kind, menu_topics=topics, include_intro=include_intro)
         self._add_assistant(state, msg)
@@ -1834,10 +1917,28 @@ class PersonaSupervisor:
         current = normalize_persona_id(state.persona_id)
         target = normalize_persona_id(target_pid)
 
-        msg = self._normalize_male(f"ตอนนี้อยู่โหมด {current} ครับ ต้องการเปลี่ยนไปโหมด {target} ใช่ไหมครับ")
+        msg = self._normalize_male(f"🔄 ตอนนี้อยู่โหมด {current} ครับ ต้องการเปลี่ยนไปโหมด {target} ใช่ไหมครับ")
         self._add_assistant(state, msg)
         state.last_action = "persona_switch_confirm"
         return state, msg
+
+    def _silent_switch_to_academic(self, state: ConversationState, user_input: str) -> Tuple[ConversationState, str]:
+        """Switch to academic silently (no announcement), answer, then auto-return to practical."""
+        self._mark_auto_return_if_practical_to_academic(state, "academic")
+        state.persona_id = "academic"
+        state.context["persona_id"] = "academic"
+        state.last_action = "academic_auto_switch"
+        # Use user_input if it looks like a legal question; else replay last known topic
+        ctx = state.context or {}
+        if self._looks_like_legal_question(user_input):
+            replay = user_input
+        else:
+            replay = ctx.get("last_user_legal_query", "").strip() or ctx.get("last_topic", "").strip() or user_input
+        st2, reply = self._academic.handle(state, replay, _internal=False)
+        st2, reply = self._post_route_academic_auto_return(st2, reply)
+        reply = self._normalize_male(reply)
+        self._add_assistant(st2, reply)
+        return st2, reply
 
     def _propose_toggle_switch(self, state: ConversationState, reason: str, replay_user_input: str = "") -> Tuple[ConversationState, str]:
         cur = normalize_persona_id(state.persona_id)
@@ -1852,7 +1953,7 @@ class PersonaSupervisor:
 
         if cur == target2:
             other = self._other_persona(cur)
-            msg = self._normalize_male(f"ตอนนี้อยู่โหมด {cur} อยู่แล้วครับ ต้องการสลับไปโหมด {other} ไหมครับ")
+            msg = self._normalize_male(f"🔄 ตอนนี้อยู่โหมด {cur} อยู่แล้วครับ ต้องการสลับไปโหมด {other} ไหมครับ")
             self._add_assistant(state, msg)
             state.last_action = "persona_already_in_mode"
             state.context = state.context or {}
@@ -1943,81 +2044,12 @@ class PersonaSupervisor:
             st2.last_action = "academic_intake_route"
             return st2, reply
 
-        # 2.2) awaiting persona confirmation
+        # 2.2) Clear legacy awaiting_persona_confirmation state (confirmation dialog removed)
         if state.context.get("awaiting_persona_confirmation"):
-            if not raw_stripped:
-                msg = self._normalize_male("ขอคำตอบยืนยันอีกครั้งได้ไหมครับ")
-                self._add_assistant(state, msg)
-                state.last_action = "persona_switch_confirm_unclear"
-                return state, msg
-
-            det = self._classify_yes_no_det(raw_stripped)
-
-            yes = bool(det.get("yes"))
-            no = bool(det.get("no"))
-            confv = float(det.get("confidence", 0.0) or 0.0)
-
-            if (not yes and not no) or confv < 0.55:
-                llm_res: Dict[str, Any] = {}
-                try:
-                    llm_res = self.llm_confirm_call(raw_stripped) or {}
-                except Exception:
-                    llm_res = {}
-
-                try:
-                    llm_conf = float(llm_res.get("confidence", 0.0) or 0.0)
-                except Exception:
-                    llm_conf = 0.0
-
-                if llm_conf >= 0.55:
-                    yes = bool(llm_res.get("yes", False))
-                    no = bool(llm_res.get("no", False))
-
-            if yes and not no:
-                target = normalize_persona_id(state.context.get("pending_persona") or "practical")
-
-                state.persona_id = target
-                state.context["persona_id"] = target
-
-                state.context.pop("awaiting_persona_confirmation", None)
-                state.context.pop("pending_persona", None)
-                replay = str(state.context.pop("pending_replay_user_input", "") or "").strip()
-
-                msg = self._normalize_male(f"ตอนนี้เป็นโหมด {target} แล้วครับ")
-                self._add_assistant(state, msg)
-                state.last_action = "persona_switched"
-
-                # Only replay original input if it was a legal/content question —
-                # NOT a switch trigger (e.g. "ไปบอทอีกตัว") to prevent infinite switch loop.
-                if replay and self._looks_like_legal_question(replay) and not self._looks_like_switch_without_target(replay):
-                    st2, reply2 = self._handle_inner(state, replay)
-                    return st2, reply2
-
-                # When switching to Academic with no replay, auto-continue with last legal topic
-                if target == "academic" and not replay:
-                    ctx_now = state.context or {}
-                    last_q = ctx_now.get("last_user_legal_query", "").strip() or ctx_now.get("last_topic", "").strip()
-                    if last_q:
-                        _LOG.info("[Supervisor] academic_switch auto-replay last_q=%r", last_q[:40])
-                        st2, reply2 = self._handle_inner(state, last_q)
-                        return st2, msg + "\n\n" + reply2
-
-                return state, msg
-
-            if no and not yes:
-                state.context.pop("awaiting_persona_confirmation", None)
-                state.context.pop("pending_persona", None)
-                state.context.pop("pending_replay_user_input", None)
-
-                msg = self._normalize_male("โอเคครับ ไม่เปลี่ยนโหมด")
-                self._add_assistant(state, msg)
-                state.last_action = "persona_switch_cancelled"
-                return state, msg
-
-            msg = self._normalize_male("ยังไม่ชัดครับ ตอบ “ใช่/ไม่” (หรือ 1/2) ได้ไหมครับ")
-            self._add_assistant(state, msg)
-            state.last_action = "persona_switch_confirm_unclear"
-            return state, msg
+            state.context.pop("awaiting_persona_confirmation", None)
+            state.context.pop("pending_persona", None)
+            state.context.pop("pending_replay_user_input", None)
+            state.context.pop("confirm_tries", None)
 
         # 2.2b) Academic resume: user wants to continue a previous academic session (remaining sections)
         # Triggered only when academic_resume_available=True (set after auto-return) AND input matches
@@ -2039,35 +2071,25 @@ class PersonaSupervisor:
             st2.last_action = "academic_resume"
             return st2, reply
 
-        # 2.3) style request -> propose switch
+        # 2.3) style request -> silent switch (no confirmation dialog)
         style = self._infer_user_style_request_hybrid(raw_stripped)
-        if style.get("wants_long") or style.get("wants_short"):
-            target = "academic" if style.get("wants_long") else "practical"
-            replay = raw_stripped if self._looks_like_legal_question(raw_stripped) else ""
-            return self._propose_switch_to_target(
-                state,
-                target=target,
-                reason=f"style:{style.get('method','unknown')}",
-                replay_user_input=replay,
-            )
+        if style.get("wants_long"):
+            return self._silent_switch_to_academic(state, raw_stripped)
+        # wants_short: just continue to practical routing below (no-op if already practical)
 
-        # 2.4) explicit target in text + switch verb -> propose switch
+        # 2.4) explicit target in text + switch verb -> silent switch
         explicit_target = self._infer_target_persona_from_text(raw_stripped)
         if explicit_target in {"academic", "practical"} and any(v in self._normalize_for_intent(raw_stripped) for v in self._SWITCH_VERBS):
-            return self._propose_switch_to_target(
-                state,
-                target=explicit_target,
-                reason="explicit_target",
-                replay_user_input=raw_stripped,
-            )
+            if explicit_target == "academic":
+                return self._silent_switch_to_academic(state, raw_stripped)
+            # explicit_target == "practical": already in practical, continue routing
 
-        # 2.5) switch without target -> propose toggle
+        # 2.5) switch without target -> silent switch to academic (toggle)
         if self._looks_like_switch_without_target(raw_stripped):
-            return self._propose_toggle_switch(
-                state,
-                reason="switch_without_target",
-                replay_user_input=raw_stripped,
-            )
+            cur = normalize_persona_id(state.persona_id)
+            if cur != "academic":
+                return self._silent_switch_to_academic(state, raw_stripped)
+            # Already in academic but intake not active (section 2.1 would've caught that) → ignore
 
         # 2.5.5) Number typed but no pending_slot → try to recover from last_topic_menu
         if not self._has_pending_slot(state) and self._LIKELY_SELECTION_RE.match(raw_stripped):
@@ -2095,7 +2117,7 @@ class PersonaSupervisor:
         # 2.8) mode status
         if self._looks_like_mode_status_query(raw_stripped):
             pid = normalize_persona_id(state.persona_id)
-            msg = self._normalize_male(f"ตอนนี้เป็นโหมด {pid} ครับ")
+            msg = self._normalize_male(f"ℹ️ ตอนนี้เป็นโหมด {pid} ครับ")
             self._add_assistant(state, msg)
             state.last_action = "mode_status"
             return state, msg

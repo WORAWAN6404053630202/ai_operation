@@ -18,7 +18,7 @@ RUN uv pip install --system --no-cache .
 
 ENV PYTHONPATH=/app/code
 
-CMD ["python", "-m", "uvicorn", "main:app", "--host=0.0.0.0", "--port=3000", "--reload"]
+CMD ["python", "-m", "uvicorn", "app:app", "--host=0.0.0.0", "--port=3000", "--reload"]
 
 
 FROM python:3.9-slim AS staging
@@ -41,7 +41,7 @@ RUN uv pip install --system --no-cache .
 
 ENV PYTHONPATH=/app/code
 
-CMD ["python", "-m", "uvicorn", "main:app", "--host=0.0.0.0", "--port=3000", "--reload"]
+CMD ["python", "-m", "uvicorn", "app:app", "--host=0.0.0.0", "--port=3000", "--reload"]
 
 
 FROM python:3.9-slim AS prod
@@ -64,4 +64,4 @@ RUN uv pip install --system --no-cache .
 
 ENV PYTHONPATH=/app/code
 
-CMD ["python", "-m", "uvicorn", "main:app", "--host=0.0.0.0", "--port=3000"]
+CMD ["python", "-m", "uvicorn", "app:app", "--host=0.0.0.0", "--port=3000"]

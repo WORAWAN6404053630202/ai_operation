@@ -227,6 +227,7 @@ class AcademicPersonaService:
         """
         P0: Retrieve only here (once), store academic_question, set last_retrieval_query.
         FIX: use conf.DEFAULT_RETRIEVAL_FALLBACK_QUERY as single source of truth for fallback.
+        Reuse state.current_docs when already populated by supervisor entity-type filter.
         """
         q = (user_question or "").strip()
         if not q:
@@ -234,9 +235,25 @@ class AcademicPersonaService:
                         "กฎหมายร้านอาหาร ใบอนุญาต ภาษี VAT จดทะเบียน สุขาภิบาล ประกันสังคม")
 
         state.context = state.context or {}
+
+        # Enrich query with entity type if already known (from practical slot memory)
+        if hasattr(state, "get_collected_slots"):
+            slots = state.get_collected_slots() or {}
+            for v in slots.values():
+                sv = str(v).strip()
+                if any(kw in sv for kw in ("นิติบุคคล", "บุคคลธรรมดา")):
+                    if sv not in q:
+                        q = f"{q} {sv}"
+                    break
+
         state.context["academic_question"] = q
 
-        state.current_docs = self._retrieve_docs(q)
+        # Reuse pre-retrieved docs from supervisor (e.g. entity-type filtered) if already populated.
+        # Only retrieve fresh when state.current_docs is empty or too few.
+        if len(state.current_docs or []) >= 2:
+            _LOG.info("[Academic] Reusing %d pre-retrieved docs from supervisor", len(state.current_docs))
+        else:
+            state.current_docs = self._retrieve_docs(q)
 
         if hasattr(state, "set_last_retrieval_query"):
             state.set_last_retrieval_query(q, cache_to_context=True)

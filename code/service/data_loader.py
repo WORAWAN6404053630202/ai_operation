@@ -279,6 +279,32 @@ class DataLoader:
             return None
         return self.to_json_safe(row.get(col_name))
 
+    @staticmethod
+    def _normalize_entity_type(registration_type: Optional[str]) -> Optional[str]:
+        """Map raw registration_type values to normalized category (บุคคลธรรมดา / นิติบุคคล)."""
+        if not registration_type:
+            return None
+        t = registration_type.strip()
+        _JURISTIC = {
+            "นิติบุคคล", "บริษัท", "บริษัทจำกัด", "บริษัทมหาชน", "บริษัทมหาชนจำกัด",
+            "ห้างหุ้นส่วน", "ห้างหุ้นส่วนจำกัด", "ห้างหุ้นส่วนสามัญ",
+            "ห้างหุ้นส่วนสามัญนิติบุคคล",
+        }
+        _INDIVIDUAL = {
+            "บุคคลธรรมดา", "บุคคลธรรมดา (คนเดียว)", "บุคคลธรรมดา กิจการเจ้าของคนเดียว",
+            "ประเภทบุคคลธรรมดา",
+        }
+        if t in _JURISTIC:
+            return "นิติบุคคล"
+        if t in _INDIVIDUAL:
+            return "บุคคลธรรมดา"
+        # Fuzzy: contains keyword
+        if any(kw in t for kw in ("บริษัท", "ห้างหุ้นส่วน", "นิติบุคคล")):
+            return "นิติบุคคล"
+        if "บุคคลธรรมดา" in t:
+            return "บุคคลธรรมดา"
+        return None
+
     # -----------------------------
     # RAG: content shaping (NEW)
     # -----------------------------
@@ -298,6 +324,7 @@ class DataLoader:
                 f"ใบอนุญาต: {md.get('license_type')}" if md.get("license_type") else "",
                 f"หัวข้อ: {md.get('operation_topic')}" if md.get("operation_topic") else "",
                 f"ประเภทการจดทะเบียน: {md.get('registration_type')}" if md.get("registration_type") else "",
+                f"ประเภทผู้ประกอบการ: {md.get('entity_type_normalized')}" if md.get("entity_type_normalized") else "",
             ]
         )
 
@@ -337,13 +364,15 @@ class DataLoader:
             if dept:
                 self.departments_found.add(dept)
 
+            reg_type = self._get_row_value(row, colmap.get("registration_type"))
             metadata = {
                 "row_id": int(idx),
                 "department": self._get_row_value(row, colmap.get("department")),
                 "license_type": self._get_row_value(row, colmap.get("license_type")),
                 "operation_by_department": self._get_row_value(row, colmap.get("operation_by_department")),
                 "operation_topic": self._get_row_value(row, colmap.get("operation_topic")),
-                "registration_type": self._get_row_value(row, colmap.get("registration_type")),
+                "registration_type": reg_type,
+                "entity_type_normalized": self._normalize_entity_type(reg_type),
                 "terms_and_conditions": self._get_row_value(row, colmap.get("terms_and_conditions")),
                 "service_channel": self._get_row_value(row, colmap.get("service_channel")),
                 "operation_steps": self._get_row_value(row, colmap.get("operation_steps")),

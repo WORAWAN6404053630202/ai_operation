@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RESTBIZ</title>
+  <link rel="icon" href="https://supercoconut.co/wp-content/uploads/2025/04/cropped-Untitled-design-18.png" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="sidebar-top">
+        <button id="newChatBtn" class="new-chat-btn">+ New chat</button>
+
+        <div class="bot-picker">
+          <label for="botSelect">Bot</label>
+          <select id="botSelect">
+            <option value="practical">Practical Bot</option>
+            <option value="academic">Academic Bot</option>
+          </select>
+        </div>
+
+        <div class="retention-box">
+          Session จะเก็บไว้ 7 วัน แล้วลบอัตโนมัติ
+        </div>
+      </div>
+
+      <div class="session-header">Recent chats</div>
+      <div id="sessionList" class="session-list"></div>
+
+      <div class="sidebar-bottom">
+        <button id="healthBtn" class="side-btn">Healthcheck</button>
+        <button id="deleteSessionBtn" class="side-btn danger">Delete current chat</button>
+      </div>
+    </aside>
+
+    <main class="main-panel">
+      <header class="topbar">
+        <div class="topbar-left">
+          <img
+            class="brand-icon"
+            src="https://supercoconut.co/wp-content/uploads/2025/04/cropped-Untitled-design-18.png"
+            alt="logo"
+          />
+          <div>
+            <div class="brand-title">RESTBIZ</div>
+            <div class="brand-subtitle">ผู้ช่วยด้านกฎหมาย สำหรับธุรกิจร้านอาหาร</div>
+          </div>
+        </div>
+        <div class="session-badge" id="sessionBadge">No session</div>
+      </header>
+
+      <section id="welcomePanel" class="welcome-panel">
+        <h1>How can I help you today?</h1>
+        <p>เลือกหัวข้อ หรือพิมพ์คำถามได้เลย</p>
+        <div id="topicCards" class="topic-cards"></div>
+      </section>
+
+      <section id="chatMessages" class="chat-messages"></section>
+
+      <footer class="composer-wrap">
+        <div class="composer">
+          <textarea
+            id="messageInput"
+            placeholder="Message RESTBIZ..."
+            rows="1"
+          ></textarea>
+          <button id="sendBtn" class="send-btn">↑</button>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

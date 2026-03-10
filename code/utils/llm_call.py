@@ -74,9 +74,11 @@ def llm_invoke(
             session_total = getattr(state, "total_tokens", 0)
             if session_total > _TOKEN_WARN_THRESHOLD:
                 log.warning(
-                    "[%s] Session token budget exceeded %d (total=%d)",
+                    "[%s] Session token budget exceeded %d (total=%d) — trimming history",
                     label, _TOKEN_WARN_THRESHOLD, session_total,
                 )
+                if hasattr(state, "trim_messages"):
+                    state.trim_messages(keep_last=8)
         except Exception:
             pass
 

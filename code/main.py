@@ -1,4 +1,4 @@
-# code/main.py
+#/Users/w.worawan/Downloads/ai-operation-microservice3_v2ori/code/main.py
 """
 Local entrypoint for running PersonaSupervisor in CLI mode
 

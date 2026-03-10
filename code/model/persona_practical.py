@@ -275,10 +275,11 @@ class PracticalPersonaService:
         if "?" in t or "？" in t:
             t = re.split(r"[?？]", t, maxsplit=1)[0].strip()
 
-        if not t.endswith("ครับ"):
+        # Strip trailing emoji/spaces before checking ending (avoids "ครับ 😊ครับ")
+        t_check = re.sub(r"[\U0001F300-\U0001FFFF\U00002600-\U000027BF\s]+$", "", t).strip()
+        if not t_check.endswith("ครับ"):
             last_line = (t.split("\n")[-1] if "\n" in t else t).strip()
             if re.search(r"[a-zA-Z0-9/._\-]$", last_line):
-                # Ends with URL/path/non-Thai — add ครับ on separate line to avoid appending to URL
                 t = t + "\nครับ"
             else:
                 t = t.rstrip(" .") + "ครับ"
@@ -837,11 +838,26 @@ class PracticalPersonaService:
             "execution": {"question": "อยากให้ช่วยเรื่องไหนเกี่ยวกับร้านอาหารครับ?", "context_update": {}},
         }
 
-    def _retrieve_docs(self, query: str) -> List[Dict[str, Any]]:
-        docs = self.retriever.invoke(query)
-        results: List[Dict[str, Any]] = []
+    def _retrieve_docs(self, query: str, metadata_filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         max_docs = getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 8)
         max_chars = getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 250)
+
+        if metadata_filter:
+            vectorstore = getattr(self.retriever, "vectorstore", None)
+            if vectorstore is not None:
+                try:
+                    tmp = vectorstore.as_retriever(search_kwargs={"k": max_docs, "filter": metadata_filter})
+                    docs = tmp.invoke(query)
+                    _LOG.info("[Practical] Filtered retrieval (filter=%s) got %d docs", metadata_filter, len(docs))
+                except Exception as e:
+                    _LOG.warning("[Practical] Filtered retrieval failed (%s), falling back", e)
+                    docs = self.retriever.invoke(query)
+            else:
+                docs = self.retriever.invoke(query)
+        else:
+            docs = self.retriever.invoke(query)
+
+        results: List[Dict[str, Any]] = []
         for d in docs[:max_docs]:
             results.append(
                 {"content": (getattr(d, "page_content", "") or "")[:max_chars], "metadata": getattr(d, "metadata", {}) or {}}

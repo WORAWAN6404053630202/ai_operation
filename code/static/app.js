@@ -1,0 +1,300 @@
+let sessionId = "";
+let currentPersona = "practical";
+
+const chatMessages = document.getElementById("chatMessages");
+const messageInput = document.getElementById("messageInput");
+const sendBtn = document.getElementById("sendBtn");
+const newChatBtn = document.getElementById("newChatBtn");
+const healthBtn = document.getElementById("healthBtn");
+const deleteSessionBtn = document.getElementById("deleteSessionBtn");
+const sessionList = document.getElementById("sessionList");
+const topicCards = document.getElementById("topicCards");
+const welcomePanel = document.getElementById("welcomePanel");
+const sessionBadge = document.getElementById("sessionBadge");
+const botSelect = document.getElementById("botSelect");
+
+function escapeHtml(text) {
+  return (text || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function formatTimeLabel(unixSeconds) {
+  if (!unixSeconds) return "";
+  const date = new Date(unixSeconds * 1000);
+  return date.toLocaleString("th-TH", {
+    dateStyle: "short",
+    timeStyle: "short",
+  });
+}
+
+function autoResizeTextarea() {
+  messageInput.style.height = "24px";
+  messageInput.style.height = Math.min(messageInput.scrollHeight, 220) + "px";
+}
+
+function setSessionBadge() {
+  sessionBadge.textContent = sessionId ? `${sessionId} • ${currentPersona}` : "No session";
+}
+
+function clearMessages() {
+  chatMessages.innerHTML = "";
+}
+
+function scrollToBottom() {
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function hideWelcome() {
+  welcomePanel.style.display = "none";
+}
+
+function showWelcome() {
+  welcomePanel.style.display = "";
+}
+
+function renderMessage(role, content) {
+  hideWelcome();
+
+  const row = document.createElement("div");
+  row.className = "message-row";
+
+  let avatarHtml = "";
+  let roleLabel = "";
+
+  if (role === "assistant") {
+    avatarHtml = `<img class="message-avatar" src="https://supercoconut.co/wp-content/uploads/2025/04/cropped-Untitled-design-18.png" alt="bot" />`;
+    roleLabel = "RESTBIZ";
+  } else {
+    avatarHtml = `<div class="message-avatar user-avatar">Y</div>`;
+    roleLabel = "You";
+  }
+
+  row.innerHTML = `
+    ${avatarHtml}
+    <div class="message-content">
+      <div class="message-role">${roleLabel}</div>
+      <div class="message-text">${escapeHtml(content).replace(/\n/g, "<br>")}</div>
+    </div>
+  `;
+
+  chatMessages.appendChild(row);
+  scrollToBottom();
+}
+
+function renderTopicCards(topics = []) {
+  topicCards.innerHTML = "";
+
+  topics.forEach((topic) => {
+    const btn = document.createElement("button");
+    btn.className = "topic-card";
+    btn.type = "button";
+    btn.innerHTML = `
+      <div class="topic-title">${escapeHtml(topic.title || "-")}</div>
+      <div class="topic-desc">${escapeHtml(topic.description || "")}</div>
+    `;
+    btn.addEventListener("click", () => {
+      messageInput.value = topic.title || "";
+      autoResizeTextarea();
+      sendMessage();
+    });
+    topicCards.appendChild(btn);
+  });
+}
+
+function renderSessionList(items = []) {
+  sessionList.innerHTML = "";
+
+  items.forEach((item) => {
+    const btn = document.createElement("button");
+    btn.className = "session-item";
+    if (item.session_id === sessionId) {
+      btn.classList.add("active");
+    }
+
+    btn.innerHTML = `
+      <div class="session-item-title">${escapeHtml(item.preview || item.session_id)}</div>
+      <div class="session-item-meta">${escapeHtml(item.persona_id || "")} • ${escapeHtml(formatTimeLabel(item.updated_at))}</div>
+    `;
+
+    btn.addEventListener("click", () => {
+      loadSession(item.session_id);
+    });
+
+    sessionList.appendChild(btn);
+  });
+}
+
+async function apiGet(url) {
+  const response = await fetch(url);
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.detail || `HTTP ${response.status}`);
+  }
+  return data;
+}
+
+async function apiPost(url, payload = {}) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.detail || `HTTP ${response.status}`);
+  }
+  return data;
+}
+
+async function refreshSessions() {
+  try {
+    const data = await apiGet("/api/v1/sessions");
+    renderSessionList(data.sessions || []);
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+async function createNewSession() {
+  try {
+    clearMessages();
+    showWelcome();
+
+    currentPersona = botSelect.value || "practical";
+    setSessionBadge();
+
+    const data = await apiPost("/api/v1/greeting", {
+      persona_id: currentPersona,
+    });
+
+    sessionId = data.session_id || "";
+    currentPersona = data.persona_id || currentPersona;
+    botSelect.value = currentPersona;
+    setSessionBadge();
+
+    renderTopicCards(data.topics || []);
+    renderMessage("assistant", data.response || "สวัสดีครับ");
+    await refreshSessions();
+  } catch (error) {
+    console.error(error);
+    renderMessage("assistant", `เกิดข้อผิดพลาดในการเริ่มแชต: ${error.message}`);
+  }
+}
+
+async function loadSession(targetSessionId) {
+  try {
+    const data = await apiPost("/api/v1/session/load", {
+      session_id: targetSessionId,
+    });
+
+    sessionId = data.session_id || "";
+    currentPersona = data.persona_id || "practical";
+    botSelect.value = currentPersona;
+    setSessionBadge();
+
+    clearMessages();
+
+    const messages = data.messages || [];
+    if (messages.length === 0) {
+      showWelcome();
+    } else {
+      hideWelcome();
+      messages.forEach((msg) => {
+        renderMessage(msg.role, msg.content || "");
+      });
+    }
+
+    await refreshSessions();
+  } catch (error) {
+    console.error(error);
+    renderMessage("assistant", `โหลด session ไม่สำเร็จ: ${error.message}`);
+  }
+}
+
+async function deleteCurrentSession() {
+  if (!sessionId) return;
+
+  try {
+    await apiPost("/api/v1/session/delete", {
+      session_id: sessionId,
+    });
+
+    sessionId = "";
+    setSessionBadge();
+    clearMessages();
+    showWelcome();
+    await refreshSessions();
+  } catch (error) {
+    console.error(error);
+    renderMessage("assistant", `ลบ session ไม่สำเร็จ: ${error.message}`);
+  }
+}
+
+async function sendMessage() {
+  const text = (messageInput.value || "").trim();
+  if (!text) return;
+
+  if (!sessionId) {
+    await createNewSession();
+  }
+
+  renderMessage("user", text);
+  messageInput.value = "";
+  autoResizeTextarea();
+
+  try {
+    const data = await apiPost("/api/v1/chat", {
+      message: text,
+      session_id: sessionId,
+    });
+
+    sessionId = data.session_id || sessionId;
+    currentPersona = data.persona_id || currentPersona;
+    botSelect.value = currentPersona;
+    setSessionBadge();
+
+    renderMessage("assistant", data.response || "ไม่มีข้อความตอบกลับ");
+    await refreshSessions();
+  } catch (error) {
+    console.error(error);
+    renderMessage("assistant", `เกิดข้อผิดพลาดระหว่างส่งข้อความ: ${error.message}`);
+  }
+}
+
+async function checkHealth() {
+  try {
+    const data = await apiGet("/api/v1/healthcheck");
+    renderMessage(
+      "assistant",
+      `Healthcheck OK\nservice: ${data.service}\nversion: ${data.version}\ncollection: ${data.collection_name}\nsession retention: ${data.session_retention_days} days`
+    );
+  } catch (error) {
+    console.error(error);
+    renderMessage("assistant", `healthcheck failed: ${error.message}`);
+  }
+}
+
+newChatBtn.addEventListener("click", createNewSession);
+sendBtn.addEventListener("click", sendMessage);
+healthBtn.addEventListener("click", checkHealth);
+deleteSessionBtn.addEventListener("click", deleteCurrentSession);
+
+messageInput.addEventListener("input", autoResizeTextarea);
+
+messageInput.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  if (e.shiftKey) return;
+
+  e.preventDefault();
+  sendMessage();
+});
+
+window.addEventListener("DOMContentLoaded", async () => {
+  autoResizeTextarea();
+  setSessionBadge();
+  await refreshSessions();
+  showWelcome();
+});

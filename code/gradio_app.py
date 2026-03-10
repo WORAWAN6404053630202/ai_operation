@@ -1,8 +1,12 @@
+#/Users/w.worawan/Downloads/ai-operation-microservice3_v2ori/code/gradio_app.py
 from __future__ import annotations
 
+import logging
 import socket
 import uuid
 from typing import List, Dict, Optional, Tuple
+
+_LOG = logging.getLogger(__name__)
 
 import gradio as gr
 
@@ -89,7 +93,11 @@ def on_send(user_text: str, session_id: str, history: List[Dict[str, str]]):
         history = history or []
         return "", st.session_id, history, _session_label(st), history
 
-    st, reply = supervisor.handle(state=st, user_input=user_text)
+    try:
+        st, reply = supervisor.handle(state=st, user_input=user_text)
+    except Exception as exc:
+        _LOG.error("supervisor.handle failed: %s", exc, exc_info=True)
+        reply = "ขอโทษครับ มีปัญหาเกิดขึ้น กรุณาลองอีกครั้งครับ"
     _STATE_MANAGER.save(st.session_id, st)
 
     history = history or []
