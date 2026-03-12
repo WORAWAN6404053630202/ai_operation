@@ -1,6 +1,8 @@
 let sessionId = "";
 let currentPersona = "practical";
 
+const CLIENT_ID_KEY = "restbiz_client_id";
+
 const chatMessages = document.getElementById("chatMessages");
 const messageInput = document.getElementById("messageInput");
 const sendBtn = document.getElementById("sendBtn");
@@ -10,7 +12,6 @@ const deleteSessionBtn = document.getElementById("deleteSessionBtn");
 const sessionList = document.getElementById("sessionList");
 const topicCards = document.getElementById("topicCards");
 const welcomePanel = document.getElementById("welcomePanel");
-const sessionBadge = document.getElementById("sessionBadge");
 const botSelect = document.getElementById("botSelect");
 
 function escapeHtml(text) {
@@ -34,8 +35,25 @@ function autoResizeTextarea() {
   messageInput.style.height = Math.min(messageInput.scrollHeight, 220) + "px";
 }
 
-function setSessionBadge() {
-  sessionBadge.textContent = sessionId ? `${sessionId} • ${currentPersona}` : "No session";
+function getClientId() {
+  let value = localStorage.getItem(CLIENT_ID_KEY);
+  if (value && value.trim()) return value;
+
+  if (window.crypto && crypto.randomUUID) {
+    value = crypto.randomUUID();
+  } else {
+    value = `client_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  localStorage.setItem(CLIENT_ID_KEY, value);
+  return value;
+}
+
+function getDefaultHeaders() {
+  return {
+    "Content-Type": "application/json",
+    "X-Client-Id": getClientId(),
+  };
 }
 
 function clearMessages() {
@@ -58,7 +76,7 @@ function renderMessage(role, content) {
   hideWelcome();
 
   const row = document.createElement("div");
-  row.className = "message-row";
+  row.className = `message-row ${role === "assistant" ? "assistant" : "user"}`;
 
   let avatarHtml = "";
   let roleLabel = "";
@@ -72,10 +90,12 @@ function renderMessage(role, content) {
   }
 
   row.innerHTML = `
-    ${avatarHtml}
-    <div class="message-content">
-      <div class="message-role">${roleLabel}</div>
-      <div class="message-text">${escapeHtml(content).replace(/\n/g, "<br>")}</div>
+    <div class="message-card">
+      ${avatarHtml}
+      <div class="message-bubble-wrap">
+        <div class="message-role">${roleLabel}</div>
+        <div class="message-bubble">${escapeHtml(content).replace(/\n/g, "<br>")}</div>
+      </div>
     </div>
   `;
 
@@ -127,7 +147,12 @@ function renderSessionList(items = []) {
 }
 
 async function apiGet(url) {
-  const response = await fetch(url);
+  const response = await fetch(url, {
+    headers: {
+      "X-Client-Id": getClientId(),
+    },
+  });
+
   const data = await response.json();
   if (!response.ok) {
     throw new Error(data.detail || `HTTP ${response.status}`);
@@ -138,7 +163,7 @@ async function apiGet(url) {
 async function apiPost(url, payload = {}) {
   const response = await fetch(url, {
     method: "POST",
-    headers: {"Content-Type": "application/json"},
+    headers: getDefaultHeaders(),
     body: JSON.stringify(payload),
   });
 
@@ -152,9 +177,12 @@ async function apiPost(url, payload = {}) {
 async function refreshSessions() {
   try {
     const data = await apiGet("/api/v1/sessions");
-    renderSessionList(data.sessions || []);
+    const sessions = data.sessions || [];
+    renderSessionList(sessions);
+    return sessions;
   } catch (error) {
     console.error(error);
+    return [];
   }
 }
 
@@ -164,7 +192,6 @@ async function createNewSession() {
     showWelcome();
 
     currentPersona = botSelect.value || "practical";
-    setSessionBadge();
 
     const data = await apiPost("/api/v1/greeting", {
       persona_id: currentPersona,
@@ -173,7 +200,6 @@ async function createNewSession() {
     sessionId = data.session_id || "";
     currentPersona = data.persona_id || currentPersona;
     botSelect.value = currentPersona;
-    setSessionBadge();
 
     renderTopicCards(data.topics || []);
     renderMessage("assistant", data.response || "สวัสดีครับ");
@@ -193,7 +219,6 @@ async function loadSession(targetSessionId) {
     sessionId = data.session_id || "";
     currentPersona = data.persona_id || "practical";
     botSelect.value = currentPersona;
-    setSessionBadge();
 
     clearMessages();
 
@@ -223,10 +248,16 @@ async function deleteCurrentSession() {
     });
 
     sessionId = "";
-    setSessionBadge();
     clearMessages();
     showWelcome();
-    await refreshSessions();
+
+    const sessions = await refreshSessions();
+
+    if (sessions.length > 0) {
+      await loadSession(sessions[0].session_id);
+    } else {
+      await createNewSession();
+    }
   } catch (error) {
     console.error(error);
     renderMessage("assistant", `ลบ session ไม่สำเร็จ: ${error.message}`);
@@ -254,7 +285,6 @@ async function sendMessage() {
     sessionId = data.session_id || sessionId;
     currentPersona = data.persona_id || currentPersona;
     botSelect.value = currentPersona;
-    setSessionBadge();
 
     renderMessage("assistant", data.response || "ไม่มีข้อความตอบกลับ");
     await refreshSessions();
@@ -293,8 +323,14 @@ messageInput.addEventListener("keydown", (e) => {
 });
 
 window.addEventListener("DOMContentLoaded", async () => {
+  getClientId();
   autoResizeTextarea();
-  setSessionBadge();
-  await refreshSessions();
-  showWelcome();
+
+  const sessions = await refreshSessions();
+
+  if (sessions.length > 0) {
+    await loadSession(sessions[0].session_id);
+  } else {
+    await createNewSession();
+  }
 });

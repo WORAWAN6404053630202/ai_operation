@@ -31,14 +31,15 @@ Persona Supervisor (Hybrid Routing + FSM) — Option A (Supervisor owns ALL visi
 - Safe fallback:
   - always guarantee exactly 5 menu items even if data is sparse
 
-✅ NEWEST (your requirement):
+✅ CURRENT BEHAVIOR (silent switch, no confirmation dialogs):
 - If user asks for "ละเอียด/เชิงลึก/วิชาการ" OR hints Academic persona:
-  - DO NOT switch immediately
-  - MUST say current persona + ask confirmation to switch to the other persona
+  - SWITCH IMMEDIATELY (silent, no announcement)
+  - LLM is primary detector (not regex-gated)
+  - Academic answers → auto-returns to Practical silently
 - If user says "change/switch persona/mode" (with/without target):
-  - MUST say current persona + ask confirmation to switch to the other persona
-- If user requests persona that is already active:
-  - MUST say "already in mode X" and ask if they want to switch back to the other persona
+  - SWITCH IMMEDIATELY to academic if that's the target, no confirmation
+- Academic resume: re-enter academic silently if user wants to continue previous topic
+- No "กลับมาโหมด Practical แล้วครับ" announcements
 - Academic final_answer 3-branch logic stays in AcademicPersonaService (no changes here)
 
 ✅ BUGFIX (this request):
@@ -126,11 +127,13 @@ class PersonaSupervisor:
     _SWITCH_VERBS = ("เปลี่ยน", "สลับ", "ปรับ", "ขอเปลี่ยน", "ขอสลับ", "ขอปรับ", "change", "switch", "ไป")
     _SWITCH_MARKERS = ("โหมด", "mode", "persona", "บุคลิก", "บอท", "bot", "ตัว")
 
+    # Only very specific phrases that unambiguously signal "I want Academic/deep-dive mode".
+    # Broad words like "ละเอียด", "มากกว่านี้", "บอกเพิ่มเติม" are intentionally excluded —
+    # they are too common in general Thai speech and would cause false positives.
+    # Natural phrasing that doesn't match here is caught by the LLM (primary detector).
     _TARGET_ACADEMIC_HINTS = (
-        "ละเอียด",
         "เชิงลึก",
         "วิชาการ",
-        "ตามกฎหมาย",
         "อ้างอิงข้อกฎหมาย",
         "อธิบายละเอียด",
         "ขอแบบละเอียด",
@@ -139,17 +142,11 @@ class PersonaSupervisor:
         "เอาแบบละเอียดทั้งหมด",
         "ขยายความ",
         "ลงรายละเอียด",
-        "ละเอียดขึ้น",
-        "อธิบายมากกว่า",
-        "อธิบายเพิ่มเติม",
-        "รายละเอียดมากกว่า",
-        "รายละเอียดเพิ่มเติม",
-        "บอกเพิ่มเติม",
-        "อธิบายให้มากกว่า",
-        "มากกว่านี้",
     )
+    # Only specific phrases that unambiguously signal "I want short/summary mode".
+    # "สั้น" alone (e.g. "ข้อความสั้น") and "เร็วๆ" (e.g. "เร็วๆ นี้") are excluded — too broad.
+    # LLM handles ambiguous natural phrasing as primary detector.
     _TARGET_PRACTICAL_HINTS = (
-        "สั้น",
         "สั้นๆ",
         "กระชับ",
         "สรุป",
@@ -158,7 +155,6 @@ class PersonaSupervisor:
         "เอาแบบสรุป",
         "เช็คลิสต์",
         "เป็นข้อๆ",
-        "เร็วๆ",
     )
 
     _STYLE_LIKELY_RE = re.compile(
@@ -194,13 +190,17 @@ class PersonaSupervisor:
         re.IGNORECASE,
     )
 
-    # Patterns for resuming an Academic session after auto-return to Practical
+    # Patterns for resuming an Academic session after auto-return to Practical.
+    # IMPORTANT: Keep only phrases that unambiguously signal "continue the SAME previous academic session".
+    # Broad words like "ทั้งหมด" (could mean anything), "เรื่องเก่า" (vague),
+    # "ขอกลับไป" (no qualifier), "ต้องการทราบเพิ่ม" (generic request),
+    # "ขอรายละเอียดเพิ่ม", "ขอข้อมูลเพิ่มเติม" (could be new topic) are excluded.
+    # Ambiguous natural phrasing falls through to LLM fallback (llm_fallback_intent_call).
     _ACADEMIC_RESUME_RE = re.compile(
-        r"(ทั้งหมด|ขอทั้งหมด|ดูทั้งหมด|ส่วนที่เหลือ|ขอส่วนอื่น|อยากรู้ส่วนอื่น"
+        r"(ขอทั้งหมด|ดูทั้งหมด|ส่วนที่เหลือ|ขอส่วนอื่น|อยากรู้ส่วนอื่น"
         r"|อยากรู้ต่อ|อยากดูต่อ|ขอต่อจากเดิม|อยากรู้เพิ่มเรื่องนี้|ยังอยากรู้"
-        r"|อยากได้ส่วน|อยากถามต่อ|ต้องการทราบเพิ่ม|ต้องการเพิ่มเติม"
-        r"|กลับไปเรื่องเดิม|กลับไปเรื่องเก่า|เรื่องเก่า|ขอกลับไป|ต่อจากที่แล้ว"
-        r"|อยากรู้เพิ่มเกี่ยวกับ|ขอรายละเอียดเพิ่ม|ขอข้อมูลเพิ่มเติม)",
+        r"|อยากได้ส่วน|อยากถามต่อ"
+        r"|กลับไปเรื่องเดิม|กลับไปเรื่องเก่า|ต่อจากที่แล้ว)",
         re.IGNORECASE,
     )
     _NEW_TOPIC_RE = re.compile(
@@ -463,19 +463,43 @@ class PersonaSupervisor:
         )
 
         def _call(kind: str, persona_id: str, last_topic_hint: str, include_intro: bool) -> dict:
+            # Build context-aware instructions for each kind
+            kind_instructions = ""
+            if kind == "thanks":
+                if last_topic_hint:
+                    kind_instructions = (
+                        f"- ผู้ใช้พึ่งขอบคุณหลังจากสอบถามเรื่อง '{last_topic_hint}'\n"
+                        "- ตอบรับคำขอบคุณอย่างอบอุ่น แล้วถามว่ายังมีคำถามเรื่องเดิมหรือเรื่องอื่นอีกไหม\n"
+                        "- ห้ามพูดแบบ generic เช่น 'มีอะไรให้ช่วยไหม' ให้เชื่อมโยงกับ topic ที่คุยมา\n"
+                    )
+                else:
+                    kind_instructions = (
+                        "- ผู้ใช้ขอบคุณ ตอบรับอย่างอบอุ่นและถามว่ามีอะไรให้ช่วยอีกไหม\n"
+                    )
+            elif kind in ("smalltalk", "blank"):
+                if last_topic_hint:
+                    kind_instructions = (
+                        f"- ก่อนหน้านี้คุยเรื่อง '{last_topic_hint}' ถ้าผู้ใช้อาจยังสงสัยเรื่องนั้นอยู่ ให้เชิญชวนต่อ\n"
+                        "- ตอบรับแบบเป็นกันเองสั้นๆ แล้วถามว่ายังมีเรื่องนั้นหรือเรื่องอื่นให้ช่วยไหม\n"
+                    )
+                else:
+                    kind_instructions = "- ตอบรับแบบเป็นกันเองสั้นๆ และถามว่ามีอะไรให้ช่วยไหม\n"
+            else:
+                kind_instructions = "- ทักทายอย่างอบอุ่น\n"
+
             prompt = (
-                "หน้าที่: เขียนข้อความทักทาย/ตอบรับภาษาไทยแบบมนุษย์\n"
+                "หน้าที่: เขียนข้อความทักทาย/ตอบรับภาษาไทยแบบมนุษย์ ในฐานะ 'น้องสุดยอด' ที่ปรึกษาร้านอาหาร\n"
                 "ข้อกำหนดร่วม:\n"
-                "- 1 ประโยคสั้นๆ + ปิดท้ายด้วยคำถามสั้นๆ 1 ข้อ\n"
+                "- 1-2 ประโยคสั้นๆ ลงท้ายด้วยคำถาม 1 ข้อ\n"
                 "- ห้ามใส่รายการหัวข้อ/เลขข้อ/เมนู\n"
                 "- ห้ามสั่ง user ว่า 'เลือก/พิมพ์/กด'\n"
                 "- ต้องลงท้ายด้วย 'ครับ'\n"
-                "โทนตาม persona:\n"
-                "  - practical: ตรง กระชับ\n"
-                "  - academic: สุภาพมืออาชีพ แต่ไม่ยาว\n"
+                "- แทนตัวเองว่า 'ผม' หรือ 'น้องสุดยอด' ห้ามใช้ 'ฉัน'\n"
                 "กฎ include_intro:\n"
-                "- ถ้า include_intro=true: ต้องแนะนำตัวว่า Restbiz ช่วยเรื่องกฎหมาย/ใบอนุญาต/ภาษีร้านอาหาร\n"
+                "- ถ้า include_intro=true: แนะนำตัวว่า Restbiz ช่วยเรื่องกฎหมาย/ใบอนุญาต/ภาษีร้านอาหาร\n"
                 "- ถ้า include_intro=false: ห้ามพูดชื่อ Restbiz และห้ามบอกหน้าที่บอทซ้ำ\n"
+                f"กฎเฉพาะสำหรับ kind='{kind}':\n"
+                f"{kind_instructions}"
                 "ตอบเป็น JSON เท่านั้น: {\"prefix\": \"...\"}\n"
                 f"kind: {kind}\n"
                 f"persona: {persona_id}\n"
@@ -744,12 +768,19 @@ class PersonaSupervisor:
 
     def _infer_user_style_request_hybrid(self, s: str) -> Dict[str, Any]:
         text = s or ""
-        if not self._STYLE_LIKELY_RE.search(text):
-            det = self._infer_user_style_request_det(text)
-            if det["wants_short"] or det["wants_long"]:
-                return {"wants_short": det["wants_short"], "wants_long": det["wants_long"], "method": "det", "confidence": 0.9}
+
+        # 1. Fast-path: deterministic keyword check (no LLM cost)
+        det = self._infer_user_style_request_det(text)
+        if det["wants_short"] or det["wants_long"]:
+            return {"wants_short": det["wants_short"], "wants_long": det["wants_long"], "method": "det", "confidence": 0.9}
+
+        # 2. Skip LLM for pure noise/number-only inputs (too short to have style intent)
+        stripped = text.strip()
+        if not stripped or len(stripped) <= 3 or self._LIKELY_SELECTION_RE.match(stripped):
             return {"wants_short": False, "wants_long": False, "method": "none", "confidence": 0.0}
 
+        # 3. LLM is primary detector for all substantive inputs — catches natural phrasing
+        #    that regex misses (e.g. "อธิบายแบบครบๆ", "ขอทราบทั้งหมดเลย", "แบบย่อๆ ได้ไหม")
         res: Dict[str, Any] = {}
         try:
             res = self.llm_style_call(text) or {}
@@ -771,10 +802,6 @@ class PersonaSupervisor:
         if wants_long or wants_short:
             return {"wants_short": wants_short, "wants_long": wants_long, "method": "llm", "confidence": confv}
 
-        det = self._infer_user_style_request_det(text)
-        if det["wants_short"] or det["wants_long"]:
-            return {"wants_short": det["wants_short"], "wants_long": det["wants_long"], "method": "det_fallback", "confidence": 0.7}
-
         return {"wants_short": False, "wants_long": False, "method": "llm_low", "confidence": confv}
 
     def _classify_intent(self, state: ConversationState, user_input: str) -> Dict[str, Any]:
@@ -784,8 +811,8 @@ class PersonaSupervisor:
         if self._is_academic_intake_active(state):
             return {"intent": self.INTENT_ACAD_INTAKE_REPLY, "meta": {}}
 
-        if state.context.get("awaiting_persona_confirmation"):
-            return {"intent": self.INTENT_CONFIRM_YESNO, "meta": {}}
+        # awaiting_persona_confirmation is no longer used (confirmation dialogs removed)
+        # state.context.get("awaiting_persona_confirmation") is cleared in section 2.2 of _handle_inner
 
         if self._looks_like_switch_without_target(text):
             return {"intent": self.INTENT_EXPLICIT_SWITCH, "meta": {"kind": "no_target"}}
@@ -914,7 +941,7 @@ class PersonaSupervisor:
 
         docs = self.retriever.invoke(q)
         results: List[Dict[str, Any]] = []
-        top_k = int(getattr(conf, "RETRIEVAL_TOP_K", 20) or 20)
+        top_k = int(getattr(conf, "RETRIEVAL_TOP_K", 12) or 12)
         for d in (docs or [])[:top_k]:
             results.append({"content": (getattr(d, "page_content", "") or "")[:600], "metadata": getattr(d, "metadata", {}) or {}})
 
@@ -990,6 +1017,39 @@ class PersonaSupervisor:
                 seen.add(n)
                 out.append(n)
         return out
+
+    def _fuzzy_match_option(self, user_input: str, options: List[Any], threshold: float = 0.30) -> Optional[str]:
+        """Fuzzy match user free-text to closest slot option using character bigram overlap.
+        Used as fallback when LLM slot mapper fails or returns low confidence.
+        Threshold 0.30 works well for Thai text (no word boundaries)."""
+        raw_norm = self._normalize_for_intent(user_input)
+        if not raw_norm or len(raw_norm) < 2:
+            return None
+
+        ngrams_raw = {raw_norm[i:i + 2] for i in range(len(raw_norm) - 1)}
+        if not ngrams_raw:
+            return None
+
+        best_opt: Optional[str] = None
+        best_score = 0.0
+
+        for opt in options:
+            s = str(opt).strip()
+            if not s:
+                continue
+            s_norm = self._normalize_for_intent(s)
+            if not s_norm or len(s_norm) < 2:
+                continue
+            ngrams_opt = {s_norm[i:i + 2] for i in range(len(s_norm) - 1)}
+            if not ngrams_opt:
+                continue
+            overlap = len(ngrams_raw & ngrams_opt)
+            score = overlap / max(len(ngrams_raw), len(ngrams_opt))
+            if score > best_score:
+                best_score = score
+                best_opt = s
+
+        return best_opt if best_score >= threshold else None
 
     def _map_pending_slot_reply(self, pending: Dict[str, Any], user_input: str) -> Tuple[Optional[str], Optional[str]]:
         options = pending.get("options") or []
@@ -1081,6 +1141,14 @@ class PersonaSupervisor:
                         if ct == s_norm or (ct in s_norm) or (s_norm in ct):
                             return s, None
 
+        # 4) Character bi-gram overlap fuzzy match (fallback when LLM fails/low-confidence)
+        # Works for Thai text where word boundaries are ambiguous.
+        # Helps when user types natural text (e.g. "แก้ไขหุ้นส่วน") for option "การแก้ไขข้อมูลหุ้นส่วน"
+        fuzzy_match = self._fuzzy_match_option(raw, options)
+        if fuzzy_match is not None:
+            _LOG.info("[Supervisor] pending_slot fuzzy match: %r → %r", raw[:40], fuzzy_match[:40])
+            return fuzzy_match, None
+
         # otherwise require numeric for non-topic pending slots
         return None, "กรุณาตอบเป็นตัวเลขตามตัวเลือกครับ"
 
@@ -1118,6 +1186,49 @@ class PersonaSupervisor:
             return False
 
         return self._looks_like_pending_slot_reply(user_input)
+
+    def _get_registration_types_for_docs(self, docs: List[Dict]) -> List[str]:
+        """
+        Given already-retrieved docs for a topic, find ALL registration_type values
+        that exist in Chroma for the same license_type domain.
+        Uses Chroma metadata query (exact match, not similarity) — fully deterministic.
+        Returns sorted list. Returns [] if license_type not found or on any error.
+        """
+        try:
+            # Step 1: Extract license_type from retrieved docs (first non-empty wins)
+            license_type = None
+            for d in (docs or []):
+                lt = ((d.get("metadata") or {}).get("license_type") or "").strip()
+                if lt:
+                    license_type = lt
+                    break
+            if not license_type:
+                return []
+
+            # Step 2: Query Chroma for ALL docs with that license_type (no similarity — exact metadata match)
+            vectorstore = getattr(self._practical.retriever, "vectorstore", None)
+            if vectorstore is None:
+                return []
+            coll = getattr(vectorstore, "_collection", None)
+            if coll is None:
+                return []
+            result = coll.get(where={"license_type": license_type}, include=["metadatas"])
+
+            # Step 3: Extract unique non-empty registration_type values
+            types: set = set()
+            for md in (result.get("metadatas") or []):
+                rt = ((md or {}).get("registration_type") or "").strip()
+                if rt:
+                    types.add(rt)
+            reg_types = sorted(types)
+            _LOG.info(
+                "[Supervisor] _get_registration_types_for_docs: license_type=%r → %d types: %s",
+                license_type, len(reg_types), reg_types,
+            )
+            return reg_types
+        except Exception as e:
+            _LOG.warning("[Supervisor] _get_registration_types_for_docs failed: %s", e)
+            return []
 
     def _route_pending_slot_to_persona(self, state: ConversationState, user_input: str) -> Tuple[ConversationState, str]:
         pending = (state.context or {}).get("pending_slot") or {}
@@ -1163,35 +1274,47 @@ class PersonaSupervisor:
                 _LOG.warning("[Supervisor] pre-retrieve failed for topic=%r: %s", str(mapped)[:40], e)
                 state.current_docs = []
 
-        elif isinstance(pending, dict) and pending.get("key") and mapped and (
-            "นิติบุคคล" in str(mapped) or "บุคคลธรรมดา" in str(mapped)
-        ):
-            # Entity-type slot: normalize to clean value (handles verbose options like "นิติบุคคล (บริษัท / ห้างหุ้นส่วน)")
+            # Deterministically enumerate all registration_type values for this domain
+            # so practical can show ALL entity type options regardless of embedding ranking
+            _reg_types = self._get_registration_types_for_docs(state.current_docs or [])
+            if _reg_types:
+                state.context["topic_registration_types"] = _reg_types
+            else:
+                state.context.pop("topic_registration_types", None)
+
+        elif isinstance(pending, dict) and pending.get("key") and mapped:
+            # Any non-topic slot filled — enrich retrieval if entity type can be inferred.
+            # Use data_loader's _normalize_entity_type to cover all sub-types:
+            # บริษัทจำกัด, ห้างหุ้นส่วน, บุคคลธรรมดา ฯลฯ → นิติบุคคล / บุคคลธรรมดา
             _raw = str(mapped).strip()
-            slot_val = "นิติบุคคล" if "นิติบุคคล" in _raw else "บุคคลธรรมดา"
+            _entity_val = None
+            try:
+                from service.data_loader import DataLoader as _DL
+                _entity_val = _DL._normalize_entity_type(_raw)
+            except Exception:
+                # Fallback: simple keyword check
+                if "นิติบุคคล" in _raw or "บริษัท" in _raw or "ห้างหุ้นส่วน" in _raw:
+                    _entity_val = "นิติบุคคล"
+                elif "บุคคลธรรมดา" in _raw:
+                    _entity_val = "บุคคลธรรมดา"
+
             base_q = (
                 getattr(state, "last_retrieval_query", None)
                 or (state.context or {}).get("last_retrieval_query")
                 or (state.context or {}).get("last_user_legal_query")
                 or ""
             ).strip()
-            enriched_q = f"{base_q} {slot_val}" if base_q else slot_val
-            entity_filter = {"entity_type_normalized": slot_val}
-            try:
-                state.current_docs = self._practical._retrieve_docs(enriched_q, metadata_filter=entity_filter)
-                state.last_retrieval_query = enriched_q
-                _LOG.info("[Supervisor] pre-retrieved %d docs for entity_type=%r query=%r", len(state.current_docs), slot_val, enriched_q[:60])
-            except Exception as e:
-                _LOG.warning("[Supervisor] pre-retrieve failed for entity_type=%r: %s", slot_val, e)
-                state.current_docs = []
 
-            # Answer directly — no Phase 3 section menu in Practical mode
-            topic_label = str((state.context or {}).get("last_topic") or "").strip()
-            query = f"{topic_label} {slot_val}".strip() if topic_label else (base_q or slot_val)
-            st2, reply = self._practical.handle(state, query, _internal=True)
-            reply = self._normalize_male(reply)
-            self._add_assistant(st2, reply)
-            return st2, reply
+            if _entity_val:
+                # Re-retrieve with entity-type filter for better doc coverage
+                enriched_q = f"{base_q} {_entity_val}".strip() if base_q else _entity_val
+                entity_filter = {"entity_type_normalized": _entity_val}
+                try:
+                    state.current_docs = self._practical._retrieve_docs(enriched_q, metadata_filter=entity_filter)
+                    state.last_retrieval_query = enriched_q
+                    _LOG.info("[Supervisor] entity-enriched retrieval: entity=%r docs=%d", _entity_val, len(state.current_docs))
+                except Exception as e:
+                    _LOG.warning("[Supervisor] entity-enriched retrieval failed: %s", e)
 
         pid = normalize_persona_id(state.persona_id)
         if pid == "academic":
@@ -1207,13 +1330,20 @@ class PersonaSupervisor:
         return st2, reply
 
     # --------------------------
-    # Auto-return followup (unchanged)
+    # Auto-return followup
     # --------------------------
     def _build_auto_return_followup(self, state: ConversationState) -> str:
         ctx = state.context or {}
         ctx.pop("auto_return_topic_context", None)
         state.context = ctx
         return "ถ้ามีอะไรสงสัยเพิ่มหรืออยากถามเรื่องอื่น บอกผมได้เลยครับ 😊"
+
+    def _reply_has_closing(self, reply: str) -> bool:
+        """True if LLM answer already ends with a closing/farewell phrase.
+        Prevents appending a duplicate follow-up when the LLM already closed politely."""
+        tail = (reply or "")[-200:]
+        signals = ("สงสัยเพิ่ม", "ถามเพิ่ม", "บอกผมได้เลย", "ช่วยได้เลย", "สอบถามเพิ่มเติม")
+        return any(s in tail for s in signals)
 
     def _post_route_academic_auto_return(self, state: ConversationState, reply: str) -> Tuple[ConversationState, str]:
         ctx = state.context or {}
@@ -1246,7 +1376,8 @@ class PersonaSupervisor:
         state.context["academic_resume_available"] = True
 
         follow_up = self._build_auto_return_followup(state)
-        if follow_up:
+        # Only append follow-up if LLM answer doesn't already end with a similar closing phrase
+        if follow_up and not self._reply_has_closing(reply):
             combined = reply.rstrip() + "\n\n─────────────────\n" + follow_up
             return state, combined
 
@@ -1260,14 +1391,15 @@ class PersonaSupervisor:
     _MENU_CANDIDATE_MAX = 30
     _LLM_PICK_MIN_CONF = 0.55
 
-    _MENU_REQUIRE_KEYWORDS = (
+    # Loaded from conf.MENU_REQUIRE_KEYWORDS — add new domain keywords there when dataset expands
+    # NOTE: org-name fragments (สรรพากร, กรม, สำนักงาน) intentionally excluded —
+    # they are caught by _looks_orgish() and must NOT grant menu_worthy status.
+    _MENU_REQUIRE_KEYWORDS: tuple = tuple(getattr(conf, "MENU_REQUIRE_KEYWORDS", (
         "ใบอนุญาต", "อนุญาต", "ขั้นตอน", "เอกสาร", "ค่าธรรมเนียม", "ระยะเวลา", "ช่องทาง",
         "ภาษี", "vat", "ภพ", "จดทะเบียน", "ทะเบียนพาณิชย์", "dbd",
         "ประกันสังคม", "กองทุน", "สุขาภิบาล", "เปิดร้าน", "ยื่นคำขอ", "คำขอ",
         "ใบกำกับภาษี", "ใบเสร็จ", "แบบฟอร์ม", "ฟอร์ม",
-    )
-    # NOTE: org-name fragments (สรรพากร, กรม, สำนักงาน) intentionally excluded —
-    # they are caught by _looks_orgish() and must NOT grant menu_worthy status.
+    )))
     _MENU_DETAILISH_PATTERNS = (
         r"^กรณี", r"^ถ้า", r"^สำหรับ", r"^เมื่อ", r"^หาก", r"^ในกรณี", r"^ข้อยกเว้น",
         r"^หมายเหตุ", r"^เพิ่มเติม", r"^ตัวอย่าง", r"^คำแนะนำ",
@@ -1281,7 +1413,8 @@ class PersonaSupervisor:
         r"\b\d{8,}\b",
     )
 
-    _MENU_FALLBACK_TOPICS = [
+    # Loaded from conf so the list can be updated without touching this file
+    _MENU_FALLBACK_TOPICS: List[str] = list(getattr(conf, "MENU_FALLBACK_TOPICS", [
         "ขอใบอนุญาตเปิดร้านอาหาร",
         "สุขาภิบาลอาหาร / อาหารสะอาด",
         "ภาษี VAT / ขอ ภพ.20",
@@ -1292,7 +1425,7 @@ class PersonaSupervisor:
         "ช่องทางยื่นคำขอ / หน่วยงาน",
         "ประกันสังคม (ขึ้นทะเบียนนายจ้าง)",
         "กองทุนเงินทดแทน",
-    ]
+    ]))
 
     def _format_numbered_options(self, options: List[str], max_items: int = 9) -> str:
         opts = [str(x).strip() for x in (options or []) if str(x).strip()]
@@ -1469,13 +1602,14 @@ class PersonaSupervisor:
         return freq
 
     def _build_topic_pool_from_corpus(self, state: ConversationState) -> List[Tuple[str, int]]:
-        queries = [
+        # Loaded from conf.TOPIC_POOL_QUERIES — add new domain queries there when dataset expands
+        queries: List[str] = list(getattr(conf, "TOPIC_POOL_QUERIES", [
             "ใบอนุญาต เปิดร้านอาหาร เทศบาล สำนักงานเขต สุขาภิบาลอาหาร",
             "ภาษี VAT ภพ.20 ใบกำกับภาษี กรมสรรพากร จด VAT",
             "จดทะเบียนพาณิชย์ นิติบุคคล DBD กรมพัฒนาธุรกิจการค้า หนังสือรับรอง",
             "ประกันสังคม ขึ้นทะเบียนนายจ้าง ลูกจ้าง กองทุนเงินทดแทน",
             "ขั้นตอนการดำเนินการ เอกสารที่ต้องใช้ ค่าธรรมเนียม ระยะเวลา ช่องทางยื่นคำขอ",
-        ]
+        ]))
 
         merged: Dict[str, int] = {}
         for q in queries:
@@ -2009,12 +2143,21 @@ class PersonaSupervisor:
     # Main handle
     # --------------------------
     def handle(self, state: ConversationState, user_input: str) -> Tuple[ConversationState, str]:
+        import time as _time
+        _t0 = _time.perf_counter()
         st, reply = self._handle_inner(state, user_input)
         if hasattr(st, "trim_messages"):
             st.trim_messages(keep_last=12)
         # Trim large context fields that bloat the prompt (topic_pool can be 100+ items)
         if st.context and len(st.context.get("topic_pool") or []) > 10:
             st.context["topic_pool"] = st.context["topic_pool"][:10]
+        _elapsed = _time.perf_counter() - _t0
+        _LOG.info(
+            "[Supervisor] ⏱ response time = %.2fs | user=%r | reply_len=%d",
+            _elapsed,
+            (user_input or "")[:60],
+            len(reply or ""),
+        )
         return st, reply
 
     def _handle_inner(self, state: ConversationState, user_input: str) -> Tuple[ConversationState, str]:
@@ -2052,24 +2195,56 @@ class PersonaSupervisor:
             state.context.pop("confirm_tries", None)
 
         # 2.2b) Academic resume: user wants to continue a previous academic session (remaining sections)
-        # Triggered only when academic_resume_available=True (set after auto-return) AND input matches
-        # continuation intent (e.g. "ทั้งหมด", "ขอส่วนอื่น", "อยากรู้ต่อ").
-        if state.context.get("academic_resume_available") and raw_stripped and self._ACADEMIC_RESUME_RE.search(raw_stripped):
-            _LOG.info("[Supervisor] academic_resume triggered input=%r", raw_stripped[:40])
-            state.context.pop("academic_resume_available", None)
-            state.context.pop("pending_slot", None)  # clear practical topics menu
-            state.persona_id = "academic"
-            state.context["persona_id"] = "academic"
-            # Reset FSM to awaiting_sections — section_catalog is still in context
-            flow = dict(state.context.get("academic_flow") or {})
-            flow["stage"] = "awaiting_sections"
-            state.context["academic_flow"] = flow
-            st2, reply = self._academic.handle(state, raw_stripped, _internal=False)
-            st2, reply = self._post_route_academic_auto_return(st2, reply)
-            reply = self._normalize_male(reply)
-            self._add_assistant(st2, reply)
-            st2.last_action = "academic_resume"
-            return st2, reply
+        # Triggered when academic_resume_available=True AND (regex matches OR LLM detects elaborate/continue intent).
+        # GUARD: If the user has since asked about a different topic (last_retrieval_query differs from
+        # academic_question), do NOT resume the old session — clear the flag and fall through to fresh routing.
+        if state.context.get("academic_resume_available") and raw_stripped:
+            _academic_q = (state.context or {}).get("academic_question", "").strip()
+            _current_q = (state.get_last_retrieval_query() or "").strip()
+            _topic_changed = bool(
+                _academic_q and _current_q and _academic_q[:40].lower() != _current_q[:40].lower()
+            )
+            if _topic_changed:
+                # User moved to a new topic — old academic session is stale; clear resume availability
+                _LOG.info(
+                    "[Supervisor] academic_resume skipped — topic changed (was=%r now=%r)",
+                    _academic_q[:40], _current_q[:40],
+                )
+                state.context.pop("academic_resume_available", None)
+                state.context.pop("academic_flow", None)
+                state.context.pop("section_catalog", None)
+                # Fall through to normal routing (2.3 may trigger a fresh silent switch)
+            else:
+                _is_resume = bool(self._ACADEMIC_RESUME_RE.search(raw_stripped))
+                if not _is_resume:
+                    # LLM fallback: check if user wants to elaborate on the last academic topic
+                    try:
+                        _last_q = state.get_last_retrieval_query() or (state.context or {}).get("last_topic", "")
+                        _fi = self.llm_fallback_intent_call(raw_stripped, _last_q or "", "academic") or {}
+                        _intent = str(_fi.get("intent") or "").strip().lower()
+                        # Only "elaborate" (wants more detail on SAME topic) triggers resume.
+                        # "legal_question" means a NEW question — must NOT resume old session.
+                        if _intent == "elaborate" and float(_fi.get("confidence") or 0.0) >= 0.55:
+                            _is_resume = True
+                            _LOG.info("[Supervisor] academic_resume via LLM fallback intent=%r conf=%s", _intent, _fi.get("confidence"))
+                    except Exception:
+                        pass
+                if _is_resume:
+                    _LOG.info("[Supervisor] academic_resume triggered input=%r", raw_stripped[:40])
+                    state.context.pop("academic_resume_available", None)
+                    state.context.pop("pending_slot", None)  # clear practical topics menu
+                    state.persona_id = "academic"
+                    state.context["persona_id"] = "academic"
+                    # Reset FSM to awaiting_sections — section_catalog is still in context
+                    flow = dict(state.context.get("academic_flow") or {})
+                    flow["stage"] = "awaiting_sections"
+                    state.context["academic_flow"] = flow
+                    st2, reply = self._academic.handle(state, raw_stripped, _internal=False)
+                    st2, reply = self._post_route_academic_auto_return(st2, reply)
+                    reply = self._normalize_male(reply)
+                    self._add_assistant(st2, reply)
+                    st2.last_action = "academic_resume"
+                    return st2, reply
 
         # 2.3) style request -> silent switch (no confirmation dialog)
         style = self._infer_user_style_request_hybrid(raw_stripped)

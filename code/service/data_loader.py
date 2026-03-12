@@ -251,6 +251,12 @@ class DataLoader:
                 ],
                 contains_any=["อ้างอิง", "research", "document"],
             ),
+            "answer_guideline": self._resolve_col(
+                df,
+                primary="แนวคำตอบ",
+                aliases=["แนวทางคำตอบ", "แนวตอบ"],
+                contains_any=["แนวคำตอบ", "แนวตอบ"],
+            ),
         }
 
     def _validate_sheet_schema(self, df: pd.DataFrame, sheet_url: str) -> None:
@@ -339,6 +345,7 @@ class DataLoader:
                 f"เงื่อนไข: {md.get('terms_and_conditions')}" if md.get("terms_and_conditions") else "",
                 f"ข้อกฎหมาย/ข้อบังคับ: {md.get('legal_regulatory')}" if md.get("legal_regulatory") else "",
                 f"ฟอร์ม/เอกสาร: {md.get('restaurant_ai_document')}" if md.get("restaurant_ai_document") else "",
+                f"แนวคำตอบ: {md.get('answer_guideline')}" if md.get("answer_guideline") else "",
             ]
         )
 
@@ -382,21 +389,18 @@ class DataLoader:
                 "legal_regulatory": self._get_row_value(row, colmap.get("legal_regulatory")),
                 "restaurant_ai_document": self._get_row_value(row, colmap.get("restaurant_ai_document")),
                 "research_reference": self._get_row_value(row, colmap.get("research_reference")),
+                "answer_guideline": self._get_row_value(row, colmap.get("answer_guideline")),
                 "source": source,
             }
 
             # NEW: page_content is NOT "all columns" anymore (reduce embedding noise)
             page_content = self._build_page_content(metadata)
 
-            # If everything is empty (rare), keep a minimal anchor to avoid empty doc
+            # Skip rows with no procedural content — indexing boilerplate degrades search quality
             if not page_content:
-                page_content = self._join_nonempty(
-                    [
-                        f"หน่วยงาน: {metadata.get('department')}" if metadata.get("department") else "",
-                        f"ใบอนุญาต: {metadata.get('license_type')}" if metadata.get("license_type") else "",
-                        f"หัวข้อ: {metadata.get('operation_topic')}" if metadata.get("operation_topic") else "",
-                    ]
-                ).strip() or "ข้อมูลกฎหมาย/ขั้นตอนร้านอาหาร (ไม่มีรายละเอียดในแถวนี้)"
+                topic = metadata.get("operation_topic") or metadata.get("license_type") or f"row {idx}"
+                print(f"[DataLoader] WARNING: Skipping empty row (no content): {topic}")
+                continue
 
             self.documents.append(Document(page_content=page_content, metadata=metadata))
 

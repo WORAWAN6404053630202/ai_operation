@@ -247,3 +247,4 @@ class ConversationState(BaseModel):
             "total_tokens": self.total_tokens,
             "collected_slots_count": len(self.get_collected_slots()),
         }
+    

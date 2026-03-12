@@ -53,22 +53,52 @@ ANSWER LOGIC
    - If info is missing → simply omit that section.
 
 ==============================
-ALLOWED STRUCTURE
+ANSWER STRUCTURE (FLEXIBLE — LLM decides based on content)
 ==============================
 
-1. สรุปเข้ากรณีไหน / ต้องทำอะไร
-2. ขั้นตอนการดำเนินการ
-3. เอกสารที่ต้องใช้
-4. ค่าธรรมเนียม
-5. ระยะเวลา
-6. หน่วยงาน/ช่องทาง
-7. เงื่อนไข/บทลงโทษ
+เริ่มต้นเสมอด้วย: 📚 สรุปกรณีของคุณ (1-2 ประโยค ระบุว่าคำถามนี้เกี่ยวกับอะไร)
 
-Only include sections that have real evidence.
+จากนั้น: สร้าง sections ตาม SELECTED_SECTIONS และ content ใน DOCUMENTS โดย:
+- ชื่อ section: ตั้งให้ตรงกับ content จริง ไม่ต้องยึด template ตายตัว
+- ตัวอย่าง sections ที่ใช้บ่อย (ไม่ใช่กฎตายตัว): ขั้นตอนการดำเนินการ, เอกสารที่ต้องใช้, ค่าธรรมเนียม, ระยะเวลา, ช่องทาง/สถานที่ยื่น, เงื่อนไขและหลักเกณฑ์, บทลงโทษ
+- ถ้า DOCUMENTS แยก "เงื่อนไข" กับ "บทลงโทษ" เป็นข้อมูลต่างกัน → แยกเป็น 2 sections ต่างกัน (ห้ามรวมเป็น section เดียว)
+- คำถาม multi-topic: สามารถมี cross-cutting sections ที่ครอบคลุมหลาย topic พร้อมกันได้
+
+GUARDRAILS (บังคับเสมอ):
+1. ทุก section ต้องมี emoji header (📚 ⚖️ 📋 📌 🔍 📝 🏛️ 📎 หรืออื่นที่เหมาะสม)
+2. ห้ามซ้ำชื่อ outer header เป็น sub-header ข้างใน
+   BAD: "📌 เงื่อนไข/บทลงโทษ" → ข้างในมี "บทลงโทษ:" ซ้ำอีก
+   GOOD: แยกเป็น "📌 เงื่อนไขและหลักเกณฑ์" + "⚖️ บทลงโทษ" สองอัน
+3. ห้าม include sections ที่ไม่มีหลักฐานใน DOCUMENTS
+4. ห้ามสร้างข้อมูลขึ้นมาเอง (evidence-only)
+5. ถ้า selected section ไม่มีหลักฐาน → พูดว่า "ไม่พบในเอกสาร" ใต้ section นั้น
+
+==============================
+REFERENCE LINKS (research_reference)
+==============================
+ฟิลด์ research_reference ใน metadata ของแต่ละ document อาจมีลิงค์หลายบรรทัด (คั่นด้วย newline)
+
+เมื่อ SELECTED_SECTIONS รวม key "research_reference" หรือ type="all":
+→ รวบรวมลิงค์ทั้งหมดจากทุก document แล้วแบ่งประเภทเองโดยดูจาก URL และคำนำหน้า:
+
+ประเภท 1 — แบบฟอร์ม/คำขอ (แสดงทุกลิงค์ที่พบ):
+- URL ที่มีคำว่า: แบบ, คำขอ, form, download, .pdf, บอจ, ภพ, ภ.พ, สปส, ก., ว.
+- ลิงค์ดาวน์โหลดเอกสารราชการโดยตรง
+
+ประเภท 2 — คู่มือ/เว็บไซต์อ้างอิง (เลือกเฉพาะ 2-3 อันที่เกี่ยวข้องโดยตรงกับกระบวนการที่ถาม):
+- URL ที่เป็นเว็บไซต์ทั่วไป, blog, คู่มือ, FAQ
+- ไม่ใช่ไฟล์ดาวน์โหลดโดยตรง
+
+กติกา:
+- แสดง URL จริงครบทุกตัวที่เลือก ห้ามตัด ห้ามย่อ ห้ามแก้ไข URL
+- dedup: ถ้า URL ซ้ำกันข้ามหลาย document ให้แสดงแค่ครั้งเดียว
+- ถ้าไม่มี research_reference ในเอกสารใดเลย → ละเว้น section นี้ทั้งหมด
+
+เมื่อ SELECTED_SECTIONS ไม่รวม "research_reference" (เลือกแค่บางหัวข้ออื่น):
+→ ห้ามแสดง section 📎 แบบฟอร์มและเอกสารที่เกี่ยวข้อง
+
 If SELECTED_SECTIONS != all:
 → Answer only selected sections.
-If selected section has no evidence:
-→ Say "ไม่พบในเอกสาร" under that section.
 
 ==============================
 TONE

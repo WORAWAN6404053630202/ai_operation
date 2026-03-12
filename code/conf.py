@@ -55,7 +55,7 @@ TEMPERATURE_PRACTICAL = _safe_float("TEMPERATURE_PRACTICAL", 0.2)
 
 MAX_TOKENS_ACADEMIC = _safe_int("MAX_TOKENS_ACADEMIC", 8000)
 MAX_TOKENS_ACADEMIC_SLOTS = _safe_int("MAX_TOKENS_ACADEMIC_SLOTS", 3000)
-MAX_TOKENS_PRACTICAL = _safe_int("MAX_TOKENS_PRACTICAL", 4000)
+MAX_TOKENS_PRACTICAL = _safe_int("MAX_TOKENS_PRACTICAL", 1000)
 
 EMBEDDING_MODEL = os.getenv(
     "EMBEDDING_MODEL",
@@ -63,13 +63,13 @@ EMBEDDING_MODEL = os.getenv(
 )
 
 MAX_ROUNDS = _safe_int("MAX_ROUNDS", 7)
-RETRIEVAL_TOP_K = _safe_int("RETRIEVAL_TOP_K", 8)
+RETRIEVAL_TOP_K = _safe_int("RETRIEVAL_TOP_K", 12)
 
-LLM_DOCS_MAX_PRACTICAL = _safe_int("LLM_DOCS_MAX_PRACTICAL", 8)
+LLM_DOCS_MAX_PRACTICAL = _safe_int("LLM_DOCS_MAX_PRACTICAL", 12)
 LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 10)
 
-LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 250)
-LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 350)
+LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 700)
+LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 1000)
 
 RETRIEVAL_QUERY_MAX_CHARS = _safe_int("RETRIEVAL_QUERY_MAX_CHARS", 200)
 
@@ -98,6 +98,46 @@ DEFAULT_RETRIEVAL_FALLBACK_QUERY = os.getenv(
     "DEFAULT_RETRIEVAL_FALLBACK_QUERY",
     "กฎหมายร้านอาหาร ใบอนุญาต ภาษี VAT จดทะเบียน สุขาภิบาล ประกันสังคม",
 )
+
+# ------------------------------------------------------------------
+# Greeting menu configuration
+# ------------------------------------------------------------------
+
+# Fallback topics shown when real corpus pool < 12 topics.
+# Edit this list when the business domain changes or expands.
+MENU_FALLBACK_TOPICS: list = [
+    "ขอใบอนุญาตเปิดร้านอาหาร",
+    "สุขาภิบาลอาหาร / อาหารสะอาด",
+    "ภาษี VAT / ขอ ภพ.20",
+    "จดทะเบียนพาณิชย์ / DBD",
+    "เอกสารที่ต้องใช้ / เช็คลิสต์",
+    "ค่าธรรมเนียม",
+    "ระยะเวลาดำเนินการ",
+    "ช่องทางยื่นคำขอ / หน่วยงาน",
+    "ประกันสังคม (ขึ้นทะเบียนนายจ้าง)",
+    "กองทุนเงินทดแทน",
+]
+
+# Broad queries used to discover topic pool from corpus at session start.
+# Add new queries here when the dataset expands to new domains.
+TOPIC_POOL_QUERIES: list = [
+    "ใบอนุญาต เปิดร้านอาหาร เทศบาล สำนักงานเขต สุขาภิบาลอาหาร",
+    "ภาษี VAT ภพ.20 ใบกำกับภาษี กรมสรรพากร จด VAT",
+    "จดทะเบียนพาณิชย์ นิติบุคคล DBD กรมพัฒนาธุรกิจการค้า หนังสือรับรอง",
+    "ประกันสังคม ขึ้นทะเบียนนายจ้าง ลูกจ้าง กองทุนเงินทดแทน",
+    "ขั้นตอนการดำเนินการ เอกสารที่ต้องใช้ ค่าธรรมเนียม ระยะเวลา ช่องทางยื่นคำขอ",
+]
+
+# Keywords that make a topic label "menu-worthy" (must contain at least one).
+# Add keywords here when the dataset expands to new domains.
+# NOTE: org-name fragments (สรรพากร, กรม, สำนักงาน) are intentionally excluded —
+# they are caught separately by _looks_orgish() and must NOT grant menu_worthy status.
+MENU_REQUIRE_KEYWORDS: list = [
+    "ใบอนุญาต", "อนุญาต", "ขั้นตอน", "เอกสาร", "ค่าธรรมเนียม", "ระยะเวลา", "ช่องทาง",
+    "ภาษี", "vat", "ภพ", "จดทะเบียน", "ทะเบียนพาณิชย์", "dbd",
+    "ประกันสังคม", "กองทุน", "สุขาภิบาล", "เปิดร้าน", "ยื่นคำขอ", "คำขอ",
+    "ใบกำกับภาษี", "ใบเสร็จ", "แบบฟอร์ม", "ฟอร์ม",
+]
 
 # FIX: hard stop on missing API key — fail at startup, not at first LLM call
 if not OPENROUTER_API_KEY:

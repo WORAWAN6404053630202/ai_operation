@@ -8,9 +8,12 @@ Enterprise CLI baseline:
 - Provides 'reset' to wipe current session state (avoid stale state confusion)
 """
 
+import logging
 import re
 import uuid
 from rich.console import Console
+
+logging.basicConfig(level=logging.INFO, format="%(name)s | %(message)s")
 from rich.markup import escape as rich_escape
 from rich.prompt import Prompt
 

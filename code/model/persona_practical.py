@@ -14,6 +14,9 @@ from utils.prompts_practical import SYSTEM_PROMPT as SYSTEM_PROMPT_PRACTICAL
 
 _LOG = logging.getLogger("restbiz.practical")
 
+# Metadata fields with no semantic value for the LLM — always hidden from docs_json
+_LLM_HIDDEN_METADATA_KEYS = frozenset({"row_id", "source"})
+
 # P0: practical policy "last gate"
 try:
     from utils.practical_lint import enforce_practical_policy  # type: ignore
@@ -386,8 +389,10 @@ class PracticalPersonaService:
             "content_keywords": ["กฎหมาย", "ข้อกำหนด", "ประกาศ", "พ.ร.บ", "บทลงโทษ", "ข้อบังคับ"],
         },
         "ฟอร์มเอกสารตัวจริง": {
-            "meta_keys": ["restaurant_ai_document", "form", "template", "ฟอร์ม", "เอกสาร AI ร้านอาหาร"],
-            "content_keywords": ["แบบฟอร์ม", "ดาวน์โหลด", "ฟอร์ม", "ตัวอย่างเอกสาร", "คำขอ"],
+            "meta_keys": [
+                "restaurant_ai_document", "form", "template", "ฟอร์ม", "เอกสาร AI ร้านอาหาร",
+            ],
+            "content_keywords": ["แบบฟอร์ม", "ดาวน์โหลด", "ฟอร์ม", "ตัวอย่างเอกสาร", "คำขอ", "ช่องทางออนไลน์"],
         },
     }
 
@@ -413,6 +418,7 @@ class PracticalPersonaService:
     def __init__(self, retriever):
         self.retriever = retriever
         self._topic_menu_cache: Optional[List[str]] = None
+        self._topic_registry: Optional[List[str]] = None  # lazy-loaded from Chroma at first use
         self.llm_greet_call = self._default_greet_llm_call()
         self._init_llm()
 
@@ -862,7 +868,127 @@ class PracticalPersonaService:
             results.append(
                 {"content": (getattr(d, "page_content", "") or "")[:max_chars], "metadata": getattr(d, "metadata", {}) or {}}
             )
+
+        # INFO-level doc visibility log (always visible in production)
+        _LOG.info("[Practical] _retrieve_docs query=%r → %d docs returned", query[:60], len(results))
+        for i, r in enumerate(results):
+            md = r.get("metadata", {}) or {}
+            topic = md.get("operation_topic") or md.get("topic") or md.get("filename") or "?"
+            etype = md.get("entity_type_normalized") or md.get("entity_type") or ""
+            section = md.get("section") or md.get("doc_type") or ""
+            snippet = (r.get("content", "") or "")[:80].replace("\n", " ")
+            _LOG.info(
+                "  [doc %d/%d] topic=%r entity=%r section=%r | %r",
+                i + 1, len(results), topic, etype, section, snippet,
+            )
+
         return results
+
+    # --------------------------
+    # Topic Registry (auto-discovery from Chroma, no hardcoding)
+    # --------------------------
+    def _build_topic_registry(self) -> List[str]:
+        """Read all unique operation_topic values from the Chroma collection.
+        This is the source-of-truth registry — auto-updates when data is re-ingested."""
+        vectorstore = getattr(self.retriever, "vectorstore", None)
+        if vectorstore is None:
+            _LOG.warning("[Practical] Topic registry: vectorstore not available")
+            return []
+        try:
+            coll = getattr(vectorstore, "_collection", None)
+            if coll is None:
+                return []
+            result = coll.get(include=["metadatas"])
+            metadatas = result.get("metadatas") or []
+            topics: set = set()
+            for md in metadatas:
+                t = ((md or {}).get("operation_topic") or "").strip()
+                if t:
+                    topics.add(t)
+            registry = sorted(topics)
+            _LOG.info("[Practical] Topic registry loaded: %d unique topics", len(registry))
+            return registry
+        except Exception as e:
+            _LOG.warning("[Practical] Topic registry build failed: %s", e)
+            return []
+
+    def _get_topic_registry(self) -> List[str]:
+        """Lazy-load topic registry (cached for lifetime of this instance)."""
+        if self._topic_registry is None:
+            self._topic_registry = self._build_topic_registry()
+        return self._topic_registry
+
+    def _select_relevant_topics(self, question: str, registry: List[str]) -> List[str]:
+        """Ask LLM which topics from the registry are relevant to this question.
+        Returns a list of matched topic strings (may be empty if none match)."""
+        if not registry:
+            return []
+        numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(registry))
+        prompt = (
+            "คุณเป็น AI ช่วยกรองหัวข้อกฎหมาย\n"
+            "จากคำถามของ user ด้านล่าง กรุณาเลือกหัวข้อที่เกี่ยวข้องจากรายการ\n\n"
+            f"คำถาม: {question}\n\n"
+            f"รายการหัวข้อทั้งหมดในฐานข้อมูล:\n{numbered}\n\n"
+            "ตอบเป็น JSON array ของ index (เลขที่) ที่เกี่ยวข้อง เช่น [1, 5, 12]\n"
+            "ถ้าไม่มีหัวข้อที่เกี่ยวข้อง ตอบ []\n"
+            "JSON:"
+        )
+        try:
+            resp = llm_invoke(self.llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/topic_select")
+            text = (resp.content or "").strip()
+            # extract JSON array
+            m = re.search(r"\[[\d,\s]*\]", text)
+            if not m:
+                return []
+            indices = json.loads(m.group())
+            selected = []
+            for idx in indices:
+                try:
+                    i = int(idx)
+                    if 1 <= i <= len(registry):
+                        selected.append(registry[i - 1])
+                except Exception:
+                    pass
+            _LOG.info("[Practical] Topic selection: %d topics selected for question %r", len(selected), question[:60])
+            return selected
+        except Exception as e:
+            _LOG.warning("[Practical] Topic selection failed: %s — falling back to direct retrieval", e)
+            return []
+
+    def _retrieve_multi_topic(self, question: str) -> List[Dict[str, Any]]:
+        """Multi-topic retrieval using Topic Registry.
+        Automatically discovers relevant topics from the DB, retrieves per topic, and merges."""
+        registry = self._get_topic_registry()
+        if not registry:
+            # registry unavailable → fall back to single retrieval
+            return self._retrieve_docs(question)
+
+        selected_topics = self._select_relevant_topics(question, registry)
+
+        if len(selected_topics) <= 1:
+            # single topic (or none found) → normal retrieval is sufficient
+            return self._retrieve_docs(question)
+
+        # Multi-topic: retrieve per topic then merge+dedup
+        _LOG.info("[Practical] Multi-topic retrieval for %d topics: %s", len(selected_topics), selected_topics)
+        seen_ids: set = set()
+        merged: List[Dict[str, Any]] = []
+        for topic in selected_topics:
+            try:
+                docs = self._retrieve_docs(topic)
+            except Exception as e:
+                _LOG.warning("[Practical] Retrieval failed for topic %r: %s", topic, e)
+                continue
+            for d in docs:
+                md = d.get("metadata", {}) or {}
+                doc_id = md.get("doc_id") or md.get("row_id") or md.get("chunk_id") or (d.get("content", "") or "")[:40]
+                if doc_id not in seen_ids:
+                    seen_ids.add(doc_id)
+                    merged.append(d)
+
+        max_docs = getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 8) * 2
+        _LOG.info("[Practical] Multi-topic merged: %d unique docs (cap=%d)", len(merged), max_docs)
+        return merged[:max_docs]
 
     def _debug_log(self, stage: str, query: str, docs_json: List[Dict[str, Any]]):
         if not _LOG.isEnabledFor(logging.DEBUG):
@@ -1062,10 +1188,10 @@ class PracticalPersonaService:
             self._debug_log("post_retrieve(topic)", query=q, docs_json=tmp)
             return self.handle(state, "__auto_post_retrieve__", _internal=True)
 
-        # Practical retrieval: new-topic aware
+        # Practical retrieval: new-topic aware (uses multi-topic registry for compound questions)
         if (not _internal) and self._looks_like_legal_question(user_text):
             if self._should_retrieve_new_topic(state, user_text):
-                state.current_docs = self._retrieve_docs(user_text)
+                state.current_docs = self._retrieve_multi_topic(user_text)
                 state.last_retrieval_query = user_text
                 tmp = [
                     {"content": d.get("content", "")[:120], "metadata": d.get("metadata", {})}
@@ -1079,10 +1205,16 @@ class PracticalPersonaService:
         docs_json = []
         for d in (state.current_docs or [])[:12]:
             md = d.get("metadata", {}) or {}
+            filtered_md = {
+                k: ("" if v is None else str(v))
+                for k, v in md.items()
+                if k not in _LLM_HIDDEN_METADATA_KEYS
+            }
             docs_json.append(
                 {
-                    "metadata": {k: ("" if v is None else str(v)) for k, v in md.items()},
-                    "content": (d.get("content", "") or "")[:250],
+                    "metadata": filtered_md,
+                    # Use full content as-is — _retrieve_docs() already applied LLM_DOC_CHARS_PRACTICAL cap
+                    "content": (d.get("content", "") or ""),
                 }
             )
 
@@ -1143,6 +1275,18 @@ Your JSON response:
                 parsed_opts = llm_opts or self._extract_numbered_options(question)
                 if parsed_opts:
                     slot_key = self._infer_slot_key_from_question(question)
+                    # Upgrade slot_options to full deterministic Chroma list when LLM options
+                    # overlap with topic_registration_types — catches cases where LLM only saw
+                    # a subset of entity types due to embedding ranking (e.g., บริษัทจำกัด missing)
+                    _chroma_types = (state.context or {}).get("topic_registration_types")
+                    if _chroma_types and parsed_opts:
+                        _overlap = set(parsed_opts) & set(_chroma_types)
+                        if _overlap:
+                            parsed_opts = list(_chroma_types)
+                            _LOG.info(
+                                "[Practical] slot_options upgraded via Chroma overlap (%d matched) → %s",
+                                len(_overlap), parsed_opts,
+                            )
                     allow_multi = True if slot_key == self._PHASE3_SLOT_KEY else False
                     state.context["pending_slot"] = {"key": slot_key, "options": parsed_opts, "allow_multi": allow_multi}
 

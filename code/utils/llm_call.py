@@ -13,6 +13,9 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, List, Optional
 
+_MAX_RETRIES = 2
+_RETRY_DELAYS = (1.0, 2.0)  # exponential backoff in seconds
+
 if TYPE_CHECKING:
     from code.model.conversation_state import ConversationState
 
@@ -37,12 +40,27 @@ def llm_invoke(
     """
     log = logger or _ROOT_LOG
     t0 = time.perf_counter()
-    try:
-        response = llm.invoke(messages)
-    except Exception:
-        elapsed = time.perf_counter() - t0
-        log.warning("[%s] LLM call FAILED after %.2fs", label, elapsed)
-        raise
+    last_exc: Optional[Exception] = None
+    for attempt in range(1 + _MAX_RETRIES):
+        try:
+            response = llm.invoke(messages)
+            break
+        except Exception as exc:
+            last_exc = exc
+            elapsed = time.perf_counter() - t0
+            if attempt < _MAX_RETRIES:
+                delay = _RETRY_DELAYS[attempt]
+                log.warning(
+                    "[%s] LLM call FAILED after %.2fs (attempt %d/%d) — retrying in %.0fs",
+                    label, elapsed, attempt + 1, 1 + _MAX_RETRIES, delay,
+                )
+                time.sleep(delay)
+            else:
+                log.warning("[%s] LLM call FAILED after %.2fs (all %d attempts exhausted)", label, elapsed, 1 + _MAX_RETRIES)
+                raise
+    else:
+        # loop exhausted without break (should not happen due to raise above)
+        raise RuntimeError(f"[{label}] LLM call failed") from last_exc
 
     elapsed = time.perf_counter() - t0
 

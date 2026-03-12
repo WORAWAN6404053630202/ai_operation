@@ -2,12 +2,13 @@
 State Manager Service
 Handles persistence of conversation states
 
-- stable persist directory
-- best-effort file locking
-- payload trimming
-- list sessions
-- purge old sessions
-- filter by browser_id
+PRODUCTION FIXES:
+- Persist directory is stable (not dependent on current working directory).
+- Supports env override via conf.STATE_DIR (if present).
+- Best-effort cross-process file locking to prevent concurrent write clobber
+- Payload trimming on save to reduce latency/state bloat (messages + internal_messages)
+- NEW: list sessions
+- NEW: purge sessions older than N days
 """
 
 from __future__ import annotations
@@ -48,10 +49,12 @@ class StateManager:
         return (session_id or "").replace("/", "_").replace("\\", "_").strip()
 
     def _state_path(self, session_id: str) -> Path:
-        return self.dir / f"{self._safe_session_id(session_id)}.json"
+        safe_id = self._safe_session_id(session_id)
+        return self.dir / f"{safe_id}.json"
 
     def _lock_path(self, session_id: str) -> Path:
-        return self.dir / f"{self._safe_session_id(session_id)}.lock"
+        safe_id = self._safe_session_id(session_id)
+        return self.dir / f"{safe_id}.lock"
 
     def _acquire_lock(self, session_id: str) -> None:
         lock_path = self._lock_path(session_id)
@@ -82,8 +85,9 @@ class StateManager:
                 time.sleep(self._lock_poll_s)
 
     def _release_lock(self, session_id: str) -> None:
+        lock_path = self._lock_path(session_id)
         try:
-            self._lock_path(session_id).unlink(missing_ok=True)
+            lock_path.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -173,8 +177,12 @@ class StateManager:
                 pass
             self._release_lock(session_id)
 
-    def list_sessions(self, limit: int = 20, browser_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    # ============================================================
+    # NEW: session listing
+    # ============================================================
+    def list_sessions(self, limit: int = 20, client_key: Optional[str] = None) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
+        client_key = (client_key or "").strip()
 
         for path in sorted(self.dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
             try:
@@ -182,33 +190,31 @@ class StateManager:
                     data = json.load(f)
 
                 data.pop("_meta", None)
-                ctx = data.get("context") or {}
 
-                if browser_id:
-                    owner = str(ctx.get("browser_id") or "").strip()
-                    if owner != str(browser_id).strip():
+                context = data.get("context") or {}
+                if client_key:
+                    owner_key = str(context.get("client_key") or "").strip()
+                    if owner_key != client_key:
                         continue
 
                 session_id = str(data.get("session_id") or path.stem)
                 persona_id = str(data.get("persona_id") or "practical")
+                messages = data.get("messages") or []
 
-                chat_title = str(ctx.get("chat_title") or "").strip()
-                if not chat_title:
-                    first_user = ""
-                    messages = data.get("messages") or []
-                    for m in messages:
-                        if m.get("role") == "user" and (m.get("content") or "").strip():
-                            first_user = (m.get("content") or "").strip()
-                            break
-                    chat_title = first_user[:60] if first_user else f"Chat {session_id[-4:]}"
+                first_user = ""
+                for m in messages:
+                    if m.get("role") == "user" and (m.get("content") or "").strip():
+                        first_user = (m.get("content") or "").strip()
+                        break
 
+                preview = first_user[:80] if first_user else f"Session {session_id}"
                 updated_at = path.stat().st_mtime
 
                 out.append(
                     {
                         "session_id": session_id,
                         "persona_id": persona_id,
-                        "title": chat_title,
+                        "preview": preview,
                         "updated_at": updated_at,
                     }
                 )
@@ -220,14 +226,19 @@ class StateManager:
 
         return out
 
+    # ============================================================
+    # NEW: purge old sessions
+    # ============================================================
     def purge_older_than_days(self, days: int = 7) -> int:
         deleted = 0
-        cutoff = time.time() - (max(1, int(days)) * 86400)
+        now = time.time()
+        cutoff = now - (max(1, int(days)) * 86400)
 
         for path in self.dir.glob("*.json"):
             try:
                 if path.stat().st_mtime < cutoff:
-                    self.delete(path.stem)
+                    session_id = path.stem
+                    self.delete(session_id)
                     deleted += 1
             except Exception:
                 continue
