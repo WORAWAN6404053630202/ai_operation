@@ -391,6 +391,7 @@ class PracticalPersonaService:
         "ฟอร์มเอกสารตัวจริง": {
             "meta_keys": [
                 "restaurant_ai_document", "form", "template", "ฟอร์ม", "เอกสาร AI ร้านอาหาร",
+                "research_reference",
             ],
             "content_keywords": ["แบบฟอร์ม", "ดาวน์โหลด", "ฟอร์ม", "ตัวอย่างเอกสาร", "คำขอ", "ช่องทางออนไลน์"],
         },

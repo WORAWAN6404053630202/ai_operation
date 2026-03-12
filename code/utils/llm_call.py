@@ -48,6 +48,7 @@ def llm_invoke(
         except Exception as exc:
             last_exc = exc
             elapsed = time.perf_counter() - t0
+            log.warning("[%s] exception: %s — %s", label, type(exc).__name__, str(exc)[:300])
             if attempt < _MAX_RETRIES:
                 delay = _RETRY_DELAYS[attempt]
                 log.warning(
