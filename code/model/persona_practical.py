@@ -311,8 +311,13 @@ class PracticalPersonaService:
                 elif isinstance(out, tuple) and len(out) == 2:
                     new_t, lint_meta = out  # enforce_practical_policy returns (text, meta_dict)
                     if isinstance(new_t, str) and new_t.strip():
+                        old_len = len(t)
                         t = new_t.strip()
+                        # ✅ LOG: fallback triggered
+                        if old_len != len(t):
+                            _LOG.info("[Practical/lint] Policy fallback triggered: old_len=%d new_len=%d", old_len, len(t))
                     if isinstance(lint_meta, dict) and lint_meta.get("ok") is False:
+                        _LOG.warning("[Practical/lint] Policy validation failed: %s", lint_meta)
                         raise ValueError("practical_lint_failed")
                 elif isinstance(out, dict):
                     new_t = out.get("text") or out.get("output") or out.get("result")
@@ -470,6 +475,14 @@ class PracticalPersonaService:
         if not t:
             return False
         return bool(self._THANKS_RE.search(t) or self._OK_RE.match(t))
+
+    def _looks_like_asking_for_reference(self, s: str) -> bool:
+        """Detect if user explicitly asks for research reference links."""
+        t = self._normalize_for_intent(s)
+        if not t:
+            return False
+        # Match patterns like: "อ้างอิงคืออะไร", "ขออ้างอิง", "มีอ้างอิงไหม", "reference"
+        return bool(re.search(r"(อ้างอิง|reference|research|เอกสารอ้างอิง|แหล่งอ้างอิง)", t, re.IGNORECASE))
 
     def _tokenize_loose(self, s: str) -> List[str]:
         t = self._normalize_for_intent(s)
@@ -830,6 +843,14 @@ class PracticalPersonaService:
                     text = text.split("```")[1].split("```")[0].strip()
 
                 obj = json.loads(text)
+                
+                # ✅ DEBUG LOG: show raw LLM JSON response before processing
+                if isinstance(obj, dict):
+                    action = obj.get("action", "?")
+                    exec_data = obj.get("execution", {})
+                    q = exec_data.get("question", "") if isinstance(exec_data, dict) else ""
+                    _LOG.info("[Practical/json] LLM response: action=%r question=%r", action, q[:100])
+                
                 return obj if isinstance(obj, dict) else {}
             except Exception as e:
                 last_err = e

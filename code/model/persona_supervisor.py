@@ -327,7 +327,7 @@ class PersonaSupervisor:
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
             temperature=0.0,
-            max_tokens=220,
+            max_tokens=300,  # ✅ Increased from 220 to accommodate 5 topics + reasoning
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
@@ -378,7 +378,7 @@ class PersonaSupervisor:
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
             temperature=0.0,
-            max_tokens=96,
+            max_tokens=180,  # ✅ Increased from 150 to accommodate yes/no + reasoning
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
@@ -415,7 +415,7 @@ class PersonaSupervisor:
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
             temperature=0.0,
-            max_tokens=96,
+            max_tokens=250,  # ✅ Increased from 200 to accommodate analysis + reasoning
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
@@ -457,7 +457,7 @@ class PersonaSupervisor:
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
             temperature=0.35,
-            max_tokens=120,
+            max_tokens=200,  # ✅ Increased from 120 to accommodate context-aware greetings
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
@@ -519,6 +519,63 @@ class PersonaSupervisor:
 
         return _call
 
+    def _default_deduplicate_options_llm_call(self) -> Callable[[List[str]], dict]:
+        """
+        LLM-based deduplication of similar/redundant options.
+        Return JSON: {"unique_options": ["..."], "reasoning": "..."}
+        - Groups semantically similar options
+        - Prefers more specific/complete versions
+        - Removes redundant entries
+        """
+        switch_model = getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL)
+        timeout = int(getattr(conf, "LLM_REQUEST_TIMEOUT", 30))
+        llm = ChatOpenAI(
+            model=switch_model,
+            openai_api_key=conf.OPENROUTER_API_KEY,
+            openai_api_base=conf.OPENROUTER_BASE_URL,
+            temperature=0.0,
+            max_tokens=300,  # ✅ Enough for list of options + reasoning
+            request_timeout=timeout,
+            model_kwargs={"response_format": {"type": "json_object"}},
+        )
+
+        def _call(options: List[str]) -> dict:
+            if len(options) <= 1:
+                return {"unique_options": options, "reasoning": "Only one option"}
+            
+            opts_str = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(options)])
+            prompt = (
+                "คุณเป็น AI ที่ช่วยจัดกลุ่มและกำจัดตัวเลือกที่ซ้ำซ้อน\n"
+                "กติกา:\n"
+                "1. ถ้าตัวเลือกมีความหมายเดียวกัน ให้เลือกเอาแค่ตัวที่เฉพาะเจาะจงกว่า (เช่น 'บริษัทจำกัด' ดีกว่า 'บริษัท')\n"
+                "2. ถ้าตัวเลือกเป็นการรวมกันของหลายประเภท (เช่น '1.ห้างหุ้นส่วนจำกัด 2.ห้างหุ้นส่วนสามัญ') ให้แยกออกมาเป็นรายการเดี่ยว\n"
+                "3. ถ้าตัวเลือกเป็นคำกว้างๆ แล้วมีคำเฉพาะเจาะจงกว่า ให้เอาเฉพาะตัวเจาะจง (เช่น มี 'ห้างหุ้นส่วนจำกัด' และ 'ห้างหุ้นส่วน' ให้เก็บทั้งคู่ถ้าต่างกัน แต่ถ้าหมายถึงสิ่งเดียวกันเอาตัวเจาะจงกว่า)\n"
+                "4. รักษาคำที่มีความหมายแตกต่างกันไว้ทั้งหมด\n\n"
+                f"ตัวเลือกที่มี:\n{opts_str}\n\n"
+                "Return JSON: {\"unique_options\": [list ของตัวเลือกที่ไม่ซ้ำกัน เรียงตามความเหมาะสม], \"reasoning\": \"อธิบายสั้นๆ ว่าทำไมถึงเลือกแบบนี้\"}"
+            )
+            
+            try:
+                resp = llm_invoke(llm, prompt)
+                txt = resp.strip()
+                if txt.startswith("```json"):
+                    txt = txt.replace("```json", "").replace("```", "").strip()
+                data = json.loads(txt)
+                
+                unique = data.get("unique_options", options)
+                reasoning = data.get("reasoning", "")
+                
+                _LOG.info(
+                    "[Supervisor] deduplicate_options: %d → %d options | reasoning=%s",
+                    len(options), len(unique), reasoning[:100]
+                )
+                return {"unique_options": unique, "reasoning": reasoning}
+            except Exception as e:
+                _LOG.warning("[Supervisor] deduplicate_options_llm failed: %s", e)
+                return {"unique_options": options, "reasoning": f"Error: {e}"}
+        
+        return _call
+
     def _default_slot_mapper_llm_call(self) -> Callable[[str, str, List[str]], dict]:
         """
         Map a free-text reply into one of pending_slot options.
@@ -533,7 +590,7 @@ class PersonaSupervisor:
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
             temperature=0.0,
-            max_tokens=120,
+            max_tokens=180,  # ✅ Increased from 120 to accommodate slot mapping + confidence + reasoning
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
@@ -583,7 +640,7 @@ class PersonaSupervisor:
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
             temperature=0.0,
-            max_tokens=150,
+            max_tokens=250,  # ✅ Increased from 150 to accommodate intent classification + query generation + confidence + reasoning
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
@@ -842,6 +899,7 @@ class PersonaSupervisor:
         llm_greet_prefix_call: Optional[Callable[[str, str, str, bool], dict]] = None,
         llm_topic_picker_call: Optional[Callable[[str, List[str], int, List[str]], dict]] = None,
         llm_slot_mapper_call: Optional[Callable[[str, str, List[str]], dict]] = None,
+        llm_deduplicate_options_call: Optional[Callable[[List[str]], dict]] = None,
     ):
         self.retriever = retriever
         self._academic = AcademicPersonaService(retriever=retriever)
@@ -857,6 +915,9 @@ class PersonaSupervisor:
 
         # ✅ NEW: LLM fallback intent classifier — replaces hardcoded error message
         self.llm_fallback_intent_call = self._default_fallback_intent_llm_call()
+
+        # ✅ NEW: LLM-based deduplication of similar options
+        self._deduplicate_options_llm_call = llm_deduplicate_options_call or self._default_deduplicate_options_llm_call()
 
         self._rng = random.Random()
 
@@ -1192,6 +1253,7 @@ class PersonaSupervisor:
         Given already-retrieved docs for a topic, find ALL registration_type values
         that exist in Chroma for the same license_type domain.
         Uses Chroma metadata query (exact match, not similarity) — fully deterministic.
+        Then uses LLM to deduplicate and normalize similar options.
         Returns sorted list. Returns [] if license_type not found or on any error.
         """
         try:
@@ -1220,12 +1282,42 @@ class PersonaSupervisor:
                 rt = ((md or {}).get("registration_type") or "").strip()
                 if rt:
                     types.add(rt)
-            reg_types = sorted(types)
+            
+            # Step 4: Filter out garbage/non-entity values
+            # Valid entity types contain these keywords (case-insensitive)
+            VALID_KEYWORDS = [
+                "บุคคลธรรมดา", "นิติบุคคล", "บริษัท", "ห้างหุ้นส่วน", 
+                "กิจการ", "เจ้าของ", "จำกัด", "สามัญ", "มหาชน"
+            ]
+            # Invalid patterns that indicate data quality issues
+            INVALID_PATTERNS = [
+                "จำนวน", "ชื่อของ", "ผู้ที่ต้อง", "ขอจอง", "ยื่น", "การ"
+            ]
+            
+            def is_valid_entity_type(t: str) -> bool:
+                t_lower = t.lower()
+                # Reject if contains invalid patterns
+                if any(inv in t for inv in INVALID_PATTERNS):
+                    return False
+                # Accept if contains valid keywords
+                return any(kw in t for kw in VALID_KEYWORDS)
+            
+            filtered_types = [t for t in types if is_valid_entity_type(t)]
+            
+            if not filtered_types:
+                return []
+            
+            # Step 5: Use LLM to deduplicate and normalize similar options
+            dedupe_call = self._deduplicate_options_llm_call()
+            result = dedupe_call(filtered_types)
+            unique_options = result.get("unique_options", filtered_types)
+            reasoning = result.get("reasoning", "")
+            
             _LOG.info(
-                "[Supervisor] _get_registration_types_for_docs: license_type=%r → %d types: %s",
-                license_type, len(reg_types), reg_types,
+                "[Supervisor] _get_registration_types_for_docs: license_type=%r → %d raw → %d filtered → %d unique | reasoning=%s",
+                license_type, len(types), len(filtered_types), len(unique_options), reasoning[:80],
             )
-            return reg_types
+            return sorted(unique_options)
         except Exception as e:
             _LOG.warning("[Supervisor] _get_registration_types_for_docs failed: %s", e)
             return []

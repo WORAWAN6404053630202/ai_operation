@@ -855,20 +855,42 @@ class AcademicPersonaService:
                 if _ln and _ln not in _agg_links:
                     _agg_links.append(_ln)
 
-        # Only inject when user explicitly requested the form/document section
-        # (choice 8 "แบบฟอร์มและเอกสารที่เกี่ยวข้อง" = key "research_reference", or choice 9 "ทั้งหมด")
+        # ✅ NEW POLICY: Only inject links when user explicitly selected sections (not default/auto)
+        # Links are shown ONLY when:
+        # - User completed section selection (not auto-finalized), AND
+        # - Selected "research_reference" section (แบบฟอร์มและเอกสาร) OR "all" (ทั้งหมด)
+        # This prevents default link spam when Academic auto-answers without section menu.
+        # NOTE: We check metadata key "research_reference", NOT hardcoded choice numbers (menu position varies by case)
+        _user_selected_sections = selected.get("type") in ("specific", "all")
         _ref_section_requested = (
-            selected.get("type") == "all"
-            or "research_reference" in (selected.get("keys") or [])
+            _user_selected_sections
+            and (selected.get("type") == "all" or "research_reference" in (selected.get("keys") or []))
         )
+        
         _agg_section = ""
         if _agg_links and _ref_section_requested:
-            _agg_section = (
-                "\nAGGREGATED_REFERENCE_LINKS"
-                f" (กรองเฉพาะ topic '{_primary_lt}' — ใส่ทุก link แบบฟอร์ม/คำขอ; คู่มือเลือกแค่ที่จำเป็นโดยตรงกับกระบวนการที่ถาม):\n"
-                + "\n".join(f"- {lnk}" for lnk in _agg_links)
-                + "\n"
-            )
+            # ✅ Filter links by category:
+            # - แบบฟอร์ม: ALWAYS include (all form links)
+            # - คู่มือ: include ONLY essential/critical ones (LLM decides)
+            # - อ้างอิง: NEVER include (unless user explicitly asks "อ้างอิงคืออะไร")
+            _form_links = []
+            _guide_links = []
+            for lnk in _agg_links:
+                lnk_lower = lnk.lower()
+                # Detect form links (แบบฟอร์ม, บอจ., ภพ., แบบ, form, application)
+                if any(kw in lnk_lower for kw in ["แบบฟอร์ม", "บอจ", "ภพ", "แบบ", "/form", "application", ".pdf"]):
+                    _form_links.append(lnk)
+                # Detect guide links (คู่มือ, guide, manual)
+                elif any(kw in lnk_lower for kw in ["คู่มือ", "guide", "manual"]):
+                    _guide_links.append(lnk)
+                # Anything else: skip (likely research reference)
+            
+            # Build instruction for LLM
+            _instruction = f" (กรองเฉพาะ topic '{_primary_lt}')"
+            if _form_links:
+                _agg_section += f"\n📄 FORM_LINKS{_instruction} — แสดงทั้งหมด:\n" + "\n".join(f"- {lnk}" for lnk in _form_links) + "\n"
+            if _guide_links:
+                _agg_section += f"\n📖 GUIDE_LINKS{_instruction} — เลือกเฉพาะคู่มือที่จำเป็นโดยตรงกับกระบวนการที่ถาม (ไม่ใช่ทั้งหมด):\n" + "\n".join(f"- {lnk}" for lnk in _guide_links) + "\n"
 
         return f"""
 {SYSTEM_PROMPT_ACADEMIC}
