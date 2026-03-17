@@ -38,6 +38,11 @@ Persona Supervisor (Hybrid Routing + FSM) — Option A (Supervisor owns ALL visi
   - Academic answers → auto-returns to Practical silently
 - If user says "change/switch persona/mode" (with/without target):
   - SWITCH IMMEDIATELY to academic if that's the target, no confirmation
+
+✅ Professional Logging:
+- ใช้ structured logging แทน plain text logs
+- บันทึก request_id, session_id, performance metrics
+- อ่านง่าย เข้าใจได้ทันที
 - Academic resume: re-enter academic silently if user wants to continue previous topic
 - No "กลับมาโหมด Practical แล้วครับ" announcements
 - Academic final_answer 3-branch logic stays in AcademicPersonaService (no changes here)
@@ -58,6 +63,10 @@ import random
 import hashlib
 
 _LOG = logging.getLogger("restbiz.supervisor")
+
+# Professional logging system
+from utils.logger import get_logger, log_function_call, TimingContext
+logger = get_logger(__name__)
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
@@ -534,7 +543,7 @@ class PersonaSupervisor:
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
             temperature=0.0,
-            max_tokens=300,  # ✅ Enough for list of options + reasoning
+            max_tokens=600,  # ✅ เพิ่มจาก 300 เพื่อรองรับ list ที่ยาวขึ้น
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
@@ -565,13 +574,23 @@ class PersonaSupervisor:
                 unique = data.get("unique_options", options)
                 reasoning = data.get("reasoning", "")
                 
-                _LOG.info(
-                    "[Supervisor] deduplicate_options: %d → %d options | reasoning=%s",
-                    len(options), len(unique), reasoning[:100]
-                )
+                # ✅ Log แบบ structured - อ่านง่าย เห็น context ชัดเจน
+                logger.log_with_data("info", "🎯 ลบตัวเลือกซ้ำสำเร็จ", {
+                    "action": "deduplicate_options",
+                    "before_count": len(options),
+                    "after_count": len(unique),
+                    "removed_count": len(options) - len(unique),
+                    "reasoning": reasoning[:100],
+                    "model": "claude-haiku"
+                })
                 return {"unique_options": unique, "reasoning": reasoning}
             except Exception as e:
-                _LOG.warning("[Supervisor] deduplicate_options_llm failed: %s", e)
+                # ✅ Log error พร้อม context
+                logger.log_with_data("warning", "⚠️ ลบตัวเลือกซ้ำล้มเหลว ใช้ข้อมูลเดิม", {
+                    "action": "deduplicate_options",
+                    "error": str(e),
+                    "fallback": "using_original_options"
+                })
                 return {"unique_options": options, "reasoning": f"Error: {e}"}
         
         return _call
@@ -1308,8 +1327,7 @@ class PersonaSupervisor:
                 return []
             
             # Step 5: Use LLM to deduplicate and normalize similar options
-            dedupe_call = self._deduplicate_options_llm_call()
-            result = dedupe_call(filtered_types)
+            result = self._deduplicate_options_llm_call(filtered_types)
             unique_options = result.get("unique_options", filtered_types)
             reasoning = result.get("reasoning", "")
             
@@ -1320,6 +1338,63 @@ class PersonaSupervisor:
             return sorted(unique_options)
         except Exception as e:
             _LOG.warning("[Supervisor] _get_registration_types_for_docs failed: %s", e)
+            return []
+
+    def _get_operation_groups_for_entity(self, license_type: str, entity_type_normalized: str) -> List[str]:
+        """
+        ดึง operation_by_department จาก Chroma แล้วจัดกลุ่มเป็น 3 หมวดหลัก:
+        - จดทะเบียนใหม่
+        - แก้ไขรายการจดทะเบียน
+        - ยกเลิกการจดทะเบียน
+        คืนค่า list ของกลุ่มที่มีข้อมูลจริงใน Chroma เท่านั้น
+        """
+        try:
+            vectorstore = getattr(self._practical.retriever, "vectorstore", None)
+            if vectorstore is None:
+                return []
+            coll = getattr(vectorstore, "_collection", None)
+            if coll is None:
+                return []
+
+            result = coll.get(
+                where={"$and": [
+                    {"license_type": license_type},
+                    {"entity_type_normalized": entity_type_normalized},
+                ]},
+                include=["metadatas"],
+            )
+
+            ops: set = set()
+            for md in (result.get("metadatas") or []):
+                op = ((md or {}).get("operation_by_department") or "").strip()
+                if op:
+                    ops.add(op)
+
+            if not ops:
+                return []
+
+            has_new    = any("การจดทะเบียน" in o for o in ops)
+            has_edit   = any(o.startswith("แก้ไข") for o in ops)
+            has_cancel = any(o.startswith("ยกเลิก") for o in ops)
+            has_info   = any("อายุ" in o or "สิทธิ์" in o for o in ops)
+
+            groups = []
+            if has_new:
+                groups.append("จดทะเบียนใหม่ (จัดตั้ง)")
+            if has_edit:
+                groups.append("แก้ไขรายการจดทะเบียน")
+            if has_cancel:
+                groups.append("ยกเลิกการจดทะเบียน")
+            if has_info:
+                groups.append("ข้อมูลทั่วไป / ข้อกำหนด")
+
+            _LOG.info(
+                "[Supervisor] operation_groups: license=%r entity=%r → %s",
+                license_type, entity_type_normalized, groups,
+            )
+            return groups
+        except Exception as e:
+            _LOG.warning("[Supervisor] _get_operation_groups_for_entity failed: %s", e)
             return []
 
     def _route_pending_slot_to_persona(self, state: ConversationState, user_input: str) -> Tuple[ConversationState, str]:
@@ -1397,7 +1472,65 @@ class PersonaSupervisor:
                 or ""
             ).strip()
 
-            if _entity_val:
+            # ✅ Level 3: ถ้า pending slot เป็น operation_group → กรอง docs ตาม operation ที่เลือก
+            _pending_key = pending.get("key") if isinstance(pending, dict) else None
+            if _pending_key == "operation_group":
+                # Map group label back to Chroma keyword prefix for filtering
+                _op_group_val = str(mapped).strip()
+                _op_kw_map = {
+                    "จดทะเบียนใหม่ (จัดตั้ง)":    "การจดทะเบียน",
+                    "แก้ไขรายการจดทะเบียน":       "แก้ไข",
+                    "ยกเลิกการจดทะเบียน":          "ยกเลิก",
+                    "ข้อมูลทั่วไป / ข้อกำหนด":    "อายุ",
+                }
+                _op_prefix = _op_kw_map.get(_op_group_val)
+
+                # Recover entity_type from previously saved slots
+                _saved_entity = None
+                try:
+                    _saved_entity = (state.get_collected_slots() or {}).get("entity_type")
+                    if _saved_entity:
+                        from service.data_loader import DataLoader as _DL2
+                        _saved_entity = _DL2._normalize_entity_type(_saved_entity)
+                except Exception:
+                    pass
+
+                if _op_prefix and _saved_entity:
+                    # Build $and filter: entity_type_normalized + operation_by_department starts with prefix
+                    enriched_q = f"{base_q} {_op_group_val}".strip() if base_q else _op_group_val
+                    try:
+                        # Chroma $and with $contains for operation prefix
+                        op_filter = {"$and": [
+                            {"entity_type_normalized": _saved_entity},
+                            {"operation_by_department": {"$contains": _op_prefix}},
+                        ]}
+                        state.current_docs = self._practical._retrieve_docs(enriched_q, metadata_filter=op_filter)
+                        state.last_retrieval_query = enriched_q
+                        _LOG.info(
+                            "[Supervisor] op-group retrieval: entity=%r op=%r prefix=%r docs=%d",
+                            _saved_entity, _op_group_val, _op_prefix, len(state.current_docs),
+                        )
+                    except Exception as e:
+                        _LOG.warning("[Supervisor] op-group retrieval failed (%s), falling back to entity-only", e)
+                        # Fallback: just entity filter without operation filter
+                        try:
+                            state.current_docs = self._practical._retrieve_docs(
+                                enriched_q, metadata_filter={"entity_type_normalized": _saved_entity}
+                            )
+                        except Exception:
+                            pass
+                elif _saved_entity:
+                    # No prefix matched — still re-retrieve with entity filter
+                    enriched_q = f"{base_q} {_op_group_val}".strip() if base_q else _op_group_val
+                    try:
+                        state.current_docs = self._practical._retrieve_docs(
+                            enriched_q, metadata_filter={"entity_type_normalized": _saved_entity}
+                        )
+                        state.last_retrieval_query = enriched_q
+                    except Exception:
+                        pass
+
+            elif _entity_val:
                 # Re-retrieve with entity-type filter for better doc coverage
                 enriched_q = f"{base_q} {_entity_val}".strip() if base_q else _entity_val
                 entity_filter = {"entity_type_normalized": _entity_val}
@@ -1407,6 +1540,22 @@ class PersonaSupervisor:
                     _LOG.info("[Supervisor] entity-enriched retrieval: entity=%r docs=%d", _entity_val, len(state.current_docs))
                 except Exception as e:
                     _LOG.warning("[Supervisor] entity-enriched retrieval failed: %s", e)
+
+                # ✅ Level 3: ดึง operation groups จาก Chroma เพื่อถามว่าต้องการทำเรื่องอะไร
+                # (จดทะเบียนใหม่ / แก้ไข / ยกเลิก) แทนที่จะให้ LLM เดาเอง
+                _license_type = None
+                for d in (state.current_docs or []):
+                    lt = ((d.get("metadata") or {}).get("license_type") or "").strip()
+                    if lt:
+                        _license_type = lt
+                        break
+                if _license_type:
+                    _op_groups = self._get_operation_groups_for_entity(_license_type, _entity_val)
+                    if _op_groups:
+                        state.context["topic_operation_groups"] = _op_groups
+                        _LOG.info("[Supervisor] topic_operation_groups set → %s", _op_groups)
+                    else:
+                        state.context.pop("topic_operation_groups", None)
 
         pid = normalize_persona_id(state.persona_id)
         if pid == "academic":
@@ -2493,3 +2642,4 @@ class PersonaSupervisor:
         _LOG.warning("[Supervisor] fallback_safe_return persona=%s input=%r", getattr(state, "persona_id", "?"), raw_stripped[:60])
         state.last_action = "fallback_safe_return"
         return self._handle_greeting(state, raw_stripped)
+    

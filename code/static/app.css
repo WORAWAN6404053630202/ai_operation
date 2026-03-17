@@ -261,7 +261,7 @@ textarea{
 
 .topic-cards{
   margin-top:22px;
-  display:grid;
+  display:none; /* ซ่อนการ์ดตอนโหลด จะแสดงเมื่อได้รับข้อมูลจาก API */
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap:12px;
   text-align:left;

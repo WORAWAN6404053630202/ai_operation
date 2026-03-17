@@ -105,6 +105,13 @@ function renderMessage(role, content) {
 
 function renderTopicCards(topics = []) {
   topicCards.innerHTML = "";
+  
+  // แสดงการ์ดเมื่อมีข้อมูล
+  if (topics && topics.length > 0) {
+    topicCards.style.display = "grid";
+  } else {
+    topicCards.style.display = "none";
+  }
 
   topics.forEach((topic) => {
     const btn = document.createElement("button");

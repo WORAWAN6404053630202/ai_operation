@@ -8,8 +8,10 @@ FastAPI Application Entry Point
 2. เชื่อมต่อ router (เส้นทาง API ทั้งหมดอยู่ใน router/route_v1.py)
 3. เสิร์ฟไฟล์ static (รูป, CSS, JS)
 4. เสิร์ฟหน้าเว็บ HTML หลัก (static/index.html)
+5. ติดตั้ง monitoring middleware และ logging
 """
 
+import os
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -18,12 +20,29 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from router.route_v1 import api_v1
+from router.monitoring import router as monitoring_router
+from utils.middleware import MonitoringMiddleware, HealthCheckMiddleware
+from utils.logger import setup_logging, get_logger
+
+# Setup logging based on environment
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_FORMAT = os.getenv("LOG_FORMAT", "human")  # "human" or "json"
+LOG_FILE = os.getenv("LOG_FILE", None)
+
+setup_logging(level=LOG_LEVEL, log_format=LOG_FORMAT, log_file=LOG_FILE)
+logger = get_logger(__name__)
+
+logger.info(f"Starting application with LOG_LEVEL={LOG_LEVEL}, LOG_FORMAT={LOG_FORMAT}")
 
 app = FastAPI(
     title="Restbiz — น้องสุดยอด",
     description="Thai Regulatory AI Assistant for restaurant businesses",
     version="1.0.0",
 )
+
+# Add monitoring middleware (before CORS)
+app.add_middleware(HealthCheckMiddleware)
+app.add_middleware(MonitoringMiddleware, enable_debug=(LOG_LEVEL == "DEBUG"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,7 +52,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include routers
 app.include_router(api_v1, prefix="/api/v1")
+app.include_router(monitoring_router)
 
 static_dir = Path(__file__).parent / "static"
 static_dir.mkdir(exist_ok=True)

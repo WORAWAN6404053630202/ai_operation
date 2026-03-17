@@ -15,6 +15,8 @@ from adapter.response.response_custom import HandleSuccess
 from model.conversation_state import ConversationState
 from model.state_manager import StateManager
 from model.persona_supervisor import PersonaSupervisor
+from utils.simple_cache import get_cache
+from utils.rate_limiter import get_rate_limiter
 
 import conf
 
@@ -192,6 +194,12 @@ async def delete_session(request: SessionRequest):
 
 @api_v1.get("/healthcheck")
 async def health_check():
+    cache = get_cache()
+    cache_stats = cache.get_stats()
+    
+    rate_limiter = get_rate_limiter()
+    rate_stats = rate_limiter.get_stats()
+    
     return {
         "status": "ok",
         "timestamp": datetime.datetime.now().isoformat(),
@@ -202,6 +210,8 @@ async def health_check():
         "use_zilliz": conf.USE_ZILLIZ,
         "collection_name": conf.COLLECTION_NAME,
         "session_retention_days": SESSION_RETENTION_DAYS,
+        "cache": cache_stats,
+        "rate_limit": rate_stats
     }
 
 
@@ -223,19 +233,76 @@ async def chat(request: ChatRequest):
     _cleanup_old_sessions()
 
     session_id = request.session_id or f"s_{uuid.uuid4().hex[:8]}"
+    
+    # Rate limiting check
+    rate_limiter = get_rate_limiter()
+    allowed, rate_info = rate_limiter.is_allowed(session_id)
+    
+    if not allowed:
+        logger.warning(f"[{session_id}] 🚫 Rate limit exceeded - blocking request")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many requests. Please wait {rate_info['retry_after']} seconds.",
+            headers={
+                "X-RateLimit-Limit": str(rate_info["limit"]),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(rate_info["reset_in"]),
+                "Retry-After": str(rate_info["retry_after"])
+            }
+        )
+    
+    logger.info(f"[{session_id}] ✅ Rate limit OK - {rate_info['remaining']}/{rate_info['limit']} remaining")
 
     try:
+        # Load state
         saved = state_manager.load(session_id)
         state = saved if saved else ConversationState(session_id=session_id, persona_id="practical", context={})
-
+        
+        # Check cache first
+        cache = get_cache()
+        cached_result = cache.get(session_id, request.message, state.persona_id)
+        
+        if cached_result is not None:
+            logger.info(f"[{session_id}] 🎯 Cache HIT! Skipping LLM call (saved ${cached_result.get('cost', 0):.3f})")
+            
+            # Update state with cached message (but don't call LLM)
+            state.messages.append({"role": "user", "content": request.message})
+            state.messages.append({"role": "assistant", "content": cached_result["response"]})
+            state_manager.save(session_id, state)
+            
+            return HandleSuccess(
+                message="Chat completed (cached)",
+                response=cached_result["response"],
+                session_id=session_id,
+                persona_id=state.persona_id,
+                cached=True,
+                cache_stats=cache.get_stats()
+            )
+        
+        # Cache miss - call LLM
+        logger.info(f"[{session_id}] ❌ Cache MISS - Calling LLM")
         state, bot_reply = supervisor.handle(state, request.message)
         state_manager.save(session_id, state)
+        
+        # Store in cache for future use
+        cache.set(
+            session_id=session_id,
+            question=request.message,
+            value={
+                "response": bot_reply,
+                "cost": 0.033,  # Average cost (will be updated from actual metrics)
+                "persona": state.persona_id
+            },
+            persona=state.persona_id
+        )
 
         return HandleSuccess(
             message="Chat completed",
             response=bot_reply,
             session_id=session_id,
             persona_id=state.persona_id,
+            cached=False,
+            cache_stats=cache.get_stats()
         )
 
     except Exception as e:

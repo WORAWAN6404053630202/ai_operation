@@ -12,7 +12,11 @@ from model.conversation_state import ConversationState
 from utils.llm_call import llm_invoke
 from utils.prompts_practical import SYSTEM_PROMPT as SYSTEM_PROMPT_PRACTICAL
 
-_LOG = logging.getLogger("restbiz.practical")
+# Import professional logging
+from utils.logger import get_logger, log_function_call, TimingContext
+
+_LOG = logging.getLogger("restbiz.practical")  # Keep for backward compatibility
+logger = get_logger(__name__)  # ใช้ logger ใหม่ (มี structure + context)
 
 # Metadata fields with no semantic value for the LLM — always hidden from docs_json
 _LLM_HIDDEN_METADATA_KEYS = frozenset({"row_id", "source"})
@@ -176,8 +180,25 @@ class PracticalPersonaService:
                 f"ตัวอย่างหัวข้อในระบบ (เพื่ออ้างอิงคำ): {menu_preview}\n"
             )
             try:
-                text = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greet").content.strip()
-            except Exception:
+                # ✅ วัดเวลาการเรียก LLM
+                with TimingContext(logger, "llm_greet_call"):
+                    text = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greet").content.strip()
+                    
+                # ✅ Log สำเร็จ
+                logger.log_with_data("info", "💬 สร้างคำทักทายสำเร็จ", {
+                    "action": "greet_generation",
+                    "kind": kind,
+                    "greet_streak": greet_streak,
+                    "model": switch_model,
+                    "response_length": len(text)
+                })
+            except Exception as e:
+                # ✅ Log error
+                logger.log_with_data("error", "❌ สร้างคำทักทายล้มเหลว", {
+                    "action": "greet_generation",
+                    "error": str(e),
+                    "fallback": "empty_dict"
+                })
                 return {}
 
             if "```json" in text:
@@ -867,6 +888,9 @@ class PracticalPersonaService:
         }
 
     def _retrieve_docs(self, query: str, metadata_filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        import time
+        start = time.time()
+        
         max_docs = getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 8)
         max_chars = getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 250)
 
@@ -876,33 +900,131 @@ class PracticalPersonaService:
                 try:
                     tmp = vectorstore.as_retriever(search_kwargs={"k": max_docs, "filter": metadata_filter})
                     docs = tmp.invoke(query)
-                    _LOG.info("[Practical] Filtered retrieval (filter=%s) got %d docs", metadata_filter, len(docs))
+                    # ✅ Structured log - เห็นว่าใช้ filter อะไร ได้เอกสารกี่ฉบับ
+                    logger.log_with_data("info", "🔍 ค้นหาเอกสารแบบกรอง", {
+                        "action": "filtered_retrieval",
+                        "query": query[:60],
+                        "filter": str(metadata_filter),
+                        "docs_found": len(docs),
+                        "persona": "practical"
+                    })
                 except Exception as e:
-                    _LOG.warning("[Practical] Filtered retrieval failed (%s), falling back", e)
+                    # ✅ Log error พร้อม fallback
+                    logger.log_with_data("warning", "⚠️ ค้นหาแบบกรองล้มเหลว ใช้วิธีปกติ", {
+                        "action": "filtered_retrieval_failed",
+                        "error": str(e),
+                        "fallback": "standard_retrieval"
+                    })
                     docs = self.retriever.invoke(query)
             else:
                 docs = self.retriever.invoke(query)
         else:
             docs = self.retriever.invoke(query)
 
+        retrieval_ms = (time.time() - start) * 1000
+        
+        # 🎯 Token Optimization: Filter by similarity score
+        # เลือกเฉพาะเอกสารที่มี similarity > threshold
+        min_similarity = getattr(conf, 'RETRIEVAL_MIN_SIMILARITY', 0.6)
+        filtered_docs = []
+        low_quality_docs = []
+        
+        for d in docs:
+            score = getattr(d, 'score', None)
+            if score is not None and score >= min_similarity:
+                filtered_docs.append(d)
+            elif score is not None:
+                low_quality_docs.append((d, score))
+        
+        # Safety: ถ้ากรองจนเหลือน้อยเกิน ให้เอาเอกสารเดิมมาใช้
+        if len(filtered_docs) < 2:
+            logger.log_with_data("warning", "⚠️ Similarity filter เข้มเกิน fallback ใช้เอกสารทั้งหมด", {
+                "filtered_count": len(filtered_docs),
+                "total_docs": len(docs),
+                "min_similarity": min_similarity
+            })
+            filtered_docs = docs
+        else:
+            # Log ว่ากรองออกไปกี่เอกสาร
+            logger.log_with_data("info", "🎯 กรองเอกสารตาม similarity", {
+                "before": len(docs),
+                "after": len(filtered_docs),
+                "removed": len(low_quality_docs),
+                "min_similarity": min_similarity
+            })
+        
+        docs = filtered_docs
+        
+        # Extract similarity scores if available
+        scores = []
+        for d in docs:
+            score = getattr(d, 'score', None)
+            if score is not None:
+                scores.append(score)
+        
+        # Extract top topics
+        topics = []
+        for d in docs[:3]:
+            md = getattr(d, 'metadata', {})
+            topic = md.get('operation_topic') or md.get('topic', '')
+            if topic and topic not in topics:
+                topics.append(topic)
+        
         results: List[Dict[str, Any]] = []
         for d in docs[:max_docs]:
             results.append(
                 {"content": (getattr(d, "page_content", "") or "")[:max_chars], "metadata": getattr(d, "metadata", {}) or {}}
             )
 
-        # INFO-level doc visibility log (always visible in production)
-        _LOG.info("[Practical] _retrieve_docs query=%r → %d docs returned", query[:60], len(results))
+        # ✅ Enhanced RAG metrics logging for AI Engineers
+        logger.log_with_data("info", "📚 RAG Retrieval สำเร็จ", {
+            "action": "rag_retrieval",
+            "query": query[:60],
+            "query_length": len(query),
+            "docs_retrieved": len(results),
+            "max_docs": max_docs,
+            "retrieval_time_ms": round(retrieval_ms, 2),
+            "avg_similarity": round(sum(scores) / len(scores), 3) if scores else None,
+            "min_similarity": round(min(scores), 3) if scores else None,
+            "max_similarity": round(max(scores), 3) if scores else None,
+            "top_topics": topics[:3],
+            "has_filter": metadata_filter is not None,
+            "persona": "practical"
+        })
+        
+        # ⚠️ Quality warnings for AI Engineers
+        if len(results) == 0:
+            logger.log_with_data("warning", "⚠️ ไม่พบเอกสารที่เกี่ยวข้อง", {
+                "query": query[:100],
+                "filter": str(metadata_filter) if metadata_filter else None,
+                "risk": "อาจตอบไม่ถูกต้องหรือ hallucinate",
+                "suggestion": "ตรวจสอบ vector database หรือปรับ query"
+            })
+        elif scores and max(scores) < 0.5:
+            logger.log_with_data("warning", "⚠️ ความเกี่ยวข้องต่ำ", {
+                "query": query[:60],
+                "max_similarity": round(max(scores), 3),
+                "threshold": 0.5,
+                "risk": "คำตอบอาจไม่แม่นยำ"
+            })
+        
+        # Log รายละเอียดแต่ละเอกสาร (debug level)
         for i, r in enumerate(results):
             md = r.get("metadata", {}) or {}
             topic = md.get("operation_topic") or md.get("topic") or md.get("filename") or "?"
             etype = md.get("entity_type_normalized") or md.get("entity_type") or ""
             section = md.get("section") or md.get("doc_type") or ""
             snippet = (r.get("content", "") or "")[:80].replace("\n", " ")
-            _LOG.info(
-                "  [doc %d/%d] topic=%r entity=%r section=%r | %r",
-                i + 1, len(results), topic, etype, section, snippet,
-            )
+            
+            logger.log_with_data("debug", f"📄 เอกสารที่ {i+1}", {
+                "doc_index": i + 1,
+                "total_docs": len(results),
+                "topic": topic,
+                "entity_type": etype,
+                "section": section,
+                "snippet": snippet,
+                "similarity": scores[i] if i < len(scores) else None
+            })
 
         return results
 
@@ -1107,6 +1229,12 @@ class PracticalPersonaService:
         user_text = (user_input or "").strip()
         norm = self._normalize_for_intent(user_text)
 
+        auto_internal_guard_key = "_auto_post_retrieve_guard"
+        if not _internal:
+            state.context.pop(auto_internal_guard_key, None)
+        elif user_text == "__auto_post_retrieve__":
+            state.context[auto_internal_guard_key] = int(state.context.get(auto_internal_guard_key, 0) or 0) + 1
+
         # ✅ recovery only in non-internal, owner-gated (already inside the function)
         if not _internal:
             self._maybe_recover_pending_slot_from_last_bot(state, user_text)
@@ -1270,15 +1398,28 @@ Your JSON response:
         exec_ = decision.get("execution", {}) or {}
 
         if action == "retrieve":
-            q = exec_.get("query") or user_text or user_input
-            state.current_docs = self._retrieve_docs(q)
-            state.last_retrieval_query = q
-            tmp = [
-                {"content": d.get("content", "")[:120], "metadata": d.get("metadata", {})}
-                for d in state.current_docs[:1]
-            ]
-            self._debug_log("post_retrieve", query=q, docs_json=tmp)
-            return self.handle(state, "__auto_post_retrieve__", _internal=True)
+            if _internal and user_text == "__auto_post_retrieve__":
+                guard_count = int((state.context or {}).get("_auto_post_retrieve_guard", 0) or 0)
+                if guard_count >= 2:
+                    _LOG.warning(
+                        "[Practical] auto_post_retrieve recursion guard hit (count=%d), forcing ask fallback",
+                        guard_count,
+                    )
+                    action = "ask"
+                    if not isinstance(exec_, dict):
+                        exec_ = {}
+                    exec_.setdefault("question", "อยากได้เช็คลิสต์เอกสารสำหรับเรื่องไหนครับ")
+
+            if action == "retrieve":
+                q = exec_.get("query") or user_text or user_input
+                state.current_docs = self._retrieve_docs(q)
+                state.last_retrieval_query = q
+                tmp = [
+                    {"content": d.get("content", "")[:120], "metadata": d.get("metadata", {})}
+                    for d in state.current_docs[:1]
+                ]
+                self._debug_log("post_retrieve", query=q, docs_json=tmp)
+                return self.handle(state, "__auto_post_retrieve__", _internal=True)
 
         if action == "ask":
             question = (exec_.get("question") or "อยากให้ช่วยเรื่องอะไรเกี่ยวกับร้านอาหารครับ?").strip()
@@ -1287,6 +1428,34 @@ Your JSON response:
                 state.context.update(exec_.get("context_update", {}))
 
             pending = state.context.get("pending_slot")
+
+            # ✅ BYPASS LLM choices: ถ้ามี topic_registration_types จาก Chroma
+            # ให้ใช้เป็น entity_type slot โดยตรง ไม่ต้องรอ LLM สร้างเอง
+            # เพราะ LLM มักสร้างช้อยจากเนื้อหา doc แทน จึงชื่อไม่ตรงกับ registration_type จริง
+            _chroma_types = (state.context or {}).get("topic_registration_types")
+            if not isinstance(pending, dict) and _chroma_types:
+                question = "ธุรกิจของคุณเป็นประเภทใดครับ?"
+                parsed_opts = list(_chroma_types)
+                slot_key = "entity_type"
+                allow_multi = False
+                state.context["pending_slot"] = {"key": slot_key, "options": parsed_opts, "allow_multi": allow_multi}
+                _LOG.info(
+                    "[Practical] entity_type slot set directly from Chroma registration_types → %s",
+                    parsed_opts,
+                )
+
+            # ✅ Level 3: ถ้า entity_type เลือกแล้ว และมี operation_groups → ถามว่าต้องการทำอะไร
+            _op_groups = (state.context or {}).get("topic_operation_groups")
+            if not isinstance(state.context.get("pending_slot"), dict) and _op_groups:
+                question = "ต้องการดำเนินการเรื่องใดครับ?"
+                state.context["pending_slot"] = {
+                    "key": "operation_group",
+                    "options": list(_op_groups),
+                    "allow_multi": False,
+                }
+                state.context.pop("topic_operation_groups", None)
+                _LOG.info("[Practical] operation_group slot set from Chroma groups → %s", _op_groups)
+
             if not isinstance(pending, dict):
                 # Prefer LLM-provided slot_options over regex extraction
                 llm_opts = exec_.get("slot_options")
@@ -1300,7 +1469,6 @@ Your JSON response:
                     # Upgrade slot_options to full deterministic Chroma list when LLM options
                     # overlap with topic_registration_types — catches cases where LLM only saw
                     # a subset of entity types due to embedding ranking (e.g., บริษัทจำกัด missing)
-                    _chroma_types = (state.context or {}).get("topic_registration_types")
                     if _chroma_types and parsed_opts:
                         _overlap = set(parsed_opts) & set(_chroma_types)
                         if _overlap:

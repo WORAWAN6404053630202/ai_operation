@@ -1,7 +1,14 @@
 #/Users/w.worawan/Downloads/ai-operation-microservice3_v2ori/code/tests_enterprise/conftest.py
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 import pytest
+
+# Add code directory to path for imports
+code_dir = Path(__file__).parent.parent
+if str(code_dir) not in sys.path:
+    sys.path.insert(0, str(code_dir))
 
 from model.conversation_state import ConversationState
 from model.persona_supervisor import PersonaSupervisor

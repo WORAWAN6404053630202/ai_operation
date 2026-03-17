@@ -1,14 +1,28 @@
 """
-llm_call.py — Thin wrapper around LangChain LLM .invoke() that logs
-token usage and wall-clock time per call.
+llm_call.py — Enhanced LLM wrapper with comprehensive metrics tracking
+
+Thin wrapper around LangChain LLM .invoke() that:
+- Logs token usage and wall-clock time with structured data
+- Records metrics for monitoring (cost, latency, tokens)
+- Handles retries with exponential backoff
+- Tracks per-persona usage
+- AI Engineer metrics: cost estimation, performance tracking
 
 Usage:
     from code.utils.llm_call import llm_invoke
-    response = llm_invoke(llm, messages, logger=_LOG, label="Practical/answer", state=state)
+    response = llm_invoke(
+        llm, messages, 
+        logger=_LOG, 
+        label="Practical/answer", 
+        state=state,
+        persona="practical",
+        operation="answer"
+    )
     text = (response.content or "").strip()
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -21,7 +35,109 @@ if TYPE_CHECKING:
 
 _ROOT_LOG = logging.getLogger("restbiz.llm")
 
-_TOKEN_WARN_THRESHOLD = 50_000  # warn when session total exceeds this
+
+def _safe_log_with_data(log_obj: logging.Logger, level: str, message: str, payload: dict) -> None:
+    """Structured-log when available, otherwise fallback to plain logging."""
+    method = getattr(log_obj, "log_with_data", None)
+    if callable(method):
+        try:
+            method(level, message, payload)
+            return
+        except Exception as exc:
+            _ROOT_LOG.warning("Structured log failed (%s): %s", message, exc)
+
+    numeric_level = getattr(logging, str(level).upper(), logging.INFO)
+    try:
+        log_obj.log(numeric_level, "%s | %s", message, payload)
+    except Exception:
+        _ROOT_LOG.log(numeric_level, "%s", message)
+
+# Import structured logger
+try:
+    from code.utils.logger import get_logger
+    logger = get_logger(__name__)
+    _STRUCTURED_LOG = True
+except ImportError:
+    logger = _ROOT_LOG
+    _STRUCTURED_LOG = False
+
+# 🎯 Token Management: ลด threshold เพื่อ trim history เร็วขึ้น
+# เดิม: 50,000 tokens (ยอมให้ใช้เยอะมาก)
+# ใหม่: 8,000 tokens (เตือนเมื่อใช้เกิน → trim ทันที)
+_TOKEN_WARN_THRESHOLD = 8_000  # warn when session total exceeds this
+
+# Import metrics if available
+try:
+    from code.utils.metrics import metrics
+    _METRICS_AVAILABLE = True
+except ImportError:
+    _METRICS_AVAILABLE = False
+    _ROOT_LOG.warning("Metrics module not available, metrics collection disabled")
+
+# Import config for budget thresholds
+try:
+    from code import conf
+    _CONF_AVAILABLE = True
+except ImportError:
+    _CONF_AVAILABLE = False
+
+
+def _check_token_budget(total: int, model: str) -> None:
+    """Check token budget and log warnings with severity levels"""
+    if not _CONF_AVAILABLE:
+        return
+    
+    if total >= conf.TOKEN_BUDGET_CRITICAL:
+        logger.error(
+            "🚨 CRITICAL: Token budget exceeded",
+            extra={
+                "tokens": total,
+                "threshold": conf.TOKEN_BUDGET_CRITICAL,
+                "model": model,
+                "severity": "critical",
+                "message": f"Token usage {total:,} exceeds CRITICAL threshold {conf.TOKEN_BUDGET_CRITICAL:,}!"
+            }
+        )
+    elif total >= conf.TOKEN_BUDGET_WARNING:
+        logger.warning(
+            "⚠️ WARNING: Token budget exceeded",
+            extra={
+                "tokens": total,
+                "threshold": conf.TOKEN_BUDGET_WARNING,
+                "target": conf.TOKEN_BUDGET_PER_CALL,
+                "model": model,
+                "severity": "warning",
+                "message": f"Token usage {total:,} exceeds WARNING threshold. Target: {conf.TOKEN_BUDGET_PER_CALL:,}"
+            }
+        )
+    elif total >= _TOKEN_WARN_THRESHOLD:
+        logger.info(
+            "📊 INFO: Token usage within acceptable range",
+            extra={
+                "tokens": total,
+                "target": conf.TOKEN_BUDGET_PER_CALL,
+                "warning_threshold": conf.TOKEN_BUDGET_WARNING,
+                "model": model,
+                "severity": "info"
+            }
+        )
+
+
+# 💰 Cost Estimation (ราคาโดยประมาณ - ตรวจสอบราคาจริงจาก OpenRouter)
+PRICING_USD_PER_MILLION_TOKENS = {
+    "anthropic/claude-sonnet-4": {"input": 3.00, "output": 15.00},
+    "anthropic/claude-4-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
+    "anthropic/claude-haiku-4": {"input": 0.25, "output": 1.25},
+    "anthropic/claude-3.5-haiku-20241022": {"input": 0.25, "output": 1.25},
+    "openai/gpt-4o": {"input": 5.00, "output": 15.00},
+    "openai/chatgpt-4o-latest": {"input": 5.00, "output": 15.00},
+}
+
+def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """คำนวณค่าใช้จ่ายโดยประมาณ (USD)"""
+    pricing = PRICING_USD_PER_MILLION_TOKENS.get(model, {"input": 0, "output": 0})
+    cost = (prompt_tokens * pricing["input"] / 1_000_000) + (completion_tokens * pricing["output"] / 1_000_000)
+    return cost
 
 
 def llm_invoke(
@@ -31,16 +147,35 @@ def llm_invoke(
     logger: Optional[logging.Logger] = None,
     label: str = "LLM",
     state: Optional["ConversationState"] = None,
+    persona: Optional[str] = None,  # "academic", "practical", "supervisor"
+    operation: Optional[str] = None,  # "greet", "topic_picker", "answer", etc
 ) -> Any:
     """
     Call llm.invoke(messages), log elapsed time + token usage, and
     accumulate tokens into state.add_token_usage() if state is provided.
+
+    Args:
+        llm: LangChain LLM instance
+        messages: List of messages to send
+        logger: Logger instance for logging
+        label: Label for log messages
+        state: ConversationState for token tracking
+        persona: Which persona is making the call (for metrics)
+        operation: What operation is being performed (for metrics)
 
     Returns the raw LangChain response object (same as llm.invoke would).
     """
     log = logger or _ROOT_LOG
     t0 = time.perf_counter()
     last_exc: Optional[Exception] = None
+    
+    # Extract model name for metrics
+    model_name = "unknown"
+    try:
+        model_name = getattr(llm, "model", getattr(llm, "model_name", "unknown"))
+    except:
+        pass
+    
     for attempt in range(1 + _MAX_RETRIES):
         try:
             response = llm.invoke(messages)
@@ -49,6 +184,20 @@ def llm_invoke(
             last_exc = exc
             elapsed = time.perf_counter() - t0
             log.warning("[%s] exception: %s — %s", label, type(exc).__name__, str(exc)[:300])
+            
+            # Record failed attempt in metrics
+            if _METRICS_AVAILABLE:
+                metrics.record_llm_call(
+                    model=model_name,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    elapsed_ms=elapsed * 1000,
+                    success=False,
+                    error=str(exc)[:200],
+                    persona=persona,
+                    operation=operation
+                )
+            
             if attempt < _MAX_RETRIES:
                 delay = _RETRY_DELAYS[attempt]
                 log.warning(
@@ -82,22 +231,263 @@ def llm_invoke(
         pass
 
     total_call = prompt_tokens + completion_tokens
-    log.info(
-        "[%s] tokens=%d (in=%d out=%d) time=%.2fs",
-        label, total_call, prompt_tokens, completion_tokens, elapsed,
-    )
+    
+    # 💰 Calculate cost
+    cost_usd = estimate_cost(model_name, prompt_tokens, completion_tokens)
+    
+    # 📊 Check token budget and log warnings
+    _check_token_budget(total_call, model_name)
+    
+    # ✅ Enhanced structured logging for AI Engineers
+    if _STRUCTURED_LOG:
+        _safe_log_with_data(log, "info", f"🤖 {label} สำเร็จ", {
+            "action": "llm_call",
+            "label": label,
+            "model": model_name,
+            "persona": persona,
+            "operation": operation,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_call,
+            "duration_ms": round(elapsed * 1000, 2),
+            "cost_usd": round(cost_usd, 6),
+            "session_id": getattr(state, "session_id", None) if state else None,
+            "temperature": getattr(llm, "temperature", None),
+        })
+        
+        # ⚠️ Performance warning
+        if elapsed > 2.0:
+            _safe_log_with_data(log, "warning", "🐌 LLM ช้าเกินไป", {
+                "label": label,
+                "duration_ms": round(elapsed * 1000, 2),
+                "threshold_ms": 2000,
+                "model": model_name
+            })
+    else:
+        # Fallback to old logging
+        log.info(
+            "[%s] tokens=%d (in=%d out=%d) time=%.2fs cost=$%.6f model=%s",
+            label, total_call, prompt_tokens, completion_tokens, elapsed, cost_usd, model_name,
+        )
+    
+    # Record metrics
+    if _METRICS_AVAILABLE:
+        metrics.record_llm_call(
+            model=model_name,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            elapsed_ms=elapsed * 1000,
+            success=True,
+            persona=persona,
+            operation=operation
+        )
 
     if state is not None:
         try:
             state.add_token_usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
             session_total = getattr(state, "total_tokens", 0)
+            
+            # 🎯 Token Optimization: Auto-summarize ถ้าใช้ token เยอะ
             if session_total > _TOKEN_WARN_THRESHOLD:
                 log.warning(
-                    "[%s] Session token budget exceeded %d (total=%d) — trimming history",
+                    "[%s] Session token budget exceeded %d (total=%d) — trying summarization first",
                     label, _TOKEN_WARN_THRESHOLD, session_total,
                 )
-                if hasattr(state, "trim_messages"):
-                    state.trim_messages(keep_last=8)
+                
+                # ลอง summarize ก่อน
+                try:
+                    from utils.conversation_summarizer import auto_summarize_if_needed
+                    
+                    summarized = auto_summarize_if_needed(
+                        state,
+                        threshold=8,  # summarize ถ้ามี 8+ messages
+                        keep_recent=5  # เก็บ 5 messages ล่าสุด
+                    )
+                    
+                    if summarized:
+                        log.info("[%s] Auto-summarized old messages → token reduced", label)
+                    else:
+                        # ถ้า summarize ไม่ได้ ใช้ trim แทน
+                        log.info("[%s] Summarization not needed, using trim instead", label)
+                        if hasattr(state, "trim_messages"):
+                            state.trim_messages(keep_last=5)
+                except Exception as e:
+                    log.warning("[%s] Summarization failed: %s, falling back to trim", label, e)
+                    # Fallback: trim ตามเดิม
+                    if hasattr(state, "trim_messages"):
+                        state.trim_messages(keep_last=5)
+        except Exception:
+            pass
+
+    return response
+
+
+async def llm_invoke_async(
+    llm: Any,
+    messages: List[Any],
+    *,
+    logger: Optional[logging.Logger] = None,
+    label: str = "LLM",
+    state: Optional["ConversationState"] = None,
+    persona: Optional[str] = None,
+    operation: Optional[str] = None,
+) -> Any:
+    """
+    Async version of llm_invoke. Calls llm.ainvoke() for async LLM operations.
+    
+    Args:
+        llm: LangChain LLM instance (must support ainvoke)
+        messages: List of messages to send
+        logger: Logger instance for logging
+        label: Label for log messages
+        state: ConversationState for token tracking
+        persona: Which persona is making the call (for metrics)
+        operation: What operation is being performed (for metrics)
+    
+    Returns the raw LangChain response object (async version).
+    """
+    log = logger or _ROOT_LOG
+    t0 = time.perf_counter()
+    last_exc: Optional[Exception] = None
+    
+    # Extract model name for metrics
+    model_name = "unknown"
+    try:
+        model_name = getattr(llm, "model", getattr(llm, "model_name", "unknown"))
+    except:
+        pass
+    
+    for attempt in range(1 + _MAX_RETRIES):
+        try:
+            # Use ainvoke for async call
+            response = await llm.ainvoke(messages)
+            break
+        except Exception as exc:
+            last_exc = exc
+            elapsed = time.perf_counter() - t0
+            log.warning("[%s] exception: %s — %s", label, type(exc).__name__, str(exc)[:300])
+            
+            # Record failed attempt in metrics
+            if _METRICS_AVAILABLE:
+                metrics.record_llm_call(
+                    model=model_name,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    elapsed_ms=elapsed * 1000,
+                    success=False,
+                    error=str(exc)[:200],
+                    persona=persona,
+                    operation=operation
+                )
+            
+            if attempt < _MAX_RETRIES:
+                delay = _RETRY_DELAYS[attempt]
+                log.warning(
+                    "[%s] LLM call FAILED after %.2fs (attempt %d/%d) — retrying in %.0fs",
+                    label, elapsed, attempt + 1, 1 + _MAX_RETRIES, delay,
+                )
+                await asyncio.sleep(delay)  # Use async sleep
+            else:
+                log.warning("[%s] LLM call FAILED after %.2fs (all %d attempts exhausted)", label, elapsed, 1 + _MAX_RETRIES)
+                raise
+    else:
+        raise RuntimeError(f"[{label}] LLM call failed") from last_exc
+
+    elapsed = time.perf_counter() - t0
+
+    # Extract token counts
+    prompt_tokens = 0
+    completion_tokens = 0
+    try:
+        um = getattr(response, "usage_metadata", None) or {}
+        if um:
+            prompt_tokens = int(um.get("input_tokens") or um.get("prompt_tokens") or 0)
+            completion_tokens = int(um.get("output_tokens") or um.get("completion_tokens") or 0)
+        else:
+            rm = getattr(response, "response_metadata", None) or {}
+            tu = rm.get("token_usage") or rm.get("usage") or {}
+            prompt_tokens = int(tu.get("prompt_tokens") or tu.get("input_tokens") or 0)
+            completion_tokens = int(tu.get("completion_tokens") or tu.get("output_tokens") or 0)
+    except Exception:
+        pass
+
+    total_call = prompt_tokens + completion_tokens
+    cost_usd = estimate_cost(model_name, prompt_tokens, completion_tokens)
+    
+    _check_token_budget(total_call, model_name)
+    
+    # Enhanced structured logging
+    if _STRUCTURED_LOG:
+        _safe_log_with_data(log, "info", f"🤖 {label} สำเร็จ (async)", {
+            "action": "llm_call_async",
+            "label": label,
+            "model": model_name,
+            "persona": persona,
+            "operation": operation,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_call,
+            "duration_ms": round(elapsed * 1000, 2),
+            "cost_usd": round(cost_usd, 6),
+            "session_id": getattr(state, "session_id", None) if state else None,
+            "temperature": getattr(llm, "temperature", None),
+        })
+        
+        if elapsed > 2.0:
+            _safe_log_with_data(log, "warning", "🐌 LLM ช้าเกินไป (async)", {
+                "label": label,
+                "duration_ms": round(elapsed * 1000, 2),
+                "threshold_ms": 2000,
+                "model": model_name
+            })
+    else:
+        log.info(
+            "[%s] (async) tokens=%d (in=%d out=%d) time=%.2fs cost=$%.6f model=%s",
+            label, total_call, prompt_tokens, completion_tokens, elapsed, cost_usd, model_name,
+        )
+    
+    # Record metrics
+    if _METRICS_AVAILABLE:
+        metrics.record_llm_call(
+            model=model_name,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            elapsed_ms=elapsed * 1000,
+            success=True,
+            persona=persona,
+            operation=operation
+        )
+
+    if state is not None:
+        try:
+            state.add_token_usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+            session_total = getattr(state, "total_tokens", 0)
+            
+            if session_total > _TOKEN_WARN_THRESHOLD:
+                log.warning(
+                    "[%s] Session token budget exceeded %d (total=%d) — trying summarization first",
+                    label, _TOKEN_WARN_THRESHOLD, session_total,
+                )
+                
+                try:
+                    from utils.conversation_summarizer import auto_summarize_if_needed
+                    
+                    summarized = auto_summarize_if_needed(
+                        state,
+                        threshold=8,
+                        keep_recent=5
+                    )
+                    
+                    if summarized:
+                        log.info("[%s] Auto-summarized old messages → token reduced", label)
+                    else:
+                        log.info("[%s] Summarization not needed, using trim instead", label)
+                        if hasattr(state, "trim_messages"):
+                            state.trim_messages(keep_last=5)
+                except Exception as e:
+                    log.warning("[%s] Summarization failed: %s, falling back to trim", label, e)
+                    if hasattr(state, "trim_messages"):
+                        state.trim_messages(keep_last=5)
         except Exception:
             pass
 

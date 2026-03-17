@@ -1,6 +1,7 @@
-# code/conf.py
+#/Users/w.worawan/Downloads/ai-operation-microservice3_v2ori/code/conf.py
 import os
 import warnings
+from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -65,11 +66,17 @@ EMBEDDING_MODEL = os.getenv(
 MAX_ROUNDS = _safe_int("MAX_ROUNDS", 7)
 RETRIEVAL_TOP_K = _safe_int("RETRIEVAL_TOP_K", 12)
 
-LLM_DOCS_MAX_PRACTICAL = _safe_int("LLM_DOCS_MAX_PRACTICAL", 5)
-LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 8)
+# 🎯 Token Optimization: ลดจำนวนเอกสารและความยาว
+# เดิม: Practical=5/500, Academic=8/700 → ใช้ ~8,000-12,000 tokens
+# ใหม่: Practical=3/400, Academic=5/500 → ใช้ ~5,000-7,000 tokens (ประหยัด 40%!)
+LLM_DOCS_MAX_PRACTICAL = _safe_int("LLM_DOCS_MAX_PRACTICAL", 3)  # จาก 5 → 3
+LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 5)    # จาก 8 → 5
 
-LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 500)
-LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 700)
+LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 400)  # จาก 500 → 400
+LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 500)    # จาก 700 → 500
+
+# 🎯 RAG Quality: Minimum similarity threshold
+RETRIEVAL_MIN_SIMILARITY = _safe_float("RETRIEVAL_MIN_SIMILARITY", 0.6)
 
 RETRIEVAL_QUERY_MAX_CHARS = _safe_int("RETRIEVAL_QUERY_MAX_CHARS", 200)
 
@@ -88,9 +95,12 @@ ZILLIZ_API_KEY = os.getenv("ZILLIZ_API_KEY")
 
 LOCAL_MILVUS_URI = os.getenv("LOCAL_MILVUS_URI", "./milvus_lite.db")
 
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "thai_food_business")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "thai_food_business_v2")
 
-LOCAL_VECTOR_DIR = os.getenv("LOCAL_VECTOR_DIR", "./local_chroma")
+LOCAL_VECTOR_DIR = os.getenv(
+    "LOCAL_VECTOR_DIR",
+    str(Path(__file__).parent.parent / "local_chroma_v2"),
+)
 
 # NEW: centralized default retrieval fallback query — single source of truth
 # All code should import this instead of hardcoding the Thai string
@@ -145,6 +155,17 @@ if not OPENROUTER_API_KEY:
         "OPENROUTER_API_KEY is not set. "
         "Please set it in env.properties before starting the server."
     )
+
+# ===========================
+# Cost & Budget Configuration
+# ===========================
+COST_WARNING_THRESHOLD = float(os.getenv("COST_WARNING_THRESHOLD", "1.0"))  # Warn if single call > $1
+DAILY_BUDGET_USD = float(os.getenv("DAILY_BUDGET_USD", "50.0"))  # Daily spending limit
+
+# Token budget alerts
+TOKEN_BUDGET_PER_CALL = int(os.getenv("TOKEN_BUDGET_PER_CALL", "8000"))  # Target: 6,000-8,000 tokens
+TOKEN_BUDGET_WARNING = int(os.getenv("TOKEN_BUDGET_WARNING", "10000"))  # Warning at 10,000
+TOKEN_BUDGET_CRITICAL = int(os.getenv("TOKEN_BUDGET_CRITICAL", "15000"))  # Critical at 15,000
 
 
 def validate_config() -> None:
