@@ -12,25 +12,11 @@
     <aside class="sidebar">
       <div class="sidebar-top">
         <button id="newChatBtn" class="new-chat-btn">+ New chat</button>
-
-        <div class="bot-picker">
-          <label for="botSelect">Bot</label>
-          <select id="botSelect">
-            <option value="practical">Practical Bot</option>
-            <option value="academic">Academic Bot</option>
-          </select>
-        </div>
-
-        <div class="retention-box">
-          Session จะเก็บไว้ 3 วัน แล้วลบอัตโนมัติ
-        </div>
+        <div class="retention-box">Session จะเก็บไว้ 7 วัน แล้วลบอัตโนมัติ</div>
       </div>
-
       <div class="session-header">Recent chats</div>
       <div id="sessionList" class="session-list"></div>
-
       <div class="sidebar-bottom">
-        <button id="healthBtn" class="side-btn">Healthcheck</button>
         <button id="deleteSessionBtn" class="side-btn danger">Delete current chat</button>
       </div>
     </aside>
@@ -38,11 +24,9 @@
     <main class="main-panel">
       <header class="topbar">
         <div class="topbar-left">
-          <img
-            class="brand-icon"
+          <img class="brand-icon"
             src="https://supercoconut.co/wp-content/uploads/2025/04/cropped-Untitled-design-18.png"
-            alt="logo"
-          />
+            alt="logo" />
           <div>
             <div class="brand-title">RESTBIZ</div>
             <div class="brand-subtitle">ผู้ช่วยด้านกฎหมาย สำหรับธุรกิจร้านอาหาร</div>
@@ -51,8 +35,8 @@
       </header>
 
       <section id="welcomePanel" class="welcome-panel">
-        <h1>กรุณารอสักครู่.....</h1>
-        <p>ระบบกำลังเตรียมพร้อม</p>
+        <h1 id="welcomeTitle">กรุณารอสักครู่.....</h1>
+        <p id="welcomeSubtitle">ระบบกำลังเตรียมพร้อม</p>
         <div id="topicCards" class="topic-cards"></div>
       </section>
 
@@ -60,12 +44,8 @@
 
       <footer class="composer-wrap">
         <div class="composer">
-          <textarea
-            id="messageInput"
-            placeholder="Message RESTBIZ..."
-            rows="1"
-          ></textarea>
-          <button id="sendBtn" class="send-btn">↑</button>
+          <textarea id="messageInput" placeholder="Message RESTBIZ..." rows="1"></textarea>
+          <button id="sendBtn" class="send-btn" aria-label="Send">↑</button>
         </div>
       </footer>
     </main>

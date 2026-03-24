@@ -1,100 +1,147 @@
+// ─── State ────────────────────────────────────────────────────────────────────
 let sessionId = "";
-let currentPersona = "practical";
+let isSending = false;
 
 const CLIENT_ID_KEY = "restbiz_client_id";
+const BOT_AVATAR = "https://supercoconut.co/wp-content/uploads/2025/04/cropped-Untitled-design-18.png";
 
-const chatMessages = document.getElementById("chatMessages");
-const messageInput = document.getElementById("messageInput");
-const sendBtn = document.getElementById("sendBtn");
-const newChatBtn = document.getElementById("newChatBtn");
-const healthBtn = document.getElementById("healthBtn");
+// ─── DOM refs ─────────────────────────────────────────────────────────────────
+const chatMessages     = document.getElementById("chatMessages");
+const messageInput     = document.getElementById("messageInput");
+const sendBtn          = document.getElementById("sendBtn");
+const newChatBtn       = document.getElementById("newChatBtn");
 const deleteSessionBtn = document.getElementById("deleteSessionBtn");
-const sessionList = document.getElementById("sessionList");
-const topicCards = document.getElementById("topicCards");
-const welcomePanel = document.getElementById("welcomePanel");
-const botSelect = document.getElementById("botSelect");
+const sessionList      = document.getElementById("sessionList");
+const topicCards       = document.getElementById("topicCards");
+const welcomePanel     = document.getElementById("welcomePanel");
+const welcomeTitle     = document.getElementById("welcomeTitle");
+const welcomeSubtitle  = document.getElementById("welcomeSubtitle");
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function escapeHtml(text) {
-  return (text || "")
+  return String(text || "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
 }
 
-function formatTimeLabel(unixSeconds) {
+function textToHtml(text) {
+  return escapeHtml(text).replace(/\n/g, "<br>");
+}
+
+function formatTime(unixSeconds) {
   if (!unixSeconds) return "";
-  const date = new Date(unixSeconds * 1000);
-  return date.toLocaleString("th-TH", {
+  return new Date(unixSeconds * 1000).toLocaleString("th-TH", {
     dateStyle: "short",
     timeStyle: "short",
   });
 }
 
-function autoResizeTextarea() {
-  messageInput.style.height = "24px";
-  messageInput.style.height = Math.min(messageInput.scrollHeight, 220) + "px";
-}
-
 function getClientId() {
-  let value = localStorage.getItem(CLIENT_ID_KEY);
-  if (value && value.trim()) return value;
-
-  if (window.crypto && crypto.randomUUID) {
-    value = crypto.randomUUID();
-  } else {
-    value = `client_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  let id = localStorage.getItem(CLIENT_ID_KEY);
+  if (!id) {
+    id = (window.crypto?.randomUUID?.()) ||
+         `client_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    localStorage.setItem(CLIENT_ID_KEY, id);
   }
-
-  localStorage.setItem(CLIENT_ID_KEY, value);
-  return value;
+  return id;
 }
 
-function getDefaultHeaders() {
+function getHeaders() {
   return {
     "Content-Type": "application/json",
     "X-Client-Id": getClientId(),
   };
 }
 
-function clearMessages() {
-  chatMessages.innerHTML = "";
+function setInputLocked(locked) {
+  isSending = locked;
+  messageInput.disabled = locked;
+  sendBtn.disabled = locked;
+}
+
+function autoResize() {
+  messageInput.style.height = "24px";
+  messageInput.style.height = Math.min(messageInput.scrollHeight, 200) + "px";
 }
 
 function scrollToBottom() {
   chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
+// ─── Welcome panel ────────────────────────────────────────────────────────────
+function showWelcome(title = "สวัสดีครับ 👋", subtitle = "") {
+  welcomeTitle.textContent = title;
+  welcomeSubtitle.textContent = subtitle;
+  welcomePanel.style.display = "";
+  chatMessages.style.display = "none";
+}
+
 function hideWelcome() {
   welcomePanel.style.display = "none";
+  chatMessages.style.display = "";
 }
 
-function showWelcome() {
-  welcomePanel.style.display = "";
+// ─── Topic cards ──────────────────────────────────────────────────────────────
+function renderTopicCards(topics = []) {
+  topicCards.innerHTML = "";
+  topicCards.style.display = topics.length > 0 ? "grid" : "none";
+
+  topics.forEach((topic) => {
+    const btn = document.createElement("button");
+    btn.className = "topic-card";
+    btn.type = "button";
+    btn.innerHTML = `
+      <div class="topic-title">${escapeHtml(topic.title || "")}</div>
+      <div class="topic-desc">${escapeHtml(topic.description || "")}</div>
+    `;
+    btn.addEventListener("click", () => {
+      if (isSending) return;
+      messageInput.value = topic.title || "";
+      autoResize();
+      sendMessage();
+    });
+    topicCards.appendChild(btn);
+  });
 }
 
-function renderMessage(role, content) {
+// ─── Session list ─────────────────────────────────────────────────────────────
+function renderSessionList(sessions = []) {
+  sessionList.innerHTML = "";
+  sessions.forEach((item) => {
+    const btn = document.createElement("button");
+    btn.className = "session-item" + (item.session_id === sessionId ? " active" : "");
+    btn.innerHTML = `
+      <div class="session-item-title">${escapeHtml(item.preview || item.session_id)}</div>
+      <div class="session-item-meta">${escapeHtml(formatTime(item.updated_at))}</div>
+    `;
+    btn.addEventListener("click", () => {
+      if (item.session_id !== sessionId) loadSession(item.session_id);
+    });
+    sessionList.appendChild(btn);
+  });
+}
+
+// ─── Message rendering ────────────────────────────────────────────────────────
+function appendMessage(role, content) {
   hideWelcome();
+  const isAssistant = role === "assistant";
 
   const row = document.createElement("div");
-  row.className = `message-row ${role === "assistant" ? "assistant" : "user"}`;
+  row.className = `message-row ${isAssistant ? "assistant" : "user"}`;
 
-  let avatarHtml = "";
-  let roleLabel = "";
+  const avatarHtml = isAssistant
+    ? `<img class="message-avatar" src="${BOT_AVATAR}" alt="bot" />`
+    : `<div class="message-avatar user-avatar">U</div>`;
 
-  if (role === "assistant") {
-    avatarHtml = `<img class="message-avatar" src="https://supercoconut.co/wp-content/uploads/2025/04/cropped-Untitled-design-18.png" alt="bot" />`;
-    roleLabel = "RESTBIZ";
-  } else {
-    avatarHtml = `<div class="message-avatar user-avatar">Y</div>`;
-    roleLabel = "You";
-  }
+  const roleLabel = isAssistant ? "RESTBIZ" : "You";
 
   row.innerHTML = `
     <div class="message-card">
       ${avatarHtml}
       <div class="message-bubble-wrap">
         <div class="message-role">${roleLabel}</div>
-        <div class="message-bubble">${escapeHtml(content).replace(/\n/g, "<br>")}</div>
+        <div class="message-bubble">${textToHtml(content)}</div>
       </div>
     </div>
   `;
@@ -103,146 +150,110 @@ function renderMessage(role, content) {
   scrollToBottom();
 }
 
-function renderTopicCards(topics = []) {
-  topicCards.innerHTML = "";
-  
-  // แสดงการ์ดเมื่อมีข้อมูล
-  if (topics && topics.length > 0) {
-    topicCards.style.display = "grid";
-  } else {
-    topicCards.style.display = "none";
-  }
-
-  topics.forEach((topic) => {
-    const btn = document.createElement("button");
-    btn.className = "topic-card";
-    btn.type = "button";
-    btn.innerHTML = `
-      <div class="topic-title">${escapeHtml(topic.title || "-")}</div>
-      <div class="topic-desc">${escapeHtml(topic.description || "")}</div>
-    `;
-    btn.addEventListener("click", () => {
-      messageInput.value = topic.title || "";
-      autoResizeTextarea();
-      sendMessage();
-    });
-    topicCards.appendChild(btn);
-  });
+// Creates an empty streaming bubble, returns { row, bubble }
+function createStreamingBubble() {
+  hideWelcome();
+  const row = document.createElement("div");
+  row.className = "message-row assistant";
+  row.innerHTML = `
+    <div class="message-card">
+      <img class="message-avatar" src="${BOT_AVATAR}" alt="bot" />
+      <div class="message-bubble-wrap">
+        <div class="message-role">RESTBIZ</div>
+        <div class="message-bubble"><span class="typing-cursor">▋</span></div>
+      </div>
+    </div>
+  `;
+  chatMessages.appendChild(row);
+  scrollToBottom();
+  const bubble = row.querySelector(".message-bubble");
+  return { row, bubble };
 }
 
-function renderSessionList(items = []) {
-  sessionList.innerHTML = "";
-
-  items.forEach((item) => {
-    const btn = document.createElement("button");
-    btn.className = "session-item";
-    if (item.session_id === sessionId) {
-      btn.classList.add("active");
-    }
-
-    btn.innerHTML = `
-      <div class="session-item-title">${escapeHtml(item.preview || item.session_id)}</div>
-      <div class="session-item-meta">${escapeHtml(item.persona_id || "")} • ${escapeHtml(formatTimeLabel(item.updated_at))}</div>
-    `;
-
-    btn.addEventListener("click", () => {
-      loadSession(item.session_id);
-    });
-
-    sessionList.appendChild(btn);
-  });
-}
-
-async function apiGet(url) {
-  const response = await fetch(url, {
-    headers: {
-      "X-Client-Id": getClientId(),
-    },
-  });
-
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.detail || `HTTP ${response.status}`);
-  }
+// ─── API helpers ──────────────────────────────────────────────────────────────
+async function apiGet(path) {
+  const res = await fetch(path, { headers: { "X-Client-Id": getClientId() } });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
   return data;
 }
 
-async function apiPost(url, payload = {}) {
-  const response = await fetch(url, {
+async function apiPost(path, payload = {}) {
+  const res = await fetch(path, {
     method: "POST",
-    headers: getDefaultHeaders(),
+    headers: getHeaders(),
     body: JSON.stringify(payload),
   });
-
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.detail || `HTTP ${response.status}`);
-  }
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
   return data;
 }
 
+// ─── Session management ───────────────────────────────────────────────────────
 async function refreshSessions() {
   try {
     const data = await apiGet("/api/v1/sessions");
-    const sessions = data.sessions || [];
-    renderSessionList(sessions);
-    return sessions;
-  } catch (error) {
-    console.error(error);
+    renderSessionList(data.sessions || []);
+    return data.sessions || [];
+  } catch (err) {
+    console.error("refreshSessions error:", err);
     return [];
   }
 }
 
 async function createNewSession() {
+  chatMessages.innerHTML = "";
+  showWelcome("กรุณารอสักครู่.....", "ระบบกำลังเตรียมพร้อม");
+  renderTopicCards([]);
+
   try {
-    clearMessages();
-    showWelcome();
-
-    currentPersona = botSelect.value || "practical";
-
-    const data = await apiPost("/api/v1/greeting", {
-      persona_id: currentPersona,
-    });
+    const data = await apiPost("/api/v1/greeting", { persona_id: "practical" });
 
     sessionId = data.session_id || "";
-    currentPersona = data.persona_id || currentPersona;
-    botSelect.value = currentPersona;
 
-    renderTopicCards(data.topics || []);
-    renderMessage("assistant", data.response || "สวัสดีครับ");
+    // Update welcome title with greeting text, then switch to chat view
+    const greeting = data.response || "สวัสดีครับ";
+    const topics = data.topics || [];
+
+    if (topics.length > 0) {
+      // Show welcome panel with topic cards
+      welcomeTitle.textContent = "ยินดีให้บริการครับ 😊";
+      welcomeSubtitle.textContent = "เลือกหัวข้อที่ต้องการ หรือพิมพ์คำถามได้เลยครับ";
+      renderTopicCards(topics);
+      welcomePanel.style.display = "";
+      chatMessages.style.display = "none";
+    } else {
+      appendMessage("assistant", greeting);
+    }
+
     await refreshSessions();
-  } catch (error) {
-    console.error(error);
-    renderMessage("assistant", `เกิดข้อผิดพลาดในการเริ่มแชต: ${error.message}`);
+  } catch (err) {
+    console.error("createNewSession error:", err);
+    showWelcome("เกิดข้อผิดพลาด", err.message);
   }
 }
 
-async function loadSession(targetSessionId) {
+async function loadSession(targetId) {
   try {
-    const data = await apiPost("/api/v1/session/load", {
-      session_id: targetSessionId,
-    });
+    const data = await apiPost("/api/v1/session/load", { session_id: targetId });
 
     sessionId = data.session_id || "";
-    currentPersona = data.persona_id || "practical";
-    botSelect.value = currentPersona;
-
-    clearMessages();
+    chatMessages.innerHTML = "";
 
     const messages = data.messages || [];
     if (messages.length === 0) {
-      showWelcome();
+      showWelcome("ยินดีให้บริการครับ 😊", "พิมพ์คำถามได้เลยครับ");
     } else {
       hideWelcome();
       messages.forEach((msg) => {
-        renderMessage(msg.role, msg.content || "");
+        appendMessage(msg.role, msg.content || "");
       });
     }
 
     await refreshSessions();
-  } catch (error) {
-    console.error(error);
-    renderMessage("assistant", `โหลด session ไม่สำเร็จ: ${error.message}`);
+  } catch (err) {
+    console.error("loadSession error:", err);
+    appendMessage("assistant", `โหลด session ไม่สำเร็จ: ${err.message}`);
   }
 }
 
@@ -250,71 +261,56 @@ async function deleteCurrentSession() {
   if (!sessionId) return;
 
   try {
-    await apiPost("/api/v1/session/delete", {
-      session_id: sessionId,
-    });
-
+    await apiPost("/api/v1/session/delete", { session_id: sessionId });
     sessionId = "";
-    clearMessages();
-    showWelcome();
 
     const sessions = await refreshSessions();
-
     if (sessions.length > 0) {
       await loadSession(sessions[0].session_id);
     } else {
       await createNewSession();
     }
-  } catch (error) {
-    console.error(error);
-    renderMessage("assistant", `ลบ session ไม่สำเร็จ: ${error.message}`);
+  } catch (err) {
+    console.error("deleteCurrentSession error:", err);
+    appendMessage("assistant", `ลบ session ไม่สำเร็จ: ${err.message}`);
   }
 }
 
+// ─── Send message (SSE streaming) ─────────────────────────────────────────────
 async function sendMessage() {
   const text = (messageInput.value || "").trim();
-  if (!text) return;
+  if (!text || isSending) return;
 
+  // If no session yet, create one first
   if (!sessionId) {
     await createNewSession();
+    if (!sessionId) return; // still failed
   }
 
-  renderMessage("user", text);
-  messageInput.value = "";
-  autoResizeTextarea();
-
-  // สร้าง bubble ว่างไว้ก่อน แล้วค่อย append ทีละ chunk
+  // Hide welcome, show chat
   hideWelcome();
-  const row = document.createElement("div");
-  row.className = "message-row assistant";
-  row.innerHTML = `
-    <div class="message-card">
-      <img class="message-avatar" src="https://supercoconut.co/wp-content/uploads/2025/04/cropped-Untitled-design-18.png" alt="bot" />
-      <div class="message-bubble-wrap">
-        <div class="message-role">RESTBIZ</div>
-        <div class="message-bubble" id="streamingBubble"><span class="typing-cursor">▋</span></div>
-      </div>
-    </div>
-  `;
-  chatMessages.appendChild(row);
-  scrollToBottom();
 
-  const bubble = document.getElementById("streamingBubble");
+  appendMessage("user", text);
+  messageInput.value = "";
+  autoResize();
+  setInputLocked(true);
+
+  const { bubble } = createStreamingBubble();
   let fullText = "";
 
   try {
-    const response = await fetch("/api/v1/chat/stream", {
+    const res = await fetch("/api/v1/chat/stream", {
       method: "POST",
-      headers: getDefaultHeaders(),
+      headers: getHeaders(),
       body: JSON.stringify({ message: text, session_id: sessionId }),
     });
 
-    if (!response.ok) {
-      const errData = await response.json().catch(() => ({}));
-      throw new Error(errData.detail || `HTTP ${response.status}`);
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.detail || `HTTP ${res.status}`);
     }
 
-    const reader = response.body.getReader();
+    const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
 
@@ -324,82 +320,79 @@ async function sendMessage() {
 
       buffer += decoder.decode(value, { stream: true });
 
-      // แยก SSE events ด้วย \n\n
+      // SSE events are separated by \n\n
       const parts = buffer.split("\n\n");
-      buffer = parts.pop(); // ส่วนที่ยังไม่สมบูรณ์เก็บไว้ใน buffer
+      buffer = parts.pop(); // keep incomplete last part
 
       for (const part of parts) {
         const line = part.trim();
         if (!line.startsWith("data: ")) continue;
 
+        let payload;
         try {
-          const payload = JSON.parse(line.slice(6));
+          payload = JSON.parse(line.slice(6));
+        } catch {
+          continue;
+        }
 
-          if (payload.type === "chunk") {
-            fullText += payload.text;
-            // แสดงข้อความพร้อม cursor กระพริบ
-            bubble.innerHTML = escapeHtml(fullText).replace(/\n/g, "<br>") + '<span class="typing-cursor">▋</span>';
-            scrollToBottom();
+        if (payload.type === "chunk") {
+          fullText += payload.text || "";
+          bubble.innerHTML = textToHtml(fullText) + '<span class="typing-cursor">▋</span>';
+          scrollToBottom();
 
-          } else if (payload.type === "done") {
-            // จบแล้ว ลบ cursor ออก
-            bubble.innerHTML = escapeHtml(fullText).replace(/\n/g, "<br>");
-            sessionId = payload.session_id || sessionId;
-            currentPersona = payload.persona_id || currentPersona;
-            botSelect.value = currentPersona;
-            await refreshSessions();
+        } else if (payload.type === "done") {
+          bubble.innerHTML = textToHtml(fullText);
+          sessionId = payload.session_id || sessionId;
+          scrollToBottom();
+          await refreshSessions();
 
-          } else if (payload.type === "error") {
-            bubble.innerHTML = `<span style="color:#e53e3e">เกิดข้อผิดพลาด: ${escapeHtml(payload.message)}</span>`;
-          }
-        } catch (_) {
-          // JSON parse error — ข้ามไป
+        } else if (payload.type === "error") {
+          bubble.innerHTML = `<span style="color:#e53e3e">เกิดข้อผิดพลาด: ${escapeHtml(payload.message)}</span>`;
         }
       }
     }
 
-    // ถ้า stream จบโดยไม่ได้รับ done event ให้ลบ cursor ออก
+    // If stream ended without a "done" event, remove cursor
     if (bubble.innerHTML.includes("typing-cursor")) {
-      bubble.innerHTML = escapeHtml(fullText).replace(/\n/g, "<br>");
+      bubble.innerHTML = textToHtml(fullText);
     }
 
-  } catch (error) {
-    console.error(error);
-    bubble.innerHTML = `<span style="color:#e53e3e">เกิดข้อผิดพลาด: ${escapeHtml(error.message)}</span>`;
+  } catch (err) {
+    console.error("sendMessage error:", err);
+    bubble.innerHTML = `<span style="color:#e53e3e">เกิดข้อผิดพลาด: ${escapeHtml(err.message)}</span>`;
+  } finally {
+    setInputLocked(false);
+    messageInput.focus();
   }
 }
 
-async function checkHealth() {
-  try {
-    const data = await apiGet("/api/v1/healthcheck");
-    renderMessage(
-      "assistant",
-      `Healthcheck OK\nservice: ${data.service}\nversion: ${data.version}\ncollection: ${data.collection_name}\nsession retention: ${data.session_retention_days} days`
-    );
-  } catch (error) {
-    console.error(error);
-    renderMessage("assistant", `healthcheck failed: ${error.message}`);
-  }
-}
-
-newChatBtn.addEventListener("click", createNewSession);
-sendBtn.addEventListener("click", sendMessage);
-healthBtn.addEventListener("click", checkHealth);
-deleteSessionBtn.addEventListener("click", deleteCurrentSession);
-
-messageInput.addEventListener("input", autoResizeTextarea);
-
-messageInput.addEventListener("keydown", (e) => {
-  if (e.key !== "Enter") return;
-  if (e.shiftKey) return;
-
-  e.preventDefault();
-  sendMessage();
+// ─── Event listeners ──────────────────────────────────────────────────────────
+newChatBtn.addEventListener("click", () => {
+  if (!isSending) createNewSession();
 });
 
+deleteSessionBtn.addEventListener("click", () => {
+  if (!isSending) deleteCurrentSession();
+});
+
+sendBtn.addEventListener("click", sendMessage);
+
+messageInput.addEventListener("input", autoResize);
+
+messageInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
 window.addEventListener("DOMContentLoaded", async () => {
-  getClientId();
-  autoResizeTextarea();
+  autoResize();
+
+  // Hide chat, show loading welcome
+  showWelcome("กรุณารอสักครู่.....", "ระบบกำลังเตรียมพร้อม");
+  chatMessages.style.display = "none";
 
   const sessions = await refreshSessions();
 
