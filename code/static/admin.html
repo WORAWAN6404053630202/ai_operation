@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RESTBIZ Admin</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #1a1d27;
+      --panel-2: #222636;
+      --border: #2e3248;
+      --text: #e2e8f0;
+      --muted: #7b8db0;
+      --accent: #f5c400;
+      --blue: #5fb3d9;
+      --green: #4ade80;
+      --red: #f87171;
+      --orange: #fb923c;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+    }
+
+    header {
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    header h1 { font-size: 16px; font-weight: 700; color: var(--accent); }
+    header span { color: var(--muted); font-size: 12px; }
+
+    .refresh-btn {
+      margin-left: auto;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 6px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      height: calc(100vh - 53px);
+    }
+
+    /* ── Stats bar ── */
+    .stats-bar {
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 10px 20px;
+      display: flex;
+      gap: 32px;
+    }
+
+    .stat-item { display: flex; flex-direction: column; gap: 2px; }
+    .stat-label { font-size: 11px; color: var(--muted); }
+    .stat-value { font-size: 18px; font-weight: 700; color: var(--accent); }
+
+    /* ── Session list ── */
+    .session-panel {
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .panel-title {
+      padding: 12px 16px;
+      font-size: 11px;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .session-list {
+      flex: 1;
+      overflow-y: auto;
+    }
+
+    .session-item {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      transition: background 0.1s;
+    }
+
+    .session-item:hover { background: var(--panel-2); }
+    .session-item.active { background: var(--panel-2); border-left: 2px solid var(--accent); }
+
+    .s-id { font-size: 11px; color: var(--accent); margin-bottom: 4px; }
+    .s-preview { color: var(--text); margin-bottom: 4px; line-height: 1.4; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .s-meta { font-size: 11px; color: var(--muted); display: flex; gap: 10px; }
+    .badge { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; font-size: 10px; }
+    .badge.practical { color: var(--blue); border-color: var(--blue); }
+    .badge.academic { color: var(--orange); border-color: var(--orange); }
+
+    /* ── Detail panel ── */
+    .detail-panel {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .detail-tabs {
+      display: flex;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+
+    .tab-btn {
+      padding: 10px 18px;
+      font-size: 12px;
+      color: var(--muted);
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      cursor: pointer;
+    }
+
+    .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+    .tab-content {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: none;
+    }
+
+    .tab-content.active { display: block; }
+
+    /* ── Messages ── */
+    .msg-row { margin-bottom: 14px; }
+    .msg-role {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 4px;
+    }
+
+    .msg-role.user { color: var(--blue); }
+    .msg-role.assistant { color: var(--green); }
+
+    .msg-bubble {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.6;
+      font-size: 12px;
+      font-family: Arial, sans-serif;
+    }
+
+    /* ── Slots / context ── */
+    .kv-table { width: 100%; border-collapse: collapse; }
+    .kv-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
+    .kv-table td:first-child { color: var(--muted); width: 160px; }
+    .kv-table td:last-child { color: var(--text); word-break: break-all; }
+
+    /* ── Logs ── */
+    .log-controls {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 12px;
+      align-items: center;
+    }
+
+    .log-controls input {
+      flex: 1;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+
+    .log-box {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      overflow-y: auto;
+      max-height: calc(100vh - 220px);
+      font-size: 11px;
+      line-height: 1.7;
+    }
+
+    .log-line { white-space: pre-wrap; word-break: break-all; }
+    .log-line.info    { color: var(--text); }
+    .log-line.error   { color: var(--red); }
+    .log-line.warning { color: var(--orange); }
+    .log-line.cache   { color: var(--green); }
+    .log-line.retrieve { color: var(--blue); }
+    .log-line.dim     { color: var(--muted); }
+
+    /* ── Empty state ── */
+    .empty {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: var(--muted);
+      gap: 8px;
+    }
+
+    .empty-icon { font-size: 32px; }
+
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>RESTBIZ Admin</h1>
+  <span id="lastRefresh">—</span>
+  <button class="refresh-btn" onclick="loadAll()">⟳ Refresh</button>
+</header>
+
+<div class="stats-bar" id="statsBar">
+  <div class="stat-item"><div class="stat-label">Sessions ทั้งหมด</div><div class="stat-value" id="statTotal">—</div></div>
+  <div class="stat-item"><div class="stat-label">วันนี้</div><div class="stat-value" id="statToday">—</div></div>
+  <div class="stat-item"><div class="stat-label">สัปดาห์นี้</div><div class="stat-value" id="statWeek">—</div></div>
+  <div class="stat-item"><div class="stat-label">Cache hit rate</div><div class="stat-value" id="statCache">—</div></div>
+  <div class="stat-item"><div class="stat-label">Cache hits</div><div class="stat-value" id="statHits">—</div></div>
+</div>
+
+<div class="layout">
+  <!-- Session list -->
+  <div class="session-panel">
+    <div class="panel-title">Sessions (<span id="sessionCount">0</span>)</div>
+    <div class="session-list" id="sessionList"></div>
+  </div>
+
+  <!-- Detail -->
+  <div class="detail-panel">
+    <div class="detail-tabs">
+      <button class="tab-btn active" onclick="switchTab('messages')">Messages</button>
+      <button class="tab-btn" onclick="switchTab('context')">Context / Slots</button>
+      <button class="tab-btn" onclick="switchTab('logs')">Server Logs</button>
+    </div>
+
+    <div class="tab-content active" id="tab-messages">
+      <div class="empty" id="msgEmpty">
+        <div class="empty-icon">💬</div>
+        <div>เลือก session ด้านซ้ายเพื่อดู messages</div>
+      </div>
+      <div id="msgList" style="display:none"></div>
+    </div>
+
+    <div class="tab-content" id="tab-context">
+      <div class="empty" id="ctxEmpty">
+        <div class="empty-icon">🗂</div>
+        <div>เลือก session เพื่อดู context และ collected slots</div>
+      </div>
+      <div id="ctxContent" style="display:none"></div>
+    </div>
+
+    <div class="tab-content" id="tab-logs">
+      <div class="log-controls">
+        <input type="text" id="logFilter" placeholder="Filter logs... (เช่น ERROR, retrieve, cache)" oninput="renderLogs()" />
+        <button class="refresh-btn" onclick="loadLogs()">Reload</button>
+      </div>
+      <div class="log-box" id="logBox"><div style="color:var(--muted)">กำลังโหลด log...</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  let allSessions = [];
+  let allLogLines = [];
+  let activeSession = null;
+
+  function fmt(ts) {
+    if (!ts) return "—";
+    return new Date(ts * 1000).toLocaleString("th-TH", { dateStyle: "short", timeStyle: "short" });
+  }
+
+  function escHtml(t) {
+    return String(t || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+  }
+
+  async function apiGet(url) {
+    const r = await fetch(url);
+    return r.json();
+  }
+
+  // ── Stats ──────────────────────────────────────────────────────
+  async function loadStats() {
+    const d = await apiGet("/admin/api/stats");
+    document.getElementById("statTotal").textContent = d.sessions?.total ?? "—";
+    document.getElementById("statToday").textContent = d.sessions?.today ?? "—";
+    document.getElementById("statWeek").textContent  = d.sessions?.this_week ?? "—";
+    const hr = d.cache?.hit_rate;
+    document.getElementById("statCache").textContent = hr != null ? (hr * 100).toFixed(0) + "%" : "—";
+    document.getElementById("statHits").textContent  = d.cache?.hits ?? "—";
+  }
+
+  // ── Sessions ──────────────────────────────────────────────────
+  async function loadSessions() {
+    const d = await apiGet("/admin/api/sessions?limit=100");
+    allSessions = d.sessions || [];
+    document.getElementById("sessionCount").textContent = allSessions.length;
+    renderSessionList();
+  }
+
+  function renderSessionList() {
+    const el = document.getElementById("sessionList");
+    if (!allSessions.length) {
+      el.innerHTML = '<div style="padding:20px;color:var(--muted);text-align:center">ยังไม่มี session</div>';
+      return;
+    }
+    el.innerHTML = allSessions.map(s => `
+      <div class="session-item ${s.session_id === activeSession ? 'active' : ''}"
+           onclick="selectSession('${s.session_id}')">
+        <div class="s-id">${escHtml(s.session_id)}</div>
+        <div class="s-preview">${escHtml(s.preview || "—")}</div>
+        <div class="s-meta">
+          <span class="badge ${escHtml(s.persona_id)}">${escHtml(s.persona_id)}</span>
+          <span>💬 ${s.user_messages}/${s.total_messages}</span>
+          <span>${fmt(s.updated_at)}</span>
+        </div>
+      </div>
+    `).join("");
+  }
+
+  // ── Session detail ─────────────────────────────────────────────
+  async function selectSession(sid) {
+    activeSession = sid;
+    renderSessionList();
+
+    const d = await apiGet(`/admin/api/session/${sid}`);
+
+    // Messages tab
+    const msgs = d.messages || [];
+    if (!msgs.length) {
+      document.getElementById("msgEmpty").style.display = "";
+      document.getElementById("msgList").style.display = "none";
+    } else {
+      document.getElementById("msgEmpty").style.display = "none";
+      document.getElementById("msgList").style.display = "";
+      document.getElementById("msgList").innerHTML = msgs.map(m => `
+        <div class="msg-row">
+          <div class="msg-role ${m.role}">${m.role === "user" ? "👤 User" : "🤖 RESTBIZ"}</div>
+          <div class="msg-bubble">${escHtml(m.content || "")}</div>
+        </div>
+      `).join("");
+    }
+
+    // Context tab
+    const slots = d.collected_slots || {};
+    const rows = [
+      ["session_id",    d.session_id],
+      ["persona",       d.persona_id],
+      ["fsm_state",     d.fsm_state || "—"],
+      ["last_topic",    d.last_topic || "—"],
+      ["total_messages",d.total_messages],
+      ...Object.entries(slots).map(([k, v]) => [`slot: ${k}`, v]),
+    ];
+
+    if (rows.length) {
+      document.getElementById("ctxEmpty").style.display = "none";
+      document.getElementById("ctxContent").style.display = "";
+      document.getElementById("ctxContent").innerHTML = `
+        <table class="kv-table">
+          ${rows.map(([k, v]) => `<tr><td>${escHtml(k)}</td><td>${escHtml(String(v))}</td></tr>`).join("")}
+        </table>`;
+    }
+  }
+
+  // ── Logs ──────────────────────────────────────────────────────
+  async function loadLogs() {
+    const d = await apiGet("/admin/api/logs?lines=200");
+    allLogLines = d.lines || [];
+    renderLogs();
+  }
+
+  function renderLogs() {
+    const filter = (document.getElementById("logFilter").value || "").toLowerCase();
+    const lines = filter
+      ? allLogLines.filter(l => l.toLowerCase().includes(filter))
+      : allLogLines;
+
+    document.getElementById("logBox").innerHTML = lines.map(l => {
+      let cls = "dim";
+      const ll = l.toLowerCase();
+      if (ll.includes("error"))    cls = "error";
+      else if (ll.includes("warning") || ll.includes("warn")) cls = "warning";
+      else if (ll.includes("cache hit") || ll.includes("🎯")) cls = "cache";
+      else if (ll.includes("retrieve") || ll.includes("📚") || ll.includes("doc[")) cls = "retrieve";
+      else if (ll.includes("info") || ll.includes("←") || ll.includes("→")) cls = "info";
+      return `<div class="log-line ${cls}">${escHtml(l)}</div>`;
+    }).join("") || '<div style="color:var(--muted)">ไม่มีผลลัพธ์ที่ตรงกับ filter</div>';
+
+    // Scroll to bottom
+    const box = document.getElementById("logBox");
+    box.scrollTop = box.scrollHeight;
+  }
+
+  // ── Tabs ──────────────────────────────────────────────────────
+  function switchTab(name) {
+    document.querySelectorAll(".tab-btn").forEach((b, i) => {
+      const tabs = ["messages", "context", "logs"];
+      b.classList.toggle("active", tabs[i] === name);
+    });
+    document.querySelectorAll(".tab-content").forEach(el => {
+      el.classList.toggle("active", el.id === `tab-${name}`);
+    });
+    if (name === "logs" && !allLogLines.length) loadLogs();
+  }
+
+  // ── Init ──────────────────────────────────────────────────────
+  async function loadAll() {
+    document.getElementById("lastRefresh").textContent =
+      "อัพเดท " + new Date().toLocaleTimeString("th-TH");
+    await Promise.all([loadStats(), loadSessions()]);
+  }
+
+  loadAll();
+  // Auto-refresh ทุก 30 วินาที
+  setInterval(loadAll, 30000);
+</script>
+</body>
+</html>

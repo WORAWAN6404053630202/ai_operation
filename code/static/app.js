@@ -188,7 +188,8 @@ function appendMessage(role, content) {
   scrollToBottom();
 }
 
-// Creates an empty streaming bubble, returns { row, bubble }
+// Creates an empty streaming bubble with elapsed-time counter
+// Returns { row, bubble, stopTimer }
 function createStreamingBubble() {
   hideWelcome();
   const row = document.createElement("div");
@@ -198,14 +199,31 @@ function createStreamingBubble() {
       <img class="message-avatar" src="${BOT_AVATAR}" alt="bot" />
       <div class="message-bubble-wrap">
         <div class="message-role">RESTBIZ</div>
-        <div class="message-bubble"><span class="typing-cursor">▋</span></div>
+        <div class="message-bubble">
+          <span class="typing-cursor">▋</span>
+          <span class="wait-timer"> 0s</span>
+        </div>
       </div>
     </div>
   `;
   chatMessages.appendChild(row);
   scrollToBottom();
+
   const bubble = row.querySelector(".message-bubble");
-  return { row, bubble };
+  const timerEl = row.querySelector(".wait-timer");
+
+  let seconds = 0;
+  const intervalId = setInterval(() => {
+    seconds++;
+    if (timerEl) timerEl.textContent = ` ${seconds}s`;
+  }, 1000);
+
+  function stopTimer() {
+    clearInterval(intervalId);
+    if (timerEl) timerEl.remove();
+  }
+
+  return { row, bubble, stopTimer };
 }
 
 // ─── API helpers ──────────────────────────────────────────────────────────────
@@ -329,7 +347,7 @@ async function sendMessage() {
   autoResize();
   setInputLocked(true);
 
-  const { bubble } = createStreamingBubble();
+  const { bubble, stopTimer } = createStreamingBubble();
   let fullText = "";
 
   try {
@@ -375,12 +393,14 @@ async function sendMessage() {
           scrollToBottom();
 
         } else if (payload.type === "done") {
+          stopTimer();
           bubble.innerHTML = textToHtml(fullText);
           sessionId = payload.session_id || sessionId;
           scrollToBottom();
           await refreshSessions();
 
         } else if (payload.type === "error") {
+          stopTimer();
           bubble.innerHTML = `<span style="color:#e53e3e">เกิดข้อผิดพลาด: ${escapeHtml(payload.message)}</span>`;
         }
       }
@@ -388,10 +408,12 @@ async function sendMessage() {
 
     // If stream ended without a "done" event, remove cursor
     if (bubble.innerHTML.includes("typing-cursor")) {
+      stopTimer();
       bubble.innerHTML = textToHtml(fullText);
     }
 
   } catch (err) {
+    stopTimer();
     console.error("sendMessage error:", err);
     bubble.innerHTML = `<span style="color:#e53e3e">เกิดข้อผิดพลาด: ${escapeHtml(err.message)}</span>`;
   } finally {

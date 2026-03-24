@@ -1,0 +1,126 @@
+"""
+Admin Dashboard Router
+Endpoints for monitoring bot usage, sessions, and logs.
+"""
+
+import json
+import os
+import time
+from pathlib import Path
+from typing import Optional
+
+from fastapi import APIRouter, Query
+from fastapi.responses import HTMLResponse, JSONResponse
+
+from model.state_manager import StateManager
+from utils.simple_cache import get_cache
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+_state_manager = StateManager()
+
+# Path to uvicorn log file (adjust if needed via env)
+_LOG_FILE = Path(os.getenv("LOG_FILE", str(Path(__file__).resolve().parent.parent.parent / "uvicorn.log")))
+
+
+@router.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def admin_dashboard():
+    html_path = Path(__file__).resolve().parent.parent / "static" / "admin.html"
+    if not html_path.exists():
+        return HTMLResponse("<h1>admin.html not found</h1>", status_code=404)
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
+
+@router.get("/api/sessions")
+async def admin_sessions(limit: int = Query(default=50, le=200)):
+    """List all sessions with message count and preview."""
+    sessions = _state_manager.list_sessions(limit=limit)
+
+    result = []
+    for s in sessions:
+        sid = s["session_id"]
+        state = _state_manager.load(sid)
+        messages = state.messages if state else []
+
+        user_msgs = [m for m in messages if m.get("role") == "user"]
+        bot_msgs  = [m for m in messages if m.get("role") == "assistant"]
+
+        result.append({
+            "session_id": sid,
+            "persona_id": s.get("persona_id", "practical"),
+            "preview": s.get("preview", ""),
+            "updated_at": s.get("updated_at"),
+            "total_messages": len(messages),
+            "user_messages": len(user_msgs),
+            "bot_messages": len(bot_msgs),
+        })
+
+    return JSONResponse({"sessions": result, "total": len(result)})
+
+
+@router.get("/api/session/{session_id}")
+async def admin_session_detail(session_id: str):
+    """Full message history for a session."""
+    state = _state_manager.load(session_id)
+    if state is None:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+
+    messages = state.messages or []
+    context  = state.context or {}
+
+    return JSONResponse({
+        "session_id": session_id,
+        "persona_id": state.persona_id,
+        "messages": messages,
+        "collected_slots": context.get("collected_slots", {}),
+        "last_topic": context.get("last_topic", ""),
+        "fsm_state": context.get("fsm_state", ""),
+        "total_messages": len(messages),
+    })
+
+
+@router.get("/api/stats")
+async def admin_stats():
+    """Overall stats: session count, cache, log summary."""
+    all_sessions = _state_manager.list_sessions(limit=500)
+
+    now = time.time()
+    today_cutoff   = now - 86400
+    week_cutoff    = now - 7 * 86400
+
+    sessions_today = [s for s in all_sessions if (s.get("updated_at") or 0) >= today_cutoff]
+    sessions_week  = [s for s in all_sessions if (s.get("updated_at") or 0) >= week_cutoff]
+
+    cache = get_cache()
+    cache_stats = cache.get_stats()
+
+    return JSONResponse({
+        "sessions": {
+            "total": len(all_sessions),
+            "today": len(sessions_today),
+            "this_week": len(sessions_week),
+        },
+        "cache": cache_stats,
+    })
+
+
+@router.get("/api/logs")
+async def admin_logs(lines: int = Query(default=100, le=500)):
+    """Return last N lines from the server log file."""
+    if not _LOG_FILE.exists():
+        # Try relative path (when running from code/ dir)
+        alt = Path(__file__).resolve().parent.parent.parent / "uvicorn.log"
+        if alt.exists():
+            log_path = alt
+        else:
+            return JSONResponse({"lines": [], "error": f"Log file not found: {_LOG_FILE}"})
+    else:
+        log_path = _LOG_FILE
+
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        tail = all_lines[-lines:]
+        return JSONResponse({"lines": [l.rstrip() for l in tail], "total_lines": len(all_lines)})
+    except Exception as e:
+        return JSONResponse({"lines": [], "error": str(e)})

@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 
 from router.route_v1 import api_v1
 from router.monitoring import router as monitoring_router
+from router.admin import router as admin_router
 from utils.middleware import MonitoringMiddleware, HealthCheckMiddleware
 from utils.logger import setup_logging, get_logger
 
@@ -55,6 +56,7 @@ app.add_middleware(
 # Include routers
 app.include_router(api_v1, prefix="/api/v1")
 app.include_router(monitoring_router)
+app.include_router(admin_router)
 
 
 @app.get("/health", tags=["health"], include_in_schema=False)
