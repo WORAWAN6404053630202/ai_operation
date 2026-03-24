@@ -6,7 +6,10 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 from langchain_core.documents import Document
-from langchain_community.embeddings import HuggingFaceEmbeddings
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore
+except ImportError:
+    from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
 from langchain_community.vectorstores import Chroma
 
 import conf
@@ -59,10 +62,41 @@ class LocalVectorStoreManager:
         if self.embedding_model is not None:
             return
         print(f"[Embedding] Loading: {conf.EMBEDDING_MODEL}")
+        _model = conf.EMBEDDING_MODEL
+        _is_e5 = "e5" in _model.lower()
+
+        # Prefer MPS (Apple Silicon) > CUDA > CPU for embedding speed
+        import torch
+        if torch.backends.mps.is_available():
+            _device = "mps"
+        elif torch.cuda.is_available():
+            _device = "cuda"
+        else:
+            _device = "cpu"
+        print(f"[Embedding] Using device: {_device}")
+
+        # langchain-huggingface รองรับ query_encode_kwargs แยกจาก encode_kwargs
+        # ทำให้ document ใช้ "passage: " prefix และ query ใช้ "query: " prefix
+        # ซึ่งตรงตาม spec ของ intfloat/multilingual-e5-* ทุก variant
+        _encode_kw = {"normalize_embeddings": True}
+        _query_encode_kw = {"normalize_embeddings": True}
+        if _is_e5:
+            _encode_kw["prompt"] = "passage: "
+            _query_encode_kw["prompt"] = "query: "
+
+        # Use model_cache dir to avoid re-downloading on every startup
+        import os
+        _cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "model_cache")
+        # Set env var so SentenceTransformer picks up cached model automatically
+        os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", _cache_dir)
+        os.environ["HF_HOME"] = _cache_dir
+
         self.embedding_model = HuggingFaceEmbeddings(
-            model_name=conf.EMBEDDING_MODEL,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
+            model_name=_model,
+            model_kwargs={"device": _device},
+            encode_kwargs=_encode_kw,
+            query_encode_kwargs=_query_encode_kw,
+            cache_folder=_cache_dir,
         )
         print("[Embedding] Loaded successfully")
 
@@ -183,6 +217,24 @@ class LocalVectorStoreManager:
 
         return list(docs or [])
 
+    def retrieve_with_scores(
+        self, query: str, k: int, filter: Optional[dict] = None
+    ) -> List[tuple]:
+        """Return List[Tuple[Document, float]] with cosine-relevance scores (0–1).
+
+        Falls back to (doc, None) pairs if the vectorstore doesn't support scored search.
+        """
+        if not self.vectorstore:
+            return []
+        kwargs: dict = {"k": k}
+        if filter:
+            kwargs["filter"] = filter
+        try:
+            return self.vectorstore.similarity_search_with_relevance_scores(query, **kwargs)
+        except Exception:
+            docs = self.vectorstore.similarity_search(query, **kwargs)
+            return [(d, None) for d in docs]
+
     def retrieve_docs(self, query: str, k: Optional[int] = None, clip_chars: int = 600) -> List[Dict]:
         docs = self.retrieve_raw_docs(query, k=k)
         out: List[Dict] = []
@@ -197,6 +249,11 @@ class LocalVectorStoreManager:
 
 
 _MANAGER = LocalVectorStoreManager()
+
+
+def get_vs_manager() -> LocalVectorStoreManager:
+    """Return the singleton manager (gives access to retrieve_with_scores, etc.)."""
+    return _MANAGER
 
 
 def get_retriever(k: int = 0, fail_if_empty: bool = True):

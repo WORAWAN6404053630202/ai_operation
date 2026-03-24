@@ -73,7 +73,7 @@ from langchain_core.messages import HumanMessage
 
 import conf
 from model.conversation_state import ConversationState
-from utils.llm_call import llm_invoke
+from utils.llm_call import llm_invoke, extract_llm_text
 from utils.persona_profile import (
     normalize_persona_id,
     build_strict_profile,
@@ -146,6 +146,11 @@ class PersonaSupervisor:
         "อ้างอิงข้อกฎหมาย",
         "อธิบายละเอียด",
         "ขอแบบละเอียด",
+        "แบบละเอียด",
+        "ละเอียดกว่านี้",
+        "ละเอียดกว่า",
+        "ละเอียดหน่อย",
+        "ละเอียดขึ้น",
         "ละเอียดทั้งหมด",
         "ขอแบบละเอียดทั้งหมด",
         "เอาแบบละเอียดทั้งหมด",
@@ -185,7 +190,8 @@ class PersonaSupervisor:
     )
 
     _LEGAL_SIGNAL_RE = re.compile(
-        r"(ใบอนุญาต|จดทะเบียน|ทะเบียนพาณิชย์|ภาษี|vat|ภพ\.?20|สรรพากร|เทศบาล|สำนักงานเขต|สุขาภิบาล|กรม|ค่าธรรมเนียม|เอกสาร|ขั้นตอน|บทลงโทษ|ประกาศ|พ\.ร\.บ|ประกันสังคม|กองทุน|เปิดร้าน|ขึ้นทะเบียน)",
+        r"(ใบอนุญาต|จดทะเบียน|ทะเบียนพาณิชย์|ภาษี|vat|ภพ\.?20|สรรพากร|เทศบาล|สำนักงานเขต|สุขาภิบาล|กรม|ค่าธรรมเนียม|เอกสาร|ขั้นตอน|บทลงโทษ|ประกาศ|พ\.ร\.บ|ประกันสังคม|กองทุน|เปิดร้าน|ขึ้นทะเบียน"
+        r"|qr.?pay|qr.?payment|คิวอาร์|คิวอาเพย|เพย์เมนต์|edc|รูดบัตร|merchant.?id|partner.?id|pos.?id|ระบบชำระเงิน|กสิกร|kbank|ไทยพาณิชย์|scb|ประกอบกิจการ|สุขาภิบาลอาหาร)",
         re.IGNORECASE,
     )
 
@@ -224,6 +230,59 @@ class PersonaSupervisor:
     _TH_INTERJECTION_RE = re.compile(
         r"^\s*(เอ้|เฮ้|เฮ|โอ้|โอ้โห|อ้าว|อ้าว|ว้าว|เออ|เอ่อ|อ่า|อ้า|อืม|อ๋อ|อ๋อ|เออนะ|เอ้าๆ|งั้นหรอ|งั้นเหรอ|จริงดิ|จริงเหรอ|ไม่ใช่เหรอ|เหรอ)\s*(ครับ|คับ|ค่ะ|คะ|นะ|นะครับ|นะคะ)?\s*$",
         re.IGNORECASE,
+    )
+    # Operation inference: detect from user query which operation_group is clearly implied
+    _OP_INFER_NEW_RE = re.compile(
+        r"จด\s*(vat|ภาษีมูลค่าเพิ่ม|ภพ\b|ทะเบียน|ใหม่)"
+        r"|ต้อง\s*จด|ขอ\s*จด|ยื่นขอ\s*ใหม่|จดทะเบียน\s*ใหม่|ตั้งใหม่"
+        r"|เริ่ม\s*จด|ควรจด|จะจด|จด\s*ตอนไหน|ต้องสมัคร\s*(vat|ภาษี|ภพ)",
+        re.IGNORECASE,
+    )
+    _OP_INFER_EDIT_RE = re.compile(
+        r"แก้ไข\s*(รายการ|ข้อมูล|ที่อยู่|วัตถุประสงค์|ชื่อ)|เปลี่ยนแปลง\s*(รายการ|ที่อยู่|ชื่อ)",
+        re.IGNORECASE,
+    )
+    _OP_INFER_CANCEL_RE = re.compile(
+        r"ยกเลิก\s*(การจด|ภาษี|vat|ภพ|ทะเบียน)|เลิก\s*กิจการ|ปิด\s*กิจการ|จะ\s*ยกเลิก",
+        re.IGNORECASE,
+    )
+
+    # Multi-topic license detection: maps regex pattern → canonical license_type name in Chroma.
+    # Used by _detect_license_types_from_query() to predict which licenses a query covers BEFORE retrieval.
+    _MULTI_TOPIC_LICENSE_KEYWORDS: List[Tuple[str, str]] = [
+        (r"vat|ภาษีมูลค่าเพิ่ม|ภพ\.?20|จด\s*ภาษี", "ใบภาษีมูลค่าเพิ่ม ภพ.20"),
+        (r"ใบอนุญาตจำหน่ายสุรา|ขายสุรา|จำหน่ายสุรา|สุรา|เหล้า|ภส\.08", "ใบอนุญาตจำหน่ายสุรา"),
+        (r"ภาษีป้าย|ป้ายร้าน|ภป\.1|ป้ายโฆษณา", "แบบแสดงรายการภาษีป้ายร้านอาหาร"),
+        (r"ใบอนุญาตจัดตั้ง|สถานที่จำหน่ายอาหาร|bma\s*oss|อาหาร.*ใบอนุญาต|ใบอนุญาต.*อาหาร", "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร"),
+        (r"ใบทะเบียนพาณิชย์|จดทะเบียนพาณิชย์|ทะเบียนพาณิชย์|dbd", "ใบทะเบียนพาณิชย์"),
+        (r"ประกันสังคม|กองทุนประกันสังคม|ขึ้นทะเบียนประกัน", "การขึ้นทะเบียนกองทุนประกันสังคม"),
+        (r"ใบวุฒิบัตร|อบรมผู้สัมผัสอาหาร|ผู้สัมผัสอาหาร", "ใบวุฒิบัตรผู้สัมผัสอาหาร"),
+        (r"ใบรับรองแพทย์|9\s*โรค|สณ\.11", "ใบรับรองแพทย์ 9 โรค(สณ.11)"),
+        (r"qr.?payment|พร้อมเพย์|promptpay|qr\s*พร้อมเพย์", "QR-Payment API"),
+    ]
+
+    # --------------------------
+    # Typo / garbled input detection
+    # --------------------------
+
+    # Thai characters that cannot stand alone as meaningful input:
+    # - U+0E30–U+0E4E: Thai vowel signs, tone marks, sara characters
+    #   (these are combining/dependent marks — alone they are garbled)
+    # - "ๅ" (U+0E45 sara ae standalone, but visually looks like random char when isolated)
+    # - U+0E50–U+0E59: Thai digits (alone could be a selection → handled by _LIKELY_SELECTION_RE)
+    # A "standalone diacritic" pattern: 1-3 chars all from Thai combining ranges
+    _STANDALONE_TH_DIACRITIC_RE = re.compile(
+        r"^[\u0E30-\u0E4E\u0E47-\u0E4E]{1,3}$"
+    )
+    # Garbled: only punctuation/symbols, or repeated non-word chars, or random ASCII+Thai mix
+    # that a real user would never intentionally type
+    _ALL_PUNCTUATION_RE = re.compile(r"^[^\w\u0E00-\u0E7F]+$")
+    # Looks like keyboard mash: sequence of Thai consonants ONLY (no vowel signs at all).
+    # Real Thai words always include at least one vowel mark — consonants alone cannot form
+    # a valid syllable (e.g., "กขค", "ภคม").  2–6 chars so single-char inputs (already caught
+    # by _STANDALONE_TH_DIACRITIC_RE / single-char rule) don't double-count.
+    _TH_CONSONANT_MASH_RE = re.compile(
+        r"^[\u0E01-\u0E2E]{2,6}$"
     )
 
     # --------------------------
@@ -336,7 +395,7 @@ class PersonaSupervisor:
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
             temperature=0.0,
-            max_tokens=300,  # ✅ Increased from 220 to accommodate 5 topics + reasoning
+            max_tokens=512,  # ✅ topic list JSON ต้องการพอ (5 topics + confidence + reasoning)
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
@@ -367,8 +426,11 @@ class PersonaSupervisor:
             )
 
             try:
-                text = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/topic_picker").content.strip()
-            except Exception:
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/topic_picker")).strip()
+            except Exception as e:
+                # LengthFinishReasonError: retry ไม่ช่วย — skip แล้วใช้ fallback
+                if "LengthFinishReasonError" in type(e).__name__ or "LengthFinishReason" in str(e)[:80]:
+                    _LOG.warning("[Supervisor/topic_picker] LengthFinishReasonError — max_tokens น้อยเกินไป, skip retry")
                 return {}
             text = self._strip_code_fences(text)
             try:
@@ -404,7 +466,7 @@ class PersonaSupervisor:
                 f"ข้อความผู้ใช้: {user_text}"
             )
             try:
-                text = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm").content.strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm")).strip()
             except Exception:
                 return {}
             text = self._strip_code_fences(text)
@@ -431,15 +493,19 @@ class PersonaSupervisor:
 
         def _call(user_text: str) -> dict:
             prompt = (
-                "หน้าที่: วิเคราะห์ว่า 'ข้อความผู้ใช้' ต้องการให้คำตอบ\n"
-                "1) สั้น/กระชับ (practical) หรือ 2) ละเอียด/เชิงลึก (academic)\n"
-                "ห้ามเดาสุ่ม ถ้าไม่ชัดให้ confidence ต่ำ\n"
+                "หน้าที่: ตรวจว่า 'ข้อความผู้ใช้' บอกชัดๆ ว่าต้องการ style คำตอบแบบใด\n"
+                "wants_long=true เฉพาะเมื่อมีคำบ่งชี้ชัดๆ ว่าอยากได้ข้อมูลละเอียด/เชิงลึก\n"
+                "  ตัวอย่าง wants_long: ขอละเอียด, อธิบายเชิงลึก, ครบทุกอย่าง, เป็นทางการ, แบบวิชาการ\n"
+                "  ไม่ใช่ wants_long: อยากรู้, ต้องการทราบ, ถามว่า, คืออะไร, มีอะไรบ้าง\n"
+                "wants_short=true เฉพาะเมื่อมีคำบ่งชี้ชัดๆ ว่าอยากได้แบบสั้น\n"
+                "  ตัวอย่าง wants_short: แบบสั้น, กระชับ, สรุปแค่, พอสังเขป\n"
+                "ถ้าไม่ชัดหรือเป็นแค่การถามเรื่อง ให้ confidence ต่ำ (<0.5)\n"
                 "ตอบเป็น JSON เท่านั้น:\n"
                 '{ "wants_long": true/false, "wants_short": true/false, "confidence": 0.0 }\n'
                 f"ข้อความผู้ใช้: {user_text}"
             )
             try:
-                text = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm").content.strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm")).strip()
             except Exception:
                 return {}
             text = self._strip_code_fences(text)
@@ -516,7 +582,7 @@ class PersonaSupervisor:
                 f"last_topic_hint: {last_topic_hint}\n"
             )
             try:
-                text = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm").content.strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm")).strip()
             except Exception:
                 return {}
             text = self._strip_code_fences(text)
@@ -524,6 +590,76 @@ class PersonaSupervisor:
                 obj = json.loads(text)
                 return obj if isinstance(obj, dict) else {}
             except Exception:
+                return {}
+
+        return _call
+
+    def _default_op_group_classifier_llm_call(self) -> Callable[[str, List[str]], dict]:
+        """
+        LLM-based operation group classifier.
+        Given a license_type and a list of raw operation_by_department values from ChromaDB,
+        returns a grouped structure: {display_label: [raw_values]}.
+
+        This replaces ALL hardcoded prefix rules — works for any new license type added to
+        ChromaDB in the future without any code changes.
+
+        Uses fast topic-picker model + JSON mode. Result is cached per (license_type, entity_type)
+        so LLM is called at most once per unique key per process lifetime.
+
+        Return JSON:
+        {
+          "groups": [
+            {"label": "ยื่นขอใหม่ / จดทะเบียน", "raw": ["การจดทะเบียนพาณิชย์"]},
+            {"label": "ต่ออายุ",                 "raw": ["อายุใบทะเบียนพาณิชย์"]},
+            ...
+          ]
+        }
+        """
+        topic_model = getattr(conf, "OPENROUTER_MODEL_TOPIC_PICKER",
+                              getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL))
+        timeout = int(getattr(conf, "LLM_REQUEST_TIMEOUT", 30))
+        llm = ChatOpenAI(
+            model=topic_model,
+            openai_api_key=conf.OPENROUTER_API_KEY,
+            openai_api_base=conf.OPENROUTER_BASE_URL,
+            temperature=0.0,
+            max_tokens=1200,
+            request_timeout=timeout,
+            model_kwargs={"response_format": {"type": "json_object"}},
+        )
+
+        def _call(license_type: str, raw_ops: List[str]) -> dict:
+            if not raw_ops:
+                return {"groups": []}
+            ops_str = "\n".join(f"- {o}" for o in raw_ops)
+            prompt = (
+                "คุณเป็น AI ที่ช่วยจัดกลุ่มประเภทการดำเนินการสำหรับใบอนุญาตธุรกิจ\n"
+                "หน้าที่: จัดกลุ่ม raw operation values ด้านล่างให้เป็นหมวดหมู่ที่ user เข้าใจง่าย\n"
+                "กฎ:\n"
+                "1. แต่ละกลุ่มต้องมี label ภาษาไทยที่กระชับ ชัดเจน (ไม่เกิน 30 ตัวอักษร)\n"
+                "2. ค่าที่หมายถึงการยื่น/จด/ขอใหม่ → label เช่น 'ยื่นขอใหม่ / จดทะเบียน'\n"
+                "3. ค่าที่หมายถึงต่ออายุ → label 'ต่ออายุ'\n"
+                "4. ค่าที่หมายถึงแก้ไข/เปลี่ยนแปลง → label 'แก้ไข / เปลี่ยนแปลงรายการ'\n"
+                "5. ค่าที่หมายถึงยกเลิก/เลิก → label 'ยกเลิก'\n"
+                "6. ค่าที่หมายถึงย้าย → label 'ย้ายสถานประกอบการ'\n"
+                "7. ค่าที่หมายถึงเพิ่มสาขา → label 'เพิ่มสถานประกอบการ'\n"
+                "8. ค่าที่หมายถึงปิดสาขา → label 'ปิดสถานประกอบการ'\n"
+                "9. ค่าที่ไม่เข้าข้อใดข้างต้น → label 'อื่น ๆ'\n"
+                "10. ถ้าหลาย raw values มีความหมายเดียวกัน ให้รวมไว้ใน group เดียวกัน\n"
+                "11. ห้ามสร้าง label ที่ไม่มีใน raw list\n"
+                f"license_type: {license_type}\n"
+                f"raw operations:\n{ops_str}\n"
+                "Return JSON only:\n"
+                '{"groups": [{"label": "...", "raw": ["..."]}, ...]}'
+            )
+            try:
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)],
+                                  logger=_LOG, label="Supervisor/op_group_classify")).strip()
+                text = self._strip_code_fences(text)
+                obj = json.loads(text)
+                return obj if isinstance(obj, dict) else {"groups": []}
+            except Exception as e:
+                _LOG.warning("[Supervisor] op_group_classifier LLM failed: %s", e)
                 return {}
 
         return _call
@@ -565,8 +701,8 @@ class PersonaSupervisor:
             )
             
             try:
-                resp = llm_invoke(llm, prompt)
-                txt = resp.strip()
+                resp = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/deduplicate")
+                txt = extract_llm_text(resp).strip()
                 if txt.startswith("```json"):
                     txt = txt.replace("```json", "").replace("```", "").strip()
                 data = json.loads(txt)
@@ -629,7 +765,7 @@ class PersonaSupervisor:
                 f"options: {opts}\n"
             )
             try:
-                text = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm").content.strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm")).strip()
             except Exception:
                 return {}
             text = self._strip_code_fences(text)
@@ -673,7 +809,7 @@ class PersonaSupervisor:
                 f"current_persona: {persona}\n\n"
                 "Intent categories:\n"
                 "- new_topic: ต้องการเปลี่ยนหัวข้อ / ขอหัวข้อแนะนำใหม่ / อยากรู้เรื่องอื่น\n"
-                "- elaborate: ต้องการให้อธิบายเพิ่มเติมจากคำตอบหรือหัวข้อล่าสุด\n"
+                "- elaborate: ขอให้ขยายความ/อธิบายให้ละเอียดขึ้นโดยตรง (เช่น 'ขยายความ', 'อธิบายเพิ่มหน่อย', 'บอกให้ละเอียดขึ้น') — ต้องเป็นการขอ elaboration อย่างชัดเจน ไม่ใช่การถามแง่มุมใหม่ (เอกสาร/ค่าธรรมเนียม/ขั้นตอน) หรือคำถามเกี่ยวกับธุรกิจ\n"
                 "- legal_question: ถามเรื่องกฎหมาย/ใบอนุญาต/ภาษี/จดทะเบียน/ธุรกิจร้านอาหาร\n"
                 "- greeting: ทักทาย/ขอบคุณ/ปิดบทสนทนา\n"
                 "- unknown: ไม่เกี่ยวกับธุรกิจร้านอาหารและไม่สามารถระบุได้\n\n"
@@ -682,7 +818,7 @@ class PersonaSupervisor:
                 "- query: ถ้า intent=legal_question ให้ใส่คำถามที่ชัดเจนขึ้น, ไม่งั้นเว้นว่าง"
             )
             try:
-                text = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/fallback_intent").content.strip()
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/fallback_intent")).strip()
             except Exception:
                 return {}
             text = self._strip_code_fences(text)
@@ -772,6 +908,97 @@ class PersonaSupervisor:
         if self._NOISE_ONLY_RE.match(t.lower()) and not self._looks_like_legal_question(t):
             return True
         return False
+
+    def _is_likely_typo_rule(self, s: str) -> bool:
+        """
+        Rule-based fast-path: detect obviously garbled input without LLM.
+        Returns True for inputs that are clearly not intentional (standalone Thai diacritics,
+        lone vowel marks, all-punctuation, etc.).
+        Does NOT catch ambiguous cases — those are delegated to LLM via _should_ask_typo_llm().
+        """
+        t = (s or "").strip()
+        if not t:
+            return False
+
+        # Numbers/selections are never typos
+        if self._LIKELY_SELECTION_RE.match(t):
+            return False
+
+        # Standalone Thai combining marks / vowel signs / tone marks (e.g. "ๅ", "ิ", "็")
+        if self._STANDALONE_TH_DIACRITIC_RE.match(t):
+            return True
+
+        # Single non-digit, non-Thai-consonant character
+        if len(t) == 1 and not t.isdigit():
+            # Only flag as typo if it's NOT a meaningful Thai consonant that could be a selection
+            # Thai consonants range U+0E01–U+0E2E — a single one could be noise but not a "typo" per se
+            # Single Thai vowel/diacritic is already caught above; single ASCII letter or symbol
+            if not ("\u0E01" <= t <= "\u0E2E"):
+                return True
+
+        # Pure punctuation (e.g. "???", "...", "!!")
+        if self._ALL_PUNCTUATION_RE.match(t):
+            return True
+
+        # Thai consonant mash with no real Thai vowel component (2–6 chars, all consonants/diacritics)
+        # e.g. "กขค", "ภคม" — real Thai words need at least a vowel or sara
+        if self._TH_CONSONANT_MASH_RE.match(t):
+            # But make sure it's not a real common word abbreviation or a legal signal
+            if not self._LEGAL_SIGNAL_RE.search(t) and not self._QUESTION_MARKERS_RE.search(t):
+                return True
+
+        return False
+
+    def _default_typo_check_llm_call(self) -> Callable[[str, str], dict]:
+        """
+        LLM callable for ambiguous inputs that rule-based check couldn't classify.
+        Returns {"is_typo": bool, "confidence": float, "suggested": str}.
+        Uses the fast topic-picker model for low latency.
+        - is_typo=True: input looks garbled/meaningless — ask user to retype
+        - is_typo=False: input has apparent meaning — route normally
+        - suggested: best guess at what user meant (empty string if no good guess)
+        """
+        topic_model = getattr(conf, "OPENROUTER_MODEL_TOPIC_PICKER", getattr(conf, "OPENROUTER_SWITCH_MODEL", conf.OPENROUTER_MODEL))
+        timeout = int(getattr(conf, "LLM_TOPIC_PICKER_TIMEOUT", 8))
+        llm = ChatOpenAI(
+            model=topic_model,
+            openai_api_key=conf.OPENROUTER_API_KEY,
+            openai_api_base=conf.OPENROUTER_BASE_URL,
+            temperature=0.0,
+            max_tokens=120,
+            request_timeout=timeout,
+            model_kwargs={"response_format": {"type": "json_object"}},
+        )
+
+        def _call(user_text: str, last_topic: str) -> dict:
+            prompt = (
+                "คุณคือ typo-detector สำหรับ AI ผู้ช่วยธุรกิจร้านอาหารไทย\n"
+                "วิเคราะห์ว่า user_text ด้านล่างเป็น 'การพิมพ์ผิด/ตัวอักษรสุ่ม/ไม่มีความหมาย' หรือเป็น 'ข้อความที่มีเจตนาชัดเจน'\n\n"
+                f"user_text: {user_text!r}\n"
+                f"บริบทล่าสุด: {last_topic or '(ยังไม่มี)'}\n\n"
+                "เกณฑ์ is_typo=true:\n"
+                "- อักขระสุ่มที่ไม่ก่อเป็นคำหรือประโยคได้\n"
+                "- อักษรผสมกันไม่ได้ตามหลักภาษาไทย/อังกฤษ\n"
+                "- ดูเหมือนกดแป้นพิมพ์โดยไม่ตั้งใจ\n"
+                "เกณฑ์ is_typo=false:\n"
+                "- มีคำ/ประโยคที่อ่านออกความหมายได้ แม้จะสั้น\n"
+                "- เป็นชื่อ, ตัวเลข, หรือคำย่อที่ใช้บ่อย\n\n"
+                "ตอบ JSON เท่านั้น:\n"
+                '{"is_typo": true, "confidence": 0.92, "suggested": ""}\n'
+                "- suggested: ถ้า is_typo=true แต่พอเดาได้ว่าหมายถึงอะไร ใส่คำนั้น ไม่งั้นเว้นว่าง"
+            )
+            try:
+                text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/typo_check")).strip()
+            except Exception:
+                return {}
+            text = self._strip_code_fences(text)
+            try:
+                obj = json.loads(text)
+                return obj if isinstance(obj, dict) else {}
+            except Exception:
+                return {}
+
+        return _call
 
     # --------------------------
     # Academic intake lock only when truly active
@@ -868,7 +1095,7 @@ class PersonaSupervisor:
         except Exception:
             confv = 0.0
 
-        wants_long = bool(res.get("wants_long", False)) if confv >= 0.55 else False
+        wants_long = bool(res.get("wants_long", False)) if confv >= 0.70 else False
         wants_short = bool(res.get("wants_short", False)) if confv >= 0.55 else False
 
         if wants_long and wants_short:
@@ -881,14 +1108,17 @@ class PersonaSupervisor:
         return {"wants_short": False, "wants_long": False, "method": "llm_low", "confidence": confv}
 
     def _classify_intent(self, state: ConversationState, user_input: str) -> Dict[str, Any]:
+        """
+        DEPRECATED — NOT called by _handle_inner.
+        _handle_inner contains its own inline routing priority that supersedes this method.
+        This method is kept ONLY for backward compatibility with external test fixtures that
+        may call it directly.  Do NOT add new logic here — update _handle_inner instead.
+        """
         state.context = state.context or {}
         text = (user_input or "")
 
         if self._is_academic_intake_active(state):
             return {"intent": self.INTENT_ACAD_INTAKE_REPLY, "meta": {}}
-
-        # awaiting_persona_confirmation is no longer used (confirmation dialogs removed)
-        # state.context.get("awaiting_persona_confirmation") is cleared in section 2.2 of _handle_inner
 
         if self._looks_like_switch_without_target(text):
             return {"intent": self.INTENT_EXPLICIT_SWITCH, "meta": {"kind": "no_target"}}
@@ -935,8 +1165,17 @@ class PersonaSupervisor:
         # ✅ NEW: LLM fallback intent classifier — replaces hardcoded error message
         self.llm_fallback_intent_call = self._default_fallback_intent_llm_call()
 
+        # ✅ NEW: LLM-based typo/garbled input detector
+        self.llm_typo_check_call = self._default_typo_check_llm_call()
+
         # ✅ NEW: LLM-based deduplication of similar options
         self._deduplicate_options_llm_call = llm_deduplicate_options_call or self._default_deduplicate_options_llm_call()
+
+        # ✅ LLM-based operation group classifier (no hardcoded rules)
+        # Cache: {(license_type, entity_type_normalized): (slot_options, raw_op_map)}
+        # populated lazily on first call per unique key — avoids repeated LLM round-trips
+        self._llm_op_group_classifier = self._default_op_group_classifier_llm_call()
+        self._op_groups_cache: Dict[tuple, Tuple[List[str], Dict]] = {}
 
         self._rng = random.Random()
 
@@ -1010,24 +1249,381 @@ class PersonaSupervisor:
         overlap = self._topic_overlap_ratio(last_q, q)
         return overlap < 0.22
 
+    # Regex: at least one generic follow-up keyword present in the message.
+    # Combined with length guard and no-specific-topic check below.
+    _GENERIC_FOLLOWUP_KEYWORDS_RE = re.compile(
+        r"(ขั้นตอน|การสมัคร|สมัคร|วิธีสมัคร|เอกสาร|ค่าธรรมเนียม|ค่าใช้จ่าย|"
+        r"ระยะเวลา|ช่องทางยื่น|ช่องทาง|สถานที่ยื่น|แบบฟอร์ม|ลิงก์|ลิงค์|ดาวน์โหลด|"
+        r"อยากรู้|อยากทราบ|ต้องใช้|ต้องทำ|ต้องเตรียม)",
+        re.IGNORECASE,
+    )
+    # Regex: specific topic/license keywords that indicate the user is asking about a NEW topic.
+    # If present, this is NOT a generic follow-up.
+    _SPECIFIC_TOPIC_RE = re.compile(
+        r"(ใบอนุญาต|จดทะเบียน|ภาษีมูลค่าเพิ่ม|ภาษีป้าย|vat|ภพ\.?20|สุรา|เหล้า|ประกันสังคม|ป้ายร้าน|"
+        r"ประกอบกิจการ|สถานที่จำหน่าย|ทะเบียนพาณิชย์|บริษัทจำกัด|ห้างหุ้นส่วน|qr.?pay|payment api|"
+        r"บัญชีธนาคาร|หาพนักงาน|edc|รูดบัตร|คิวอาร์เพย์|คิวอาเพ)",
+        re.IGNORECASE,
+    )
+
     def _ensure_practical_retrieval_for_legal(self, state: ConversationState, user_input: str) -> None:
         state.context = state.context or {}
         q = (user_input or "").strip()
         if not q:
             return
 
+        # Clear multi-topic flag: it is only valid for the single turn it was set.
+        # Any new legal question (this function is called for new questions, not slot answers)
+        # must start fresh — if the new query is also multi-topic the flag will be re-set below.
+        state.context.pop("_multi_topic_retrieval", None)
+
+        # 🎯 Generic follow-up anchoring: if user's message contains generic procedure/document/fee
+        # keywords but NO specific topic/license name, anchor the retrieval query to the active topic
+        # so we don't retrieve cross-topic docs and accidentally trigger multi-license detection.
+        # Example: "อยากรู้ขั้นตอนสมัคร เอกสารที่ต้องใช้ หรือค่าธรรมเนียม" after QR Payment answer.
+        _active_topic_q = (
+            str(getattr(state, "last_retrieval_query", "") or "").strip()
+            or str((state.context or {}).get("last_user_legal_query") or "").strip()
+        )
+        if (
+            _active_topic_q
+            and len(q) <= 80
+            and self._GENERIC_FOLLOWUP_KEYWORDS_RE.search(q)
+            and not self._SPECIFIC_TOPIC_RE.search(q)
+        ):
+            _LOG.info(
+                "[Supervisor] generic follow-up detected %r — anchoring retrieval to active topic %r",
+                q[:50], _active_topic_q[:50],
+            )
+            q = f"{_active_topic_q} {q}"
+
         if not self._should_retrieve_new_for_practical(state, q):
             return
 
-        docs = self.retriever.invoke(q)
+        # 🎯 Multi-topic predictive retrieval: if query mentions ≥2 license types, retrieve ALL
+        # their docs from Chroma by license_type filter and merge — lets LLM answer all in one response.
+        _detected_licenses = self._detect_license_types_from_query(q)
+        if len(_detected_licenses) >= 2:
+            try:
+                _vstore_mt = getattr(self.retriever, "vectorstore", None)
+                _coll_mt = getattr(_vstore_mt, "_collection", None) if _vstore_mt else None
+                if _coll_mt is not None:
+                    _doc_chars_mt = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 400) or 400)
+                    _SUPERVISOR_META_WL_MT = frozenset({
+                        "license_type", "operation_topic",
+                        "entity_type_normalized", "registration_type", "department",
+                        "fees", "operation_duration", "service_channel",
+                        "operation_steps", "identification_documents", "research_reference",
+                    })
+                    _SUPERVISOR_FC_MT = {
+                        "operation_steps": 600, "identification_documents": 700,
+                        "research_reference": 3200, "fees": 120, "service_channel": 200,
+                    }
+                    _merged: List[Dict] = []
+                    for _lt_name in _detected_licenses:
+                        _r = _coll_mt.get(
+                            where={"license_type": _lt_name},
+                            include=["documents", "metadatas"],
+                        )
+                        for _fc, _fm in zip(_r.get("documents") or [], _r.get("metadatas") or []):
+                            _sm: Dict = {}
+                            for _k, _v in (_fm or {}).items():
+                                if _k not in _SUPERVISOR_META_WL_MT or _v in (None, "", "nan", "None"):
+                                    continue
+                                _vs = str(_v)
+                                _cap = _SUPERVISOR_FC_MT.get(_k)
+                                _sm[_k] = _vs[:_cap] if _cap and len(_vs) > _cap else _vs
+                            _merged.append({"content": (_fc or "")[:_doc_chars_mt], "metadata": _sm})
+                    if _merged:
+                        state.current_docs = _merged
+                        state.last_retrieval_query = q
+                        state.context["_multi_topic_retrieval"] = True
+                        _LOG.info(
+                            "[Supervisor] multi-topic retrieval: %s → %d total docs merged",
+                            _detected_licenses, len(_merged),
+                        )
+                        return
+            except Exception as _e_mt:
+                _LOG.warning("[Supervisor] multi-topic retrieval failed: %s — falling back", _e_mt)
+
+        # 🎯 Targeted filter retrieval for rare license types that tend to be overwhelmed
+        # by ใบทะเบียนพาณิชย์ (77 docs) in embedding search.
+        # When query explicitly mentions one of these keywords, fetch ALL their docs directly
+        # from ChromaDB by license_type filter, bypassing the imbalanced embedding ranking.
+        _RARE_LT_PATTERNS = {
+            r"ประกันสังคม|กองทุนประกันสังคม|ขึ้นทะเบียนประกัน": "การขึ้นทะเบียนกองทุนประกันสังคม",
+            r"ใบอนุญาตจำหน่ายสุรา|ขายสุรา|จำหน่ายสุรา|ภส\.08": "ใบอนุญาตจำหน่ายสุรา",
+            r"ภาษีป้าย|ป้ายร้าน|ภป\.1": "แบบแสดงรายการภาษีป้ายร้านอาหาร",
+            r"ใบวุฒิบัตร|อบรมผู้สัมผัสอาหาร": "ใบวุฒิบัตรผู้สัมผัสอาหาร",
+            r"ใบรับรองแพทย์|9 โรค|สณ\.11": "ใบรับรองแพทย์ 9 โรค(สณ.11)",
+        }
+        for _rare_pat, _rare_lt in _RARE_LT_PATTERNS.items():
+            if re.search(_rare_pat, q, re.IGNORECASE):
+                try:
+                    _vstore = getattr(self.retriever, "vectorstore", None)
+                    _coll = getattr(_vstore, "_collection", None) if _vstore else None
+                    if _coll is not None:
+                        _filt_result = _coll.get(
+                            where={"license_type": _rare_lt},
+                            include=["documents", "metadatas"],
+                        )
+                        _filt_docs = _filt_result.get("documents") or []
+                        _filt_mds = _filt_result.get("metadatas") or []
+                        if _filt_docs:
+                            _doc_chars2 = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 400) or 400)
+                            _SUPERVISOR_META_WL2 = frozenset({
+                                "license_type", "operation_topic", "chunk_type",
+                                "entity_type_normalized", "registration_type", "department",
+                                "fees", "operation_duration", "service_channel",
+                            })
+                            _SUPERVISOR_FC2 = {
+                                "operation_steps": 600, "identification_documents": 700,
+                                "research_reference": 3200, "fees": 120, "service_channel": 200,
+                            }
+                            _filtered = []
+                            for _fc, _fm in zip(_filt_docs, _filt_mds):
+                                _sm = {}
+                                for _k, _v in (_fm or {}).items():
+                                    if _k not in _SUPERVISOR_META_WL2 or _v in (None, "", "nan", "None"):
+                                        continue
+                                    _vs = str(_v)
+                                    _cap = _SUPERVISOR_FC2.get(_k)
+                                    _sm[_k] = _vs[:_cap] if _cap and len(_vs) > _cap else _vs
+                                _filtered.append({"content": (_fc or "")[:_doc_chars2], "metadata": _sm})
+                            _LOG.info(
+                                "[Supervisor] rare-license targeted fetch: %r → %d docs (bypassing embedding imbalance)",
+                                _rare_lt, len(_filtered),
+                            )
+                            state.current_docs = _filtered
+                            state.last_retrieval_query = q
+                            return
+                except Exception as _e_rare:
+                    _LOG.warning("[Supervisor] rare-license filter retrieval failed: %s", _e_rare)
+                break  # only match first pattern
+
+        # 🎯 Query expansion: short/abbrev keywords map to full Thai terms for better embedding match
+        _QUERY_EXPAND = {
+            r"\bvat\b": "ภาษีมูลค่าเพิ่ม ภพ.20 จด VAT กรมสรรพากร",
+            r"\bภพ\.?20\b": "ภาษีมูลค่าเพิ่ม ภพ.20 จด VAT กรมสรรพากร",
+            r"ภาษีมูลค่าเพิ่ม": "ภาษีมูลค่าเพิ่ม ภพ.20 จด VAT กรมสรรพากร",
+            r"สุรา|เหล้า|ขายเหล้า": "ใบอนุญาตจำหน่ายสุรา สรรพสามิต ภส.08",
+            r"ประกันสังคม": "ขึ้นทะเบียนประกันสังคม นายจ้าง ลูกจ้าง",
+            r"ป้ายร้าน|ภาษีป้าย": "แบบแสดงรายการภาษีป้ายร้านอาหาร ป้ายโฆษณา",
+        }
+        _sv_expansions: list = []
+        for pattern, expansion in _QUERY_EXPAND.items():
+            if re.search(pattern, q, re.IGNORECASE) and expansion not in _sv_expansions:
+                _sv_expansions.append(expansion)
+        q_expanded = (q + " " + " ".join(_sv_expansions)).strip() if _sv_expansions else q
+
+        docs = self.retriever.invoke(q_expanded)
         results: List[Dict[str, Any]] = []
-        top_k = int(getattr(conf, "RETRIEVAL_TOP_K", 12) or 12)
+        top_k = int(getattr(conf, "RETRIEVAL_TOP_K", 15) or 15)
+        _doc_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 400) or 400)
+        # 🎯 Token: cap long metadata fields before storing — prevent ×N token explosion
+        _SUPERVISOR_META_WHITELIST = frozenset({
+            "license_type", "operation_topic", "chunk_type",
+            "entity_type_normalized", "registration_type", "department",
+            "fees", "operation_duration", "service_channel",
+        })
+        _SUPERVISOR_FIELD_CAPS = {
+            "operation_steps": 600, "identification_documents": 700,
+            "research_reference": 3200, "fees": 120, "service_channel": 200,
+        }
         for d in (docs or [])[:top_k]:
-            results.append({"content": (getattr(d, "page_content", "") or "")[:600], "metadata": getattr(d, "metadata", {}) or {}})
+            raw_md = getattr(d, "metadata", {}) or {}
+            slim_md = {}
+            for k, v in raw_md.items():
+                if k not in _SUPERVISOR_META_WHITELIST:
+                    continue
+                if v in (None, "", "nan", "None"):
+                    continue
+                v_str = str(v)
+                cap = _SUPERVISOR_FIELD_CAPS.get(k)
+                slim_md[k] = v_str[:cap] if cap and len(v_str) > cap else v_str
+            results.append({"content": (getattr(d, "page_content", "") or "")[:_doc_chars], "metadata": slim_md})
 
         state.current_docs = results
+        # FIX #5: write only to the Pydantic field — single source of truth.
+        # state.get_last_retrieval_query() reads this field first, so no context mirror needed.
         state.last_retrieval_query = q
-        state.context["last_retrieval_query"] = q
+
+    def _maybe_build_slot_queue_from_docs(self, state: ConversationState, query: str) -> None:
+        """
+        After doc retrieval for a direct legal question, discover slot dimensions for the
+        detected license_type and set topic_slot_queue — skipping already-collected slots.
+        If entity_type is already known, also re-retrieves docs with entity filter.
+        """
+        docs = state.current_docs or []
+        if not docs:
+            return
+
+        # Multi-topic: docs span multiple licenses intentionally — skip slot queue, let LLM answer all
+        if (state.context or {}).get("_multi_topic_retrieval"):
+            _LOG.info("[Supervisor] multi-topic retrieval flag set — skipping slot queue build")
+            return
+
+        # Extract all distinct license_types from retrieved docs
+        license_types_seen: list = []
+        for d in docs:
+            if not isinstance(d, dict):
+                continue
+            lt = ((d.get("metadata") or {}).get("license_type") or "").strip()
+            if lt and lt not in license_types_seen:
+                license_types_seen.append(lt)
+
+        if not license_types_seen:
+            return
+
+        # 🎯 Multi-topic question: if docs span >1 distinct license type, check for a dominant one.
+        # Dominant = one license has ≥60% of docs OR ≥2× the second. If dominant → proceed as
+        # single-license so slot_queue gets built from Chroma (gives correct choices).
+        if len(license_types_seen) > 1:
+            _license_counts: dict = {}
+            for _d2 in docs:
+                if not isinstance(_d2, dict):
+                    continue
+                _lt2 = ((_d2.get("metadata") or {}).get("license_type") or "").strip()
+                if _lt2:
+                    _license_counts[_lt2] = _license_counts.get(_lt2, 0) + 1
+            _total = sum(_license_counts.values())
+            _top = max(_license_counts, key=_license_counts.get)
+            _top_count = _license_counts[_top]
+            _sorted_counts = sorted(_license_counts.values(), reverse=True)
+            _second_count = _sorted_counts[1] if len(_sorted_counts) > 1 else 0
+            if _total > 0 and (
+                _top_count / _total >= 0.6
+                or (_second_count > 0 and _top_count >= _second_count * 2)
+            ):
+                _LOG.info(
+                    "[Supervisor] multi-license → dominant: %r (%d/%d docs), proceed with slot-queue",
+                    _top, _top_count, _total,
+                )
+                license_types_seen = [_top]
+            else:
+                _LOG.info(
+                    "[Supervisor] multi-license no dominant (%s) — presenting topic selector",
+                    license_types_seen,
+                )
+                # No dominant license: ask user which one to focus on first.
+                # Reuses "topic" slot routing — selection triggers focused retrieval + slot discovery.
+                # NOTE: do NOT set multi_license_topics; it forces action='answer' in practical
+                # and bypasses the slot-queue ask rule, giving incomplete generic answers.
+                _n_topics = len(license_types_seen[:4])
+                _topic_list_str = " / ".join(license_types_seen[:4])
+                _multi_q = (
+                    f"มีเรื่องที่เกี่ยวข้องกัน {_n_topics} เรื่องที่คุณน่าจะต้องดำเนินการ "
+                    f"({_topic_list_str}) "
+                    f"ต้องการเริ่มจากเรื่องใดก่อนครับ?"
+                )
+                state.context["topic_slot_queue"] = [{
+                    "key": "topic",
+                    "options": list(license_types_seen[:4]),
+                    "question": _multi_q,
+                }]
+                return
+
+        license_type = license_types_seen[0]
+
+        # Discover all slot dimensions for this license_type
+        all_slots = self._discover_slots_for_license(license_type)
+        if not all_slots:
+            return
+
+        # Filter out already-collected slots
+        try:
+            collected_keys = set((state.get_collected_slots() or {}).keys())
+        except Exception:
+            collected_keys = set()
+        remaining = [s for s in all_slots if s["key"] not in collected_keys]
+
+        if not remaining:
+            return
+
+        # ✅ FIX-P-A for legal_q path: if entity_type already collected, skip asking it again
+        # and apply entity-specific filtering + enriched retrieval + op_group slot
+        _known_entity_lq: Optional[str] = None
+        if "entity_type" in collected_keys:
+            _raw_et_lq = (state.get_collected_slots() or {}).get("entity_type", "")
+            try:
+                from service.data_loader import DataLoader as _DL_lq
+                _known_entity_lq = _DL_lq._normalize_entity_type(_raw_et_lq)
+            except Exception:
+                if "นิติบุคคล" in _raw_et_lq or "บริษัท" in _raw_et_lq or "ห้างหุ้นส่วน" in _raw_et_lq:
+                    _known_entity_lq = "นิติบุคคล"
+                elif "บุคคลธรรมดา" in _raw_et_lq:
+                    _known_entity_lq = "บุคคลธรรมดา"
+
+        if _known_entity_lq:
+            # Re-retrieve docs with entity filter for better context
+            _base_q_lq = (state.context or {}).get("last_user_legal_query") or ""
+            try:
+                state.current_docs = self._practical._retrieve_docs(
+                    f"{_base_q_lq} {_known_entity_lq}".strip(),
+                    metadata_filter={"entity_type_normalized": _known_entity_lq},
+                )
+                state.last_retrieval_query = f"{_base_q_lq} {_known_entity_lq}".strip()
+                _LOG.info(
+                    "[Supervisor] legal_q entity-enriched retrieval: entity=%r docs=%d",
+                    _known_entity_lq, len(state.current_docs),
+                )
+            except Exception as _e_lq:
+                _LOG.warning("[Supervisor] legal_q entity retrieval failed: %s", _e_lq)
+
+            # Filter registration_type options to entity-specific ones
+            _filtered_lq: List[Dict] = []
+            for _slot_lq in remaining:
+                if _slot_lq.get("key") == "registration_type":
+                    _ert_lq = self._get_registration_types_for_entity(license_type, _known_entity_lq)
+                    if len(_ert_lq) >= 2:
+                        _filtered_lq.append({
+                            "key": "registration_type",
+                            "options": _ert_lq,
+                            "question": _slot_lq.get("question", "รูปแบบการจดทะเบียนของคุณเป็นแบบใดครับ?"),
+                        })
+                        _LOG.info(
+                            "[Supervisor] legal_q registration_type filtered for entity=%r → %s",
+                            _known_entity_lq, _ert_lq,
+                        )
+                    else:
+                        _LOG.info(
+                            "[Supervisor] legal_q registration_type ≤1 opt for entity=%r → skip",
+                            _known_entity_lq,
+                        )
+                elif _slot_lq.get("key") != "entity_type":
+                    _filtered_lq.append(_slot_lq)
+            remaining = _filtered_lq
+
+            # Append operation_group slot (skip if already collected)
+            _op_res_lq = self._get_operation_groups_for_entity(license_type, _known_entity_lq)
+            _op_grps_lq, _raw_op_map_lq = (
+                _op_res_lq if isinstance(_op_res_lq, tuple) else (_op_res_lq, {})
+            )
+            if len(_op_grps_lq) >= 2 and "operation_group" not in collected_keys:
+                _inferred_lq = self._infer_operation_group_from_query(query, _op_grps_lq)
+                if _inferred_lq:
+                    state.save_collected_slot("operation_group", _inferred_lq)
+                    state.context.setdefault("slots", {})["confirmed_operation"] = _inferred_lq
+                    _LOG.info("[Supervisor] legal_q operation_group auto-inferred=%r — skipping ask", _inferred_lq)
+                else:
+                    remaining.append({
+                        "key": "operation_group",
+                        "options": _op_grps_lq,
+                        "question": "ต้องการดำเนินการเรื่องใดครับ?",
+                        "raw_op_map": _raw_op_map_lq,
+                    })
+                    _LOG.info("[Supervisor] legal_q operation_group appended → %s", _op_grps_lq)
+            elif "operation_group" in collected_keys:
+                _LOG.info("[Supervisor] legal_q operation_group already collected — skip")
+
+        if not remaining:
+            return
+
+        state.context["topic_slot_queue"] = remaining
+        _LOG.info(
+            "[Supervisor] legal_q slot_queue built: license=%r remaining=%s",
+            license_type, [s["key"] for s in remaining],
+        )
 
     # --------------------------
     # Pending slot routing (keep + mixed-input support)
@@ -1265,96 +1861,365 @@ class PersonaSupervisor:
         if self._looks_like_greeting_or_thanks(user_input) or self._is_noise(user_input):
             return False
 
+        # FIX #1: A new substantive legal question must NEVER be consumed as a slot answer.
+        # This guard lets step 2.9 (_looks_like_legal_question) handle it properly.
+        # Exemptions:
+        #   - "topic" slot: a legal phrase IS a valid topic selection
+        #   - "operation_group" slot: options contain legal keywords (จดทะเบียน, ต่ออายุ, etc.)
+        #   - "registration_type" slot: options contain terms like บริษัทจำกัด that match LEGAL_SIGNAL_RE
+        _ps = ctx.get("pending_slot")
+        pending_key = str((_ps.get("key") if isinstance(_ps, dict) else None) or "")
+        _SLOT_REPLY_ALWAYS = {"topic", "operation_group", "registration_type"}
+        if pending_key not in _SLOT_REPLY_ALWAYS and self._looks_like_legal_question(user_input):
+            _LOG.info(
+                "[Supervisor] pending_slot(%r) skipped — input looks like new legal question: %r",
+                pending_key, (user_input or "")[:50],
+            )
+            return False
+
         return self._looks_like_pending_slot_reply(user_input)
 
-    def _get_registration_types_for_docs(self, docs: List[Dict]) -> List[str]:
+    # ── Area-size keywords used to detect shop-area dimension in registration_type ──
+    _AREA_KEYWORDS: List[str] = ["น้อยกว่า", "มากกว่า", "ไม่เกิน", "เกิน", "ตารางเมตร"]
+
+    def _get_chroma_collection(self):
+        """Return the raw Chroma collection object from the practical retriever, or None."""
+        vectorstore = getattr(self._practical.retriever, "vectorstore", None)
+        if vectorstore is None:
+            return None
+        return getattr(vectorstore, "_collection", None)
+
+    def _discover_slots_for_license(self, license_type: str) -> List[Dict]:
         """
-        Given already-retrieved docs for a topic, find ALL registration_type values
-        that exist in Chroma for the same license_type domain.
-        Uses Chroma metadata query (exact match, not similarity) — fully deterministic.
-        Then uses LLM to deduplicate and normalize similar options.
-        Returns sorted list. Returns [] if license_type not found or on any error.
+        Dynamically discover all slot dimensions that exist in Chroma for a given
+        license_type. Returns an ORDERED list of slot dicts::
+
+            [
+                {"key": "entity_type",   "options": ["บุคคลธรรมดา", "นิติบุคคล"],
+                 "question": "ธุรกิจของคุณเป็นรูปแบบใดครับ?"},
+                {"key": "shop_area_type", "options": ["น้อยกว่า 200 ตารางเมตร", ...],
+                 "question": "ร้านของคุณมีขนาดพื้นที่ประมาณเท่าไหร่ครับ?"},
+                # more custom dimensions detected from registration_type …
+            ]
+
+        Detection rules (applied in order; all based on live Chroma data):
+        1. entity_type_normalized field  → slot key = "entity_type"
+        2. registration_type bullets containing area keywords → slot key = "shop_area_type"
+        3. registration_type values that are short, clean labels (not yet captured
+           by rules 1-2 and not entity/area noise) → slot key = "registration_type"
+
+        Returns [] if license_type not found, data is empty, or on any error.
+        No hardcoded option values — all come from Chroma.
         """
         try:
-            # Step 1: Extract license_type from retrieved docs (first non-empty wins)
-            license_type = None
-            for d in (docs or []):
-                lt = ((d.get("metadata") or {}).get("license_type") or "").strip()
-                if lt:
-                    license_type = lt
-                    break
-            if not license_type:
-                return []
-
-            # Step 2: Query Chroma for ALL docs with that license_type (no similarity — exact metadata match)
-            vectorstore = getattr(self._practical.retriever, "vectorstore", None)
-            if vectorstore is None:
-                return []
-            coll = getattr(vectorstore, "_collection", None)
+            coll = self._get_chroma_collection()
             if coll is None:
                 return []
             result = coll.get(where={"license_type": license_type}, include=["metadatas"])
-
-            # Step 3: Extract unique non-empty registration_type values
-            types: set = set()
-            for md in (result.get("metadatas") or []):
-                rt = ((md or {}).get("registration_type") or "").strip()
-                if rt:
-                    types.add(rt)
-            
-            # Step 4: Filter out garbage/non-entity values
-            # Valid entity types contain these keywords (case-insensitive)
-            VALID_KEYWORDS = [
-                "บุคคลธรรมดา", "นิติบุคคล", "บริษัท", "ห้างหุ้นส่วน", 
-                "กิจการ", "เจ้าของ", "จำกัด", "สามัญ", "มหาชน"
-            ]
-            # Invalid patterns that indicate data quality issues
-            INVALID_PATTERNS = [
-                "จำนวน", "ชื่อของ", "ผู้ที่ต้อง", "ขอจอง", "ยื่น", "การ"
-            ]
-            
-            def is_valid_entity_type(t: str) -> bool:
-                t_lower = t.lower()
-                # Reject if contains invalid patterns
-                if any(inv in t for inv in INVALID_PATTERNS):
-                    return False
-                # Accept if contains valid keywords
-                return any(kw in t for kw in VALID_KEYWORDS)
-            
-            filtered_types = [t for t in types if is_valid_entity_type(t)]
-            
-            if not filtered_types:
+            mds = result.get("metadatas") or []
+            if not mds:
                 return []
-            
-            # Step 5: Use LLM to deduplicate and normalize similar options
-            result = self._deduplicate_options_llm_call(filtered_types)
-            unique_options = result.get("unique_options", filtered_types)
-            reasoning = result.get("reasoning", "")
-            
-            _LOG.info(
-                "[Supervisor] _get_registration_types_for_docs: license_type=%r → %d raw → %d filtered → %d unique | reasoning=%s",
-                license_type, len(types), len(filtered_types), len(unique_options), reasoning[:80],
-            )
-            return sorted(unique_options)
+
+            slots: List[Dict] = []
+            seen_keys: set = set()
+
+            # ── Rule 0: location dimension (กรุงเทพฯ vs ต่างจังหวัด) ─────────────
+            # Ask this FIRST — it determines which service channel/fee/procedure applies.
+            # location is a single-value metadata field per doc — if ≥2 distinct values
+            # exist across docs for this license, real split exists → ask the user.
+            location_opts: set = set()
+            for md in mds:
+                loc = ((md or {}).get("location") or "").strip()
+                if loc and loc not in ("nan", "None"):
+                    location_opts.add(loc)
+            if len(location_opts) >= 2:
+                slots.append({
+                    "key": "location",
+                    "options": sorted(location_opts),
+                    "question": "ร้านของคุณตั้งอยู่ในพื้นที่ใดครับ?",
+                })
+                seen_keys.add("location")
+                _LOG.info("[Supervisor] discover_slots[%r]: location → %s", license_type, sorted(location_opts))
+            else:
+                _LOG.info(
+                    "[Supervisor] discover_slots[%r]: location SKIPPED — only %d location value(s) in docs",
+                    license_type, len(location_opts),
+                )
+
+            # ── Rule 1: entity_type_normalized dimension ──────────────────────────
+            entity_opts: set = set()
+            for md in mds:
+                et = ((md or {}).get("entity_type_normalized") or "").strip()
+                if et and et not in ("nan", "None"):
+                    entity_opts.add(et)
+            if entity_opts:
+                slots.append({
+                    "key": "entity_type",
+                    "options": sorted(entity_opts),
+                    "question": "ธุรกิจของคุณเป็นรูปแบบใดครับ?",
+                })
+                seen_keys.add("entity_type")
+                _LOG.info("[Supervisor] discover_slots[%r]: entity_type → %s", license_type, sorted(entity_opts))
+
+            # ── Rule 2: shop area dimension (area keywords in registration_type) ──
+            # Only add this slot if there are SEPARATE docs per area option
+            # (i.e. area_type actually produces different content — not just the same doc
+            # that mentions both sizes in one registration_type string).
+            area_opts: set = set()
+            for md in mds:
+                rt = ((md or {}).get("registration_type") or "").strip()
+                if not rt:
+                    continue
+                for part in re.split(r"[•\n]|\d+\.", rt):
+                    part = part.strip()
+                    if part and any(kw in part for kw in self._AREA_KEYWORDS):
+                        area_opts.add(part)
+            if area_opts:
+                # Verify: docs must be SPLIT by area — count docs whose registration_type
+                # covers only ONE area option (exclusive), not both.
+                # If every doc contains ALL area options in the same field → slot is useless.
+                _area_splits_docs = False
+                for md in mds:
+                    rt2 = ((md or {}).get("registration_type") or "").strip()
+                    _matched = [a for a in area_opts if a in rt2]
+                    if 0 < len(_matched) < len(area_opts):
+                        # This doc covers some area options but not all → real split exists
+                        _area_splits_docs = True
+                        break
+                if _area_splits_docs:
+                    slots.append({
+                        "key": "shop_area_type",
+                        "options": sorted(area_opts),
+                        "question": "ร้านของคุณมีขนาดพื้นที่ประมาณเท่าไหร่ครับ?",
+                    })
+                    seen_keys.add("shop_area_type")
+                    _LOG.info("[Supervisor] discover_slots[%r]: shop_area_type → %s", license_type, sorted(area_opts))
+                else:
+                    _LOG.info(
+                        "[Supervisor] discover_slots[%r]: shop_area_type SKIPPED — all docs contain same area options (no real split)",
+                        license_type,
+                    )
+
+            # ── Rule 3: standalone registration_type labels (no entity / area noise) ──
+            # Collect short, clean labels that survived the two filters above.
+            # Skip if the value looks like a combined paragraph (> 80 chars or has bullet •)
+            rt_opts: set = set()
+            known_entity = entity_opts | {"นิติบุคคล", "บุคคลธรรมดา"}
+            for md in mds:
+                rt = ((md or {}).get("registration_type") or "").strip()
+                if not rt:
+                    continue
+                # Skip combined multi-line values
+                if "•" in rt or "\n" in rt or len(rt) > 80:
+                    continue
+                # Skip if it overlaps with entity or area options already captured
+                if any(kw in rt for kw in self._AREA_KEYWORDS):
+                    continue
+                if rt in known_entity:
+                    continue
+                # Skip tokens that look like prefixes/headers (e.g. "ประเภทนิติบุคคล")
+                if any(rt in e or e in rt for e in known_entity):
+                    continue
+                # Skip operation-action sub-types (e.g. ย้าย, ปิด, เลิก) — these are scenarios
+                # for changing an existing registration, not initial registration sub-types
+                _OP_PREFIXES = ("ย้าย", "ปิด", "เลิก", "โอน", "หยุด", "แก้ไข", "เพิ่ม", "ลด")
+                if any(rt.startswith(pfx) for pfx in _OP_PREFIXES):
+                    continue
+                rt_opts.add(rt)
+            # ── Normalize rt_opts before building the slot ──────────────────────────
+            # Step 1: Split compound "1.X 2.Y" patterns into individual items
+            _expanded: set = set()
+            _compound_re = re.compile(r'\d+[.)]\s*(.+?)(?=\s+\d+[.)]|$)')
+            for _item in rt_opts:
+                if re.search(r'\d+[.)]\s*\S', _item):
+                    for _p in _compound_re.findall(_item):
+                        _p = _p.strip()
+                        if _p:
+                            _expanded.add(_p)
+                else:
+                    _expanded.add(_item)
+
+            # Step 2: Remove items that are proper substrings of other items
+            # e.g. "บริษัท" ⊂ "บริษัทจำกัด" → drop "บริษัท"
+            _clean = {x for x in _expanded if not any(x != y and x in y for y in _expanded)}
+
+            # Step 3: Remove "X และ Y" supersets when both parts are covered by specific items
+            # e.g. "ห้างหุ้นส่วนและบริษัท" → parts ["ห้างหุ้นส่วน","บริษัท"] both ⊂ specific options → drop
+            _clean2: set = set()
+            for x in _clean:
+                if "และ" in x:
+                    _parts = [p.strip() for p in x.split("และ") if p.strip()]
+                    _others = _clean - {x}
+                    if _parts and all(any(p in o for o in _others) for p in _parts):
+                        _LOG.debug("[Supervisor] drop supertype option %r (all parts covered)", x)
+                        continue
+                _clean2.add(x)
+
+            rt_opts = _clean2
+
+            # Only useful when there are ≥2 distinct options to choose from
+            if len(rt_opts) >= 2 and "registration_type" not in seen_keys:
+                slots.append({
+                    "key": "registration_type",
+                    "options": sorted(rt_opts),
+                    "question": "รูปแบบการจดทะเบียนของคุณเป็นแบบใดครับ?",
+                })
+                seen_keys.add("registration_type")
+                _LOG.info("[Supervisor] discover_slots[%r]: registration_type → %s", license_type, sorted(rt_opts))
+
+            return slots
         except Exception as e:
-            _LOG.warning("[Supervisor] _get_registration_types_for_docs failed: %s", e)
+            _LOG.warning("[Supervisor] _discover_slots_for_license failed: %s", e)
             return []
 
-    def _get_operation_groups_for_entity(self, license_type: str, entity_type_normalized: str) -> List[str]:
+    def _get_registration_types_for_docs(self, docs: List[Dict]) -> List[str]:
         """
-        ดึง operation_by_department จาก Chroma แล้วจัดกลุ่มเป็น 3 หมวดหลัก:
-        - จดทะเบียนใหม่
-        - แก้ไขรายการจดทะเบียน
-        - ยกเลิกการจดทะเบียน
-        คืนค่า list ของกลุ่มที่มีข้อมูลจริงใน Chroma เท่านั้น
+        Legacy shim — kept for backward compatibility.
+        Extracts license_type from docs then delegates to _discover_slots_for_license.
+        Returns the options of the FIRST discovered slot (entity_type), or [].
+        """
+        license_type = None
+        for d in (docs or []):
+            lt = ((d.get("metadata") or {}).get("license_type") or "").strip()
+            if lt:
+                license_type = lt
+                break
+        if not license_type:
+            return []
+        slots = self._discover_slots_for_license(license_type)
+        return slots[0]["options"] if slots else []
+
+    def _get_registration_types_for_entity(self, license_type: str, entity_type_normalized: str) -> List[str]:
+        """
+        ดึง registration_type options จาก Chroma กรองตาม entity_type_normalized ที่ระบุ
+        ใช้เพื่อสร้าง sub-slot สำหรับนิติบุคคล (บริษัทจำกัด vs ห้างหุ้นส่วนจำกัด vs ห้างหุ้นส่วนสามัญ)
+        คืนค่า [] ถ้าไม่มีตัวเลือกหลายแบบหรือข้อมูลไม่พอ (ไม่มี hardcode)
+        """
+        try:
+            coll = self._get_chroma_collection()
+            if coll is None:
+                return []
+            result = coll.get(
+                where={"$and": [
+                    {"license_type": license_type},
+                    {"entity_type_normalized": entity_type_normalized},
+                ]},
+                include=["metadatas"],
+            )
+            mds = result.get("metadatas") or []
+            if not mds:
+                return []
+
+            rt_raw: set = set()
+            for md in mds:
+                rt = ((md or {}).get("registration_type") or "").strip()
+                if not rt or rt in ("nan", "None"):
+                    continue
+                # Skip combined multi-line values
+                if "•" in rt or "\n" in rt or len(rt) > 80:
+                    continue
+                # Skip area-type values
+                if any(kw in rt for kw in self._AREA_KEYWORDS):
+                    continue
+                # Skip the entity-type value itself
+                if rt == entity_type_normalized:
+                    continue
+                rt_raw.add(rt)
+
+            if not rt_raw:
+                return []
+
+            # ── Normalize: split compound "1.X 2.Y" patterns ──
+            _expanded: set = set()
+            _compound_re = re.compile(r'\d+[.)]\s*(.+?)(?=\s+\d+[.)]|$)')
+            for _item in rt_raw:
+                if re.search(r'\d+[.)]\s*\S', _item):
+                    for _p in _compound_re.findall(_item):
+                        _p = _p.strip()
+                        if _p:
+                            _expanded.add(_p)
+                else:
+                    _expanded.add(_item)
+
+            # Remove SHORT substrings covered by a LONGER/more-specific label
+            # e.g. if both 'บริษัท' and 'บริษัทจำกัด' exist → keep 'บริษัทจำกัด', drop 'บริษัท'
+            _clean = {x for x in _expanded if not any(x != y and x in y for y in _expanded)}
+
+            # Remove "X และ Y" supersets when both parts are covered by specific items
+            _clean2: set = set()
+            for x in _clean:
+                if "และ" in x:
+                    _parts = [p.strip() for p in x.split("และ") if p.strip()]
+                    _others = _clean - {x}
+                    if _parts and all(any(p in o for o in _others) for p in _parts):
+                        continue
+                _clean2.add(x)
+
+            result_list = sorted(_clean2)
+            _LOG.info(
+                "[Supervisor] registration_types_for_entity: license=%r entity=%r → %s",
+                license_type, entity_type_normalized, result_list,
+            )
+            return result_list
+        except Exception as e:
+            _LOG.warning("[Supervisor] _get_registration_types_for_entity failed: %s", e)
+            return []
+
+    def _detect_license_types_from_query(self, query: str) -> List[str]:
+        """
+        Predictive multi-topic detection: scan query for ALL license type keywords BEFORE retrieval.
+        Returns list of canonical license_type names found in the query.
+        """
+        q = query or ""
+        found: List[str] = []
+        for pattern, license_name in self._MULTI_TOPIC_LICENSE_KEYWORDS:
+            if re.search(pattern, q, re.IGNORECASE) and license_name not in found:
+                found.append(license_name)
+        return found
+
+    def _infer_operation_group_from_query(self, query: str, op_groups: List[str]) -> Optional[str]:
+        """
+        If user query clearly implies a specific operation type, return matching op_group label.
+        Returns None if ambiguous — must ask user.
+        """
+        q = query or ""
+
+        def _find_group(keywords: list) -> Optional[str]:
+            for g in op_groups:
+                if any(kw in g for kw in keywords):
+                    return g
+            return None
+
+        if self._OP_INFER_CANCEL_RE.search(q):
+            found = _find_group(["ยกเลิก", "ปิด"])
+            if found:
+                return found
+        if self._OP_INFER_EDIT_RE.search(q):
+            found = _find_group(["แก้ไข", "เปลี่ยนแปลง"])
+            if found:
+                return found
+        if self._OP_INFER_NEW_RE.search(q):
+            found = _find_group(["ใหม่", "จดทะเบียน", "ยื่นขอ"])
+            if found:
+                return found
+        return None
+
+    def _get_operation_groups_for_entity(self, license_type: str, entity_type_normalized: str) -> Tuple[List[str], Dict]:
+        """
+        ดึง operation_by_department จาก Chroma แล้วจัดกลุ่มเป็นหมวดหลัก
+        คืน (slot_options, raw_op_map) เสมอ:
+          slot_options  = list ของ display labels ที่จะแสดงให้ user เลือก
+          raw_op_map    = {display_label: [raw operation_by_department values]}
+                         ใช้สร้าง enriched query ตอน retrieval
+        ไม่มี hardcode — ทุกอย่างมาจากข้อมูลจริงใน Chroma
         """
         try:
             vectorstore = getattr(self._practical.retriever, "vectorstore", None)
             if vectorstore is None:
-                return []
+                return [], {}
             coll = getattr(vectorstore, "_collection", None)
             if coll is None:
-                return []
+                return [], {}
 
             result = coll.get(
                 where={"$and": [
@@ -1371,34 +2236,114 @@ class PersonaSupervisor:
                     ops.add(op)
 
             if not ops:
-                return []
+                return [], {}
 
-            has_new    = any("การจดทะเบียน" in o for o in ops)
-            has_edit   = any(o.startswith("แก้ไข") for o in ops)
-            has_cancel = any(o.startswith("ยกเลิก") for o in ops)
-            has_info   = any("อายุ" in o or "สิทธิ์" in o for o in ops)
+            # ── Expand op set: also query without entity filter to catch shared operations ──
+            # (some op types are stored without entity_type_normalized and would be missed)
+            result_all = coll.get(where={"license_type": license_type}, include=["metadatas"])
+            ops_all: set = set()
+            for md in (result_all.get("metadatas") or []):
+                op = ((md or {}).get("operation_by_department") or "").strip()
+                if op:
+                    ops_all.add(op)
+            # Merge: entity-specific ops + license-wide ops
+            combined_ops = ops | ops_all
 
-            groups = []
-            if has_new:
-                groups.append("จดทะเบียนใหม่ (จัดตั้ง)")
-            if has_edit:
-                groups.append("แก้ไขรายการจดทะเบียน")
-            if has_cancel:
-                groups.append("ยกเลิกการจดทะเบียน")
-            if has_info:
-                groups.append("ข้อมูลทั่วไป / ข้อกำหนด")
+            # ── Cache check: avoid calling LLM repeatedly for same (license, entity) ──
+            _cache_key = (license_type, entity_type_normalized)
+            if _cache_key in self._op_groups_cache:
+                _cached = self._op_groups_cache[_cache_key]
+                _LOG.info("[Supervisor] op_groups cache hit: %r → %s", license_type, _cached[0])
+                return _cached
 
-            _LOG.info(
-                "[Supervisor] operation_groups: license=%r entity=%r → %s",
-                license_type, entity_type_normalized, groups,
-            )
-            return groups
+            # ── Try LLM classifier first (zero hardcode, handles future license types) ──
+            def _build_from_llm(op_set: set) -> Optional[Tuple[List[str], Dict]]:
+                try:
+                    res = self._llm_op_group_classifier(license_type, sorted(op_set)) or {}
+                    groups_raw = res.get("groups") or []
+                    if not groups_raw:
+                        return None
+                    slot_opts: List[str] = []
+                    raw_map: Dict[str, List[str]] = {}
+                    for g in groups_raw:
+                        label = str(g.get("label") or "").strip()
+                        raw_vals = [str(v).strip() for v in (g.get("raw") or []) if str(v).strip()]
+                        if label and raw_vals:
+                            slot_opts.append(label)
+                            raw_map[label] = raw_vals
+                    if slot_opts:
+                        _LOG.info("[Supervisor] op_groups LLM: %r → %s", license_type, slot_opts)
+                        return slot_opts, raw_map
+                except Exception as e:
+                    _LOG.warning("[Supervisor] op_groups LLM classifier failed: %s", e)
+                return None
+
+            llm_result = _build_from_llm(combined_ops)
+            if llm_result:
+                self._op_groups_cache[_cache_key] = llm_result
+                _LOG.info("[Supervisor] operation_groups: license=%r entity=%r → %s (LLM)",
+                          license_type, entity_type_normalized, llm_result[0])
+                return llm_result
+
+            # ── Rule-based fallback (fast, no LLM cost, catches common Thai prefixes) ──
+            # Used when LLM is unavailable or times out.
+            # Covers existing data well; new license types with unknown prefixes fall to "อื่น ๆ"
+            # which still works — user sees the group and can select it.
+            def _ops_to_groups_fallback(op_set: set) -> List[Tuple[str, set]]:
+                _NEW_PREFIXES = (
+                    "การจดทะเบียน", "การจดภาษี", "การจด",
+                    "การขอ", "การสมัคร", "การยื่น",
+                    "การขึ้นทะเบียน", "การขออนุมัติ",
+                    "การขอรับรอง", "การขอใบรับรอง",
+                    "เปิดบัญชี", "จัดตั้ง", "ยื่นใหม่", "เปิดใหม่", "ขอใบรับรอง",
+                )
+                _RENEW_PREFIXES = ("ต่ออายุ", "การต่ออายุ")
+                _new, _renew, _edit, _cancel, _move, _add, _close, _other = \
+                    set(), set(), set(), set(), set(), set(), set(), set()
+                for o in op_set:
+                    if any(o.startswith(pfx) for pfx in _RENEW_PREFIXES) or re.match(r"^อายุ", o):
+                        _renew.add(o)
+                    elif o.startswith("แก้ไข") or o.startswith("เปลี่ยนแปลง") or o.startswith("การแก้ไข"):
+                        _edit.add(o)
+                    elif o.startswith("ยกเลิก") or o.startswith("เลิก"):
+                        _cancel.add(o)
+                    elif o.startswith("ย้าย"):
+                        _move.add(o)
+                    elif o.startswith("เพิ่ม"):
+                        _add.add(o)
+                    elif (o.startswith("ปิด") or o.startswith("การปิด")) and "งบการเงิน" not in o:
+                        _close.add(o)
+                    elif any(o.startswith(pfx) for pfx in _NEW_PREFIXES):
+                        _new.add(o)
+                    else:
+                        _other.add(o)
+                g = []
+                if _new:    g.append(("ยื่นขอใบอนุญาตใหม่ / จดทะเบียน", _new))
+                if _renew:  g.append(("ต่ออายุใบอนุญาต",               _renew))
+                if _edit:   g.append(("แก้ไข / เปลี่ยนแปลงรายการ",    _edit))
+                if _cancel: g.append(("ยกเลิกใบอนุญาต",                _cancel))
+                if _move:   g.append(("ย้ายสถานประกอบการ",             _move))
+                if _add:    g.append(("เพิ่มสถานประกอบการ",            _add))
+                if _close:  g.append(("ปิดสถานประกอบการ",              _close))
+                if _other:  g.append(("อื่น ๆ",                        _other))
+                return g
+
+            group_tuples = _ops_to_groups_fallback(combined_ops)
+            slot_options = [label for label, _ in group_tuples]
+            raw_op_map = {label: sorted(raw_ops) for label, raw_ops in group_tuples}
+            fallback_result: Tuple[List[str], Dict] = (slot_options, raw_op_map)
+            self._op_groups_cache[_cache_key] = fallback_result
+
+            _LOG.info("[Supervisor] operation_groups: license=%r entity=%r → %s (rule-based fallback)",
+                      license_type, entity_type_normalized, slot_options)
+            return fallback_result
         except Exception as e:
             _LOG.warning("[Supervisor] _get_operation_groups_for_entity failed: %s", e)
-            return []
+            return [], {}
 
     def _route_pending_slot_to_persona(self, state: ConversationState, user_input: str) -> Tuple[ConversationState, str]:
-        pending = (state.context or {}).get("pending_slot") or {}
+        _raw_pending = (state.context or {}).get("pending_slot")
+        pending = _raw_pending if isinstance(_raw_pending, dict) else {}
         mapped, err = self._map_pending_slot_reply(pending, user_input)
 
         if err:
@@ -1433,21 +2378,321 @@ class PersonaSupervisor:
         # Pre-retrieve docs so the LLM has documents when called with _internal=True
         # (_internal=True skips the retrieval block inside persona.handle)
         if isinstance(pending, dict) and pending.get("key") == "topic" and mapped:
+            # 🎯 Predictive multi-topic: if user's ORIGINAL message mentions ≥2 license types,
+            # retrieve ALL their docs and answer everything in one response — don't single-topic.
+            _multi_from_input = self._detect_license_types_from_query(user_input or "")
+            if len(_multi_from_input) >= 2:
+                try:
+                    _vstore_mt2 = getattr(self.retriever, "vectorstore", None)
+                    _coll_mt2 = getattr(_vstore_mt2, "_collection", None) if _vstore_mt2 else None
+                    if _coll_mt2 is not None:
+                        _doc_chars_mt2 = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 400) or 400)
+                        _SUPERVISOR_META_WL_MT2 = frozenset({
+                            "license_type", "operation_topic",
+                            "entity_type_normalized", "registration_type", "department",
+                            "fees", "operation_duration", "service_channel",
+                            "operation_steps", "identification_documents", "research_reference",
+                        })
+                        _SUPERVISOR_FC_MT2 = {
+                            "operation_steps": 600, "identification_documents": 700,
+                            "research_reference": 3200, "fees": 120, "service_channel": 200,
+                        }
+                        _merged_mt2: List[Dict] = []
+                        for _lt_name2 in _multi_from_input:
+                            _r2 = _coll_mt2.get(
+                                where={"license_type": _lt_name2},
+                                include=["documents", "metadatas"],
+                            )
+                            for _fc2, _fm2 in zip(_r2.get("documents") or [], _r2.get("metadatas") or []):
+                                _sm2: Dict = {}
+                                for _k2, _v2 in (_fm2 or {}).items():
+                                    if _k2 not in _SUPERVISOR_META_WL_MT2 or _v2 in (None, "", "nan", "None"):
+                                        continue
+                                    _vs2 = str(_v2)
+                                    _cap2 = _SUPERVISOR_FC_MT2.get(_k2)
+                                    _sm2[_k2] = _vs2[:_cap2] if _cap2 and len(_vs2) > _cap2 else _vs2
+                                _merged_mt2.append({"content": (_fc2 or "")[:_doc_chars_mt2], "metadata": _sm2})
+                        if _merged_mt2:
+                            state.current_docs = _merged_mt2
+                            state.last_retrieval_query = user_input or str(mapped)
+                            state.context["_multi_topic_retrieval"] = True
+                            state.context.pop("topic_slot_queue", None)
+                            _LOG.info(
+                                "[Supervisor] topic-slot multi-topic retrieval: %s → %d total docs merged",
+                                _multi_from_input, len(_merged_mt2),
+                            )
+                            # Skip all slot building and go directly to practical answer
+                            return self._practical.handle(state, user_input, _internal=True)
+                except Exception as _e_mt2:
+                    _LOG.warning("[Supervisor] topic-slot multi-topic retrieval failed: %s — single-topic fallback", _e_mt2)
+
             try:
-                state.current_docs = self._practical._retrieve_docs(str(mapped))
+                # Step 1: similarity search to detect license_type
+                _initial_docs = self._practical._retrieve_docs(str(mapped))
+                _license_detected = None
+                for _d in _initial_docs:
+                    _lt = ((_d.get("metadata") or {}).get("license_type") or "").strip()
+                    if _lt:
+                        _license_detected = _lt
+                        break
+
+                # Step 2: coll.get() — ALL docs for license (no k limit, no similarity bias)
+                # Generic docs (entity='') score higher on topic-name similarity than specific docs
+                # (entity='นิติบุคคล', location-specific) → top-6 misses specific docs entirely.
+                # coll.get() avoids this bias by fetching every doc with the matching license_type.
+                _used_full = False
+                if _license_detected:
+                    try:
+                        _coll = self._get_chroma_collection()
+                        if _coll is not None:
+                            _result = _coll.get(
+                                where={"license_type": _license_detected},
+                                include=["documents", "metadatas"],
+                            )
+                            _max_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 600) or 600)
+                            _all_docs = [
+                                {"content": (c or "")[:_max_chars], "metadata": m or {}}
+                                for c, m in zip(
+                                    _result.get("documents") or [],
+                                    _result.get("metadatas") or [],
+                                )
+                            ]
+                            if _all_docs:
+                                state.current_docs = _all_docs
+                                _used_full = True
+                                _LOG.info(
+                                    "[Supervisor] full-license pre-retrieved %d docs for license=%r",
+                                    len(_all_docs), _license_detected,
+                                )
+                    except Exception as _e2:
+                        _LOG.warning(
+                            "[Supervisor] full-license retrieval failed: %s — fallback to similarity",
+                            _e2,
+                        )
+
+                if not _used_full:
+                    state.current_docs = _initial_docs
+                    _LOG.info(
+                        "[Supervisor] pre-retrieved %d docs (similarity) for topic=%r",
+                        len(_initial_docs), str(mapped)[:40],
+                    )
+
                 state.last_retrieval_query = str(mapped)
-                _LOG.info("[Supervisor] pre-retrieved %d docs for topic=%r", len(state.current_docs), str(mapped)[:40])
             except Exception as e:
                 _LOG.warning("[Supervisor] pre-retrieve failed for topic=%r: %s", str(mapped)[:40], e)
                 state.current_docs = []
 
-            # Deterministically enumerate all registration_type values for this domain
-            # so practical can show ALL entity type options regardless of embedding ranking
-            _reg_types = self._get_registration_types_for_docs(state.current_docs or [])
-            if _reg_types:
-                state.context["topic_registration_types"] = _reg_types
+            # ✅ Multi-license check FIRST: if initial retrieval spans multiple license types,
+            # skip the slot queue entirely and do per-topic retrieval so LLM can answer all topics.
+            _lt_counts: dict = {}
+            for _d in (state.current_docs or []):
+                if not isinstance(_d, dict):
+                    continue
+                _lt = ((_d.get("metadata") or {}).get("license_type") or "").strip()
+                if _lt:
+                    _lt_counts[_lt] = _lt_counts.get(_lt, 0) + 1
+            _lt_total = sum(_lt_counts.values())
+            _lt_unique = list(_lt_counts.keys())
+            _is_multi_license = False
+            if len(_lt_unique) > 1:
+                _lt_top = max(_lt_counts, key=_lt_counts.get)
+                _lt_top_count = _lt_counts[_lt_top]
+                _lt_sorted = sorted(_lt_counts.values(), reverse=True)
+                _lt_second = _lt_sorted[1] if len(_lt_sorted) > 1 else 0
+                # Not dominant → genuine multi-topic question
+                if not (_lt_total > 0 and (
+                    _lt_top_count / _lt_total >= 0.6
+                    or (_lt_second > 0 and _lt_top_count >= _lt_second * 2)
+                )):
+                    _is_multi_license = True
+
+            if _is_multi_license:
+                _LOG.info(
+                    "[Supervisor] topic pre-retrieve multi-license detected %s — per-topic retrieval",
+                    _lt_unique,
+                )
+                state.context["multi_license_topics"] = _lt_unique
+                _TOPIC_QUERIES_PT = {
+                    "ใบภาษีมูลค่าเพิ่ม ภพ.20": "ภาษีมูลค่าเพิ่ม ภพ.20 จด VAT กรมสรรพากร",
+                    "ใบอนุญาตจำหน่ายสุรา": "ใบอนุญาตจำหน่ายสุรา สรรพสามิต ภส.08",
+                    "แบบแสดงรายการภาษีป้าย": "ภาษีป้าย แบบ ภป.1 ป้ายร้านอาหาร",
+                    "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร": "ใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร BMA OSS",
+                    "ใบทะเบียนพาณิชย์": "จดทะเบียนพาณิชย์ DBD",
+                }
+                _pt_docs: List[Dict[str, Any]] = []
+                _pt_seen: set = set()
+                _pt_doc_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 400) or 400)
+                _PT_META_WL = frozenset({
+                    "license_type", "operation_topic", "chunk_type",
+                    "entity_type_normalized", "registration_type", "department",
+                    "fees", "operation_duration", "service_channel",
+                    "operation_steps", "identification_documents", "research_reference",
+                })
+                _PT_FIELD_CAPS = {
+                    "operation_steps": 600, "identification_documents": 700,
+                    "research_reference": 3200, "fees": 120, "service_channel": 200,
+                }
+                for _lt_item in _lt_unique:
+                    _tq = _TOPIC_QUERIES_PT.get(_lt_item, _lt_item)
+                    try:
+                        _tdocs = self.retriever.invoke(_tq)
+                        _added = 0
+                        for _td in (_tdocs or [])[:5]:
+                            _tc = (getattr(_td, "page_content", "") or "")[:_pt_doc_chars]
+                            _ck = _tc[:80]
+                            if _ck in _pt_seen:
+                                continue
+                            _pt_seen.add(_ck)
+                            _rm = getattr(_td, "metadata", {}) or {}
+                            _sm: Dict[str, Any] = {}
+                            for _k, _v in _rm.items():
+                                if _k not in _PT_META_WL or _v in (None, "", "nan", "None"):
+                                    continue
+                                _vs = str(_v)
+                                _cap = _PT_FIELD_CAPS.get(_k)
+                                _sm[_k] = _vs[:_cap] if _cap and len(_vs) > _cap else _vs
+                            _pt_docs.append({"content": _tc, "metadata": _sm})
+                            _added += 1
+                            if _added >= 3:
+                                break
+                        _LOG.info("[Supervisor] per-topic %r → %d docs", _lt_item, _added)
+                    except Exception as _e_pt:
+                        _LOG.warning("[Supervisor] per-topic retrieval failed %r: %s", _lt_item, _e_pt)
+                if _pt_docs:
+                    state.current_docs = _pt_docs
+                    _LOG.info("[Supervisor] multi-license merged: %d docs total", len(_pt_docs))
+                state.context.pop("topic_slot_queue", None)
+                _slot_queue = []  # skip slot building below
             else:
-                state.context.pop("topic_registration_types", None)
+                # ✅ Dynamic slot discovery: query Chroma to find ALL slot dimensions
+                # for this license_type (entity_type, shop_area_type, registration_type, …)
+                # Result is an ordered queue — practical pops one slot at a time.
+                _license_type_for_slots = None
+                for _d in (state.current_docs or []):
+                    if not isinstance(_d, dict):
+                        continue
+                    _lt = ((_d.get("metadata") or {}).get("license_type") or "").strip()
+                    if _lt:
+                        _license_type_for_slots = _lt
+                        break
+                if _license_type_for_slots:
+                    _slot_queue = self._discover_slots_for_license(_license_type_for_slots)
+                else:
+                    _slot_queue = []
+
+            # ✅ Cross-topic slot memory: skip slots the user already answered
+            # (e.g. entity_type answered in previous topic → don't ask again)
+            if _slot_queue:
+                try:
+                    _prev_slots = state.get_collected_slots() or {}
+                except Exception:
+                    _prev_slots = {}
+
+                if _prev_slots:
+                    _new_queue: List[Dict] = []
+                    _known_entity_for_new_topic: Optional[str] = None
+                    for _s in _slot_queue:
+                        _skey = _s.get("key")
+                        if _skey in _prev_slots:
+                            _LOG.info(
+                                "[Supervisor] skip slot %r (already answered=%r in earlier topic)",
+                                _skey, _prev_slots[_skey],
+                            )
+                            # If entity_type already known, remember it so we can apply
+                            # FIX-P-A logic (filter registration_type + append op_group)
+                            if _skey == "entity_type":
+                                try:
+                                    from service.data_loader import DataLoader as _DL_et
+                                    _known_entity_for_new_topic = _DL_et._normalize_entity_type(_prev_slots[_skey])
+                                except Exception:
+                                    _raw_et = _prev_slots[_skey]
+                                    if "นิติบุคคล" in _raw_et or "บริษัท" in _raw_et or "ห้างหุ้นส่วน" in _raw_et:
+                                        _known_entity_for_new_topic = "นิติบุคคล"
+                                    elif "บุคคลธรรมดา" in _raw_et:
+                                        _known_entity_for_new_topic = "บุคคลธรรมดา"
+                        else:
+                            _new_queue.append(_s)
+
+                    # If entity_type was already known, apply FIX-P-A:
+                    # filter registration_type + add operation_group slot
+                    if _known_entity_for_new_topic and _license_type_for_slots:
+                        # Re-retrieve docs with entity filter for better context
+                        _base_q = str(mapped).strip()
+                        try:
+                            state.current_docs = self._practical._retrieve_docs(
+                                f"{_base_q} {_known_entity_for_new_topic}".strip(),
+                                metadata_filter={"entity_type_normalized": _known_entity_for_new_topic},
+                            )
+                            state.last_retrieval_query = f"{_base_q} {_known_entity_for_new_topic}".strip()
+                            _LOG.info(
+                                "[Supervisor] new-topic entity-enriched retrieval: entity=%r docs=%d",
+                                _known_entity_for_new_topic, len(state.current_docs),
+                            )
+                        except Exception as _e:
+                            _LOG.warning("[Supervisor] new-topic entity retrieval failed: %s", _e)
+
+                        _filtered_nq: List[Dict] = []
+                        for _slot in _new_queue:
+                            if _slot.get("key") == "registration_type":
+                                _ert_opts = self._get_registration_types_for_entity(
+                                    _license_type_for_slots, _known_entity_for_new_topic
+                                )
+                                if len(_ert_opts) >= 2:
+                                    _filtered_nq.append({
+                                        "key": "registration_type",
+                                        "options": _ert_opts,
+                                        "question": _slot.get("question", "รูปแบบการจดทะเบียนของคุณเป็นแบบใดครับ?"),
+                                    })
+                                    _LOG.info(
+                                        "[Supervisor] (new-topic) registration_type filtered for entity=%r → %s",
+                                        _known_entity_for_new_topic, _ert_opts,
+                                    )
+                                else:
+                                    _LOG.info(
+                                        "[Supervisor] (new-topic) registration_type ≤1 opt for entity=%r → skip",
+                                        _known_entity_for_new_topic,
+                                    )
+                            else:
+                                _filtered_nq.append(_slot)
+                        _new_queue = _filtered_nq
+
+                        # Append operation_group slot (skip if already collected)
+                        _op_res_nt = self._get_operation_groups_for_entity(
+                            _license_type_for_slots, _known_entity_for_new_topic
+                        )
+                        _op_grps_nt, _raw_op_map_nt = (
+                            _op_res_nt if isinstance(_op_res_nt, tuple) else (_op_res_nt, {})
+                        )
+                        if len(_op_grps_nt) >= 2 and "operation_group" not in _prev_slots:
+                            _query_for_infer_nt = (state.context or {}).get("last_user_legal_query") or user_input
+                            _inferred_nt = self._infer_operation_group_from_query(_query_for_infer_nt, _op_grps_nt)
+                            if _inferred_nt:
+                                state.save_collected_slot("operation_group", _inferred_nt)
+                                state.context.setdefault("slots", {})["confirmed_operation"] = _inferred_nt
+                                _LOG.info("[Supervisor] (new-topic) operation_group auto-inferred=%r — skipping ask", _inferred_nt)
+                            else:
+                                _new_queue.append({
+                                    "key": "operation_group",
+                                    "options": _op_grps_nt,
+                                    "question": "ต้องการดำเนินการเรื่องใดครับ?",
+                                    "raw_op_map": _raw_op_map_nt,
+                                })
+                                _LOG.info(
+                                    "[Supervisor] (new-topic) operation_group appended → %s", _op_grps_nt
+                                )
+                        elif "operation_group" in _prev_slots:
+                            _LOG.info("[Supervisor] (new-topic) operation_group already collected — skip")
+
+                    _slot_queue = _new_queue
+
+            if _slot_queue:
+                state.context["topic_slot_queue"] = _slot_queue
+                _LOG.info("[Supervisor] topic_slot_queue set: %s", [s["key"] for s in _slot_queue])
+            else:
+                state.context.pop("topic_slot_queue", None)
+            # Clear legacy keys to avoid conflicts
+            state.context.pop("topic_registration_types", None)
+            state.context.pop("topic_area_types", None)
 
         elif isinstance(pending, dict) and pending.get("key") and mapped:
             # Any non-topic slot filled — enrich retrieval if entity type can be inferred.
@@ -1475,15 +2720,14 @@ class PersonaSupervisor:
             # ✅ Level 3: ถ้า pending slot เป็น operation_group → กรอง docs ตาม operation ที่เลือก
             _pending_key = pending.get("key") if isinstance(pending, dict) else None
             if _pending_key == "operation_group":
-                # Map group label back to Chroma keyword prefix for filtering
                 _op_group_val = str(mapped).strip()
-                _op_kw_map = {
-                    "จดทะเบียนใหม่ (จัดตั้ง)":    "การจดทะเบียน",
-                    "แก้ไขรายการจดทะเบียน":       "แก้ไข",
-                    "ยกเลิกการจดทะเบียน":          "ยกเลิก",
-                    "ข้อมูลทั่วไป / ข้อกำหนด":    "อายุ",
-                }
-                _op_prefix = _op_kw_map.get(_op_group_val)
+                # ── Use raw_op_map stored in the slot (built from real ChromaDB values) ──
+                # raw_op_map: {display_label: [raw operation_by_department values]}
+                # This replaces the hardcoded _op_kw_map and eliminates false-positive substring matching.
+                _raw_op_map = pending.get("raw_op_map") or {}
+                _raw_ops_for_label = _raw_op_map.get(_op_group_val) or []
+                # Build op prefix from raw values (first raw value is usually the most specific keyword)
+                _op_prefix = " ".join(_raw_ops_for_label[:2]) if _raw_ops_for_label else _op_group_val
 
                 # Recover entity_type from previously saved slots
                 _saved_entity = None
@@ -1495,67 +2739,310 @@ class PersonaSupervisor:
                 except Exception:
                     pass
 
-                if _op_prefix and _saved_entity:
-                    # Build $and filter: entity_type_normalized + operation_by_department starts with prefix
-                    enriched_q = f"{base_q} {_op_group_val}".strip() if base_q else _op_group_val
+                # Recover license_type from last_topic (set when user chose the topic menu)
+                _saved_license = (state.context or {}).get("last_topic") or ""
+
+                if _saved_entity:
+                    # Filter by BOTH entity_type AND license_type so docs from other license types
+                    # (e.g. ใบทะเบียนพาณิชย์) cannot sneak in and confuse the LLM.
+                    _all_slots_for_q = state.get_collected_slots() or {}
+                    _slot_q_parts = [v for k, v in _all_slots_for_q.items()
+                                     if k not in ("entity_type", "operation_group") and v]
+                    enriched_q = " ".join(filter(None, [base_q, _op_group_val, _op_prefix or ""] + _slot_q_parts)).strip()
                     try:
-                        # Chroma $and with $contains for operation prefix
-                        op_filter = {"$and": [
-                            {"entity_type_normalized": _saved_entity},
-                            {"operation_by_department": {"$contains": _op_prefix}},
-                        ]}
-                        state.current_docs = self._practical._retrieve_docs(enriched_q, metadata_filter=op_filter)
+                        _k_for_op = max(int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)), 8)
+                        # Build combined filter: entity_type + license_type (if known)
+                        _op_meta_filter: dict = {"entity_type_normalized": _saved_entity}
+                        if _saved_license:
+                            _op_meta_filter["license_type"] = _saved_license
+                        state.current_docs = self._practical._retrieve_docs(
+                            enriched_q,
+                            metadata_filter=_op_meta_filter,
+                            max_docs=_k_for_op,
+                        )
+                        # Fallback: if combined filter returns 0 docs, relax to entity-only
+                        if not state.current_docs and _saved_license:
+                            _LOG.info("[Supervisor] op-group combined filter 0 docs → relax to entity-only")
+                            state.current_docs = self._practical._retrieve_docs(
+                                enriched_q,
+                                metadata_filter={"entity_type_normalized": _saved_entity},
+                                max_docs=_k_for_op,
+                            )
                         state.last_retrieval_query = enriched_q
                         _LOG.info(
-                            "[Supervisor] op-group retrieval: entity=%r op=%r prefix=%r docs=%d",
-                            _saved_entity, _op_group_val, _op_prefix, len(state.current_docs),
+                            "[Supervisor] op-group retrieval: entity=%r license=%r op=%r docs=%d",
+                            _saved_entity, _saved_license, _op_group_val, len(state.current_docs),
                         )
                     except Exception as e:
-                        _LOG.warning("[Supervisor] op-group retrieval failed (%s), falling back to entity-only", e)
-                        # Fallback: just entity filter without operation filter
-                        try:
-                            state.current_docs = self._practical._retrieve_docs(
-                                enriched_q, metadata_filter={"entity_type_normalized": _saved_entity}
-                            )
-                        except Exception:
-                            pass
-                elif _saved_entity:
-                    # No prefix matched — still re-retrieve with entity filter
-                    enriched_q = f"{base_q} {_op_group_val}".strip() if base_q else _op_group_val
-                    try:
-                        state.current_docs = self._practical._retrieve_docs(
-                            enriched_q, metadata_filter={"entity_type_normalized": _saved_entity}
-                        )
-                        state.last_retrieval_query = enriched_q
-                    except Exception:
-                        pass
+                        _LOG.warning("[Supervisor] op-group retrieval failed: %s", e)
+
+                # Stamp the confirmed topic+operation into slots so LLM sees it in context
+                if _saved_license:
+                    state.context.setdefault("slots", {})["confirmed_topic"] = _saved_license
+                if _op_group_val:
+                    state.context.setdefault("slots", {})["confirmed_operation"] = _op_group_val
+
+                # BUG-A fix: operation_group slot has been consumed — clear stale queue so
+                # subsequent action='ask' fallback cannot pop it and show a wrong menu.
+                state.context.pop("topic_slot_queue", None)
+                _LOG.info("[Supervisor] topic_slot_queue cleared after operation_group consumed")
+
+            elif _pending_key in ("area_size", "shop_area_type", "operation_location", "location_scope", "location"):
+                # ✅ Area/location slot filled → re-retrieve docs with both entity + location/area_size
+                # metadata filters so LLM gets the exact doc for this user's path.
+                # New v3 schema has location + area_size as explicit metadata fields.
+                _saved_entity2 = None
+                try:
+                    _saved_entity2 = (state.get_collected_slots() or {}).get("entity_type")
+                    if _saved_entity2:
+                        from service.data_loader import DataLoader as _DL3
+                        _saved_entity2 = _DL3._normalize_entity_type(_saved_entity2)
+                except Exception:
+                    pass
+
+                # Derive location/area_size metadata values from the user's answer
+                _location_val = None
+                _area_size_val = None
+                _raw_lower = (_raw or "").lower()
+                if "กรุงเทพ" in _raw_lower:
+                    _location_val = "กรุงเทพฯ"
+                elif "ต่างจังหวัด" in _raw_lower or "ต่างหวัด" in _raw_lower:
+                    _location_val = "ต่างจังหวัด"
+                if "มากกว่า 200" in _raw_lower or "เกิน 200" in _raw_lower or "> 200" in _raw_lower:
+                    _area_size_val = "มากกว่า 200 ตารางเมตร"
+                elif "น้อยกว่า 200" in _raw_lower or "ไม่เกิน 200" in _raw_lower or "< 200" in _raw_lower:
+                    _area_size_val = "ไม่เกิน 200 ตารางเมตร"
+
+                # Build enriched query from all collected slots
+                _all_slots_area = state.get_collected_slots() or {}
+                _area_q_parts = [v for k, v in _all_slots_area.items()
+                                 if k not in ("operation_group",) and v]
+                enriched_q_area = " ".join(filter(None, [base_q] + _area_q_parts + [_raw])).strip()
+
+                # Build metadata filter: use most specific filter available
+                # Priority: location > area_size > entity (for ใบอนุญาตจัดตั้งสถานที่ use location filter)
+                _meta_filter_area: dict | None = None
+                if _location_val:
+                    _meta_filter_area = {"location": _location_val}
+                elif _area_size_val:
+                    _meta_filter_area = {"area_size": _area_size_val}
+                elif _saved_entity2:
+                    _meta_filter_area = {"entity_type_normalized": _saved_entity2}
+
+                try:
+                    _k_for_area = max(int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 6)), 8)
+                    state.current_docs = self._practical._retrieve_docs(
+                        enriched_q_area,
+                        metadata_filter=_meta_filter_area,
+                        max_docs=_k_for_area,
+                    )
+                    state.last_retrieval_query = enriched_q_area
+                    _LOG.info(
+                        "[Supervisor] area-slot retrieval v3: key=%r val=%r location=%r area=%r entity=%r filter=%r docs=%d",
+                        _pending_key, _raw, _location_val, _area_size_val, _saved_entity2,
+                        _meta_filter_area, len(state.current_docs),
+                    )
+                except Exception as e:
+                    _LOG.warning("[Supervisor] area-slot retrieval failed: %s", e)
 
             elif _entity_val:
-                # Re-retrieve with entity-type filter for better doc coverage
-                enriched_q = f"{base_q} {_entity_val}".strip() if base_q else _entity_val
+                # Re-retrieve with entity-type filter for better doc coverage.
+                # Include _raw in the query when it differs from _entity_val (e.g. registration_type
+                # "ห้างหุ้นส่วนจำกัด/สามัญ" → entity "นิติบุคคล") so vector similarity ranks
+                # the specific sub-type docs higher.
+                _pending_key2 = pending.get("key") if isinstance(pending, dict) else None
+                if _pending_key2 and _pending_key2 != "entity_type" and _raw and _raw != _entity_val:
+                    enriched_q = " ".join(filter(None, [base_q, _entity_val, _raw])).strip()
+                else:
+                    enriched_q = f"{base_q} {_entity_val}".strip() if base_q else _entity_val
+
+                # Capture current license_type BEFORE retrieval overwrites docs.
+                # Chroma entity filter returns docs from ALL licenses with that entity —
+                # we post-filter to the original license to prevent cross-license slot discovery.
+                _prior_license = None
+                for _pd in (state.current_docs or []):
+                    _plt = ((_pd.get("metadata") or {}).get("license_type") or "").strip()
+                    if _plt:
+                        _prior_license = _plt
+                        break
+
                 entity_filter = {"entity_type_normalized": _entity_val}
                 try:
-                    state.current_docs = self._practical._retrieve_docs(enriched_q, metadata_filter=entity_filter)
+                    _entity_docs = self._practical._retrieve_docs(enriched_q, metadata_filter=entity_filter)
+                    # Post-filter: keep only docs for the original license_type
+                    if _prior_license and _entity_docs:
+                        _license_filtered = [
+                            d for d in _entity_docs
+                            if ((_d_md := (d.get("metadata") or {})).get("license_type") or "").strip() == _prior_license
+                        ]
+                        if _license_filtered:
+                            state.current_docs = _license_filtered
+                            _LOG.info(
+                                "[Supervisor] entity-enriched retrieval: entity=%r license=%r docs=%d (filtered from %d)",
+                                _entity_val, _prior_license, len(_license_filtered), len(_entity_docs),
+                            )
+                        else:
+                            # No docs match the original license — keep all (better than nothing)
+                            state.current_docs = _entity_docs
+                            _LOG.info(
+                                "[Supervisor] entity-enriched retrieval: entity=%r docs=%d (no license match for %r, keeping all)",
+                                _entity_val, len(_entity_docs), _prior_license,
+                            )
+                    else:
+                        state.current_docs = _entity_docs
+                        _LOG.info("[Supervisor] entity-enriched retrieval: entity=%r docs=%d", _entity_val, len(state.current_docs))
                     state.last_retrieval_query = enriched_q
-                    _LOG.info("[Supervisor] entity-enriched retrieval: entity=%r docs=%d", _entity_val, len(state.current_docs))
                 except Exception as e:
                     _LOG.warning("[Supervisor] entity-enriched retrieval failed: %s", e)
 
-                # ✅ Level 3: ดึง operation groups จาก Chroma เพื่อถามว่าต้องการทำเรื่องอะไร
-                # (จดทะเบียนใหม่ / แก้ไข / ยกเลิก) แทนที่จะให้ LLM เดาเอง
-                _license_type = None
-                for d in (state.current_docs or []):
-                    lt = ((d.get("metadata") or {}).get("license_type") or "").strip()
-                    if lt:
-                        _license_type = lt
-                        break
-                if _license_type:
-                    _op_groups = self._get_operation_groups_for_entity(_license_type, _entity_val)
-                    if _op_groups:
-                        state.context["topic_operation_groups"] = _op_groups
-                        _LOG.info("[Supervisor] topic_operation_groups set → %s", _op_groups)
-                    else:
-                        state.context.pop("topic_operation_groups", None)
+                # When registration_type was just filled, supplement with Chroma coll.get()
+                # filtered by registration_type to get the exact docs (avoids pulling in
+                # บริษัทมหาชนจำกัด or other sub-type docs via similarity bias).
+                if _pending_key2 == "registration_type" and _raw and _prior_license:
+                    try:
+                        _coll_rt = self._get_chroma_collection()
+                        if _coll_rt is not None:
+                            _rt_result = _coll_rt.get(
+                                where={"$and": [
+                                    {"license_type": _prior_license},
+                                    {"registration_type": _raw},
+                                ]},
+                                include=["documents", "metadatas"],
+                            )
+                            _doc_chars_rt = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 400) or 400)
+                            _SUPERVISOR_META_WL_RT = frozenset({
+                                "license_type", "operation_topic", "entity_type_normalized",
+                                "registration_type", "department", "fees", "operation_duration",
+                                "service_channel", "operation_steps", "identification_documents",
+                                "research_reference",
+                            })
+                            _SUPERVISOR_FC_RT = {
+                                "operation_steps": 600, "identification_documents": 700,
+                                "research_reference": 3200, "fees": 120, "service_channel": 200,
+                            }
+                            _rt_specific: List[Dict] = []
+                            for _fc_rt, _fm_rt in zip(_rt_result.get("documents") or [], _rt_result.get("metadatas") or []):
+                                _sm_rt: Dict = {}
+                                for _k_rt, _v_rt in (_fm_rt or {}).items():
+                                    if _k_rt not in _SUPERVISOR_META_WL_RT or _v_rt in (None, "", "nan", "None"):
+                                        continue
+                                    _vs_rt = str(_v_rt)
+                                    _cap_rt = _SUPERVISOR_FC_RT.get(_k_rt)
+                                    _sm_rt[_k_rt] = _vs_rt[:_cap_rt] if _cap_rt and len(_vs_rt) > _cap_rt else _vs_rt
+                                _rt_specific.append({"content": (_fc_rt or "")[:_doc_chars_rt], "metadata": _sm_rt})
+                            if _rt_specific:
+                                # Merge: specific registration_type docs first, then remaining entity docs (dedup by content prefix)
+                                _seen_rt: set = {d["content"][:60] for d in _rt_specific}
+                                _rt_general = [d for d in (state.current_docs or []) if d.get("content", "")[:60] not in _seen_rt]
+                                state.current_docs = _rt_specific + _rt_general
+                                _LOG.info(
+                                    "[Supervisor] registration_type targeted retrieval: %r → %d specific + %d general docs",
+                                    _raw, len(_rt_specific), len(_rt_general),
+                                )
+                    except Exception as _e_rt:
+                        _LOG.warning("[Supervisor] registration_type targeted retrieval failed: %s", _e_rt)
+
+                # ✅ After entity_type collected → re-discover remaining slots
+                # (area_type may now be needed; skip entity_type since it's already collected)
+                # SKIP rebuild if pending_key is registration_type — operation_group is already
+                # in the existing topic_slot_queue and re-building would overwrite it with a
+                # fresh (potentially stale/truncated) LLM call result.
+                _skip_queue_rebuild = _pending_key2 == "registration_type" and bool(
+                    (state.context or {}).get("topic_slot_queue")
+                )
+                if _skip_queue_rebuild:
+                    _LOG.info("[Supervisor] skip slot queue rebuild — registration_type answered, operation_group already queued")
+                else:
+                    _license_type_for_area = None
+                    for d in (state.current_docs or []):
+                        lt = ((d.get("metadata") or {}).get("license_type") or "").strip()
+                        if lt:
+                            _license_type_for_area = lt
+                            break
+                    if _license_type_for_area:
+                        _all_slots = self._discover_slots_for_license(_license_type_for_area)
+                        # Remove slots already collected
+                        try:
+                            _collected_keys = set((state.get_collected_slots() or {}).keys())
+                        except Exception:
+                            _collected_keys = set()
+                        _remaining = [s for s in _all_slots if s["key"] not in _collected_keys]
+                        # Also remove entity_type itself (just answered)
+                        _remaining = [s for s in _remaining if s["key"] != "entity_type"]
+
+                        # ✅ FIX P-A: filter registration_type options to only show sub-types
+                        # that match the entity_type the user just selected (read from real Chroma data).
+                        # e.g. entity=นิติบุคคล → [บริษัทจำกัด, ห้างหุ้นส่วนจำกัด, ห้างหุ้นส่วนสามัญ]
+                        # instead of showing all entity types mixed together.
+                        if _entity_val:
+                            _filtered_remaining: List[Dict] = []
+                            for _slot in _remaining:
+                                if _slot.get("key") == "registration_type":
+                                    _entity_rt_opts = self._get_registration_types_for_entity(
+                                        _license_type_for_area, _entity_val
+                                    )
+                                    if len(_entity_rt_opts) >= 2:
+                                        # Replace with entity-filtered options
+                                        _filtered_remaining.append({
+                                            "key": "registration_type",
+                                            "options": _entity_rt_opts,
+                                            "question": _slot.get("question", "รูปแบบการจดทะเบียนของคุณเป็นแบบใดครับ?"),
+                                        })
+                                        _LOG.info(
+                                            "[Supervisor] registration_type filtered for entity=%r → %s",
+                                            _entity_val, _entity_rt_opts,
+                                        )
+                                    else:
+                                        # Only 0-1 options for this entity → skip asking (already unambiguous)
+                                        _LOG.info(
+                                            "[Supervisor] registration_type has ≤1 option for entity=%r → skip slot",
+                                            _entity_val,
+                                        )
+                                else:
+                                    _filtered_remaining.append(_slot)
+                            _remaining = _filtered_remaining
+
+                        # ✅ Level 3: append operation_group slot into the queue
+                        # so it is asked in practical BEFORE switching to academic
+                        _license_type_for_og = _license_type_for_area
+                        if _license_type_for_og and _entity_val:
+                            _op_result = self._get_operation_groups_for_entity(_license_type_for_og, _entity_val)
+                            _op_groups, _raw_op_map = _op_result if isinstance(_op_result, tuple) else (_op_result, {})
+                            # Only add to queue when ≥2 distinct options — single option means nothing to choose
+                            if len(_op_groups) >= 2:
+                                _query_for_infer_et = (state.context or {}).get("last_user_legal_query") or user_input
+                                _inferred_et = self._infer_operation_group_from_query(_query_for_infer_et, _op_groups)
+                                if _inferred_et:
+                                    state.save_collected_slot("operation_group", _inferred_et)
+                                    state.context.setdefault("slots", {})["confirmed_operation"] = _inferred_et
+                                    _LOG.info("[Supervisor] operation_group auto-inferred=%r (entity path) — skipping ask", _inferred_et)
+                                else:
+                                    _remaining.append({
+                                        "key": "operation_group",
+                                        "options": _op_groups,
+                                        "question": "ต้องการดำเนินการเรื่องใดครับ?",
+                                        "raw_op_map": _raw_op_map,
+                                    })
+                                    _LOG.info("[Supervisor] operation_group appended to slot_queue → %s", _op_groups)
+                            elif _op_groups:
+                                _LOG.info("[Supervisor] operation_group only 1 option (%s) — skip asking", _op_groups)
+
+                        if _remaining:
+                            state.context["topic_slot_queue"] = _remaining
+                            _LOG.info("[Supervisor] topic_slot_queue after entity → remaining: %s",
+                                      [s["key"] for s in _remaining])
+                        else:
+                            state.context.pop("topic_slot_queue", None)
+                # Clear legacy keys
+                state.context.pop("topic_area_types", None)
+                state.context.pop("topic_registration_types", None)
+
+                # Level 3 now handled inside slot_queue above — clear old separate key
+                state.context.pop("topic_operation_groups", None)
+
+        # BUG-E fix: record that a pending slot was successfully consumed so last_action
+        # reflects the actual operation (not a stale value from a previous invalid reply).
+        state.last_action = "pending_slot_filled"
 
         pid = normalize_persona_id(state.persona_id)
         if pid == "academic":
@@ -2199,7 +3686,7 @@ class PersonaSupervisor:
         )
         try:
             resp = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/topic_desc")
-            text = self._strip_code_fences(resp.content.strip())
+            text = self._strip_code_fences(extract_llm_text(resp).strip())
             obj = json.loads(text)
             descs = obj.get("descriptions") if isinstance(obj, dict) else obj
             if isinstance(descs, list) and descs:
@@ -2208,20 +3695,32 @@ class PersonaSupervisor:
             _LOG.warning("_generate_topic_descriptions failed, using fallback", exc_info=True)
         return [f"ผมจะแนะนำ{t} ตั้งแต่ต้นจนจบ พร้อมเอกสารที่ต้องใช้ ให้คุณทำตามได้ง่ายที่สุดครับ" for t in topics]
 
+    # Fixed first-greeting menu — shown on every new session (no LLM call, zero token cost)
+    _FIXED_GREETING_MENU: List[Tuple[str, str]] = [
+        (
+            "ขอใบอนุญาตจัดตั้งสถานที่จำหน่ายอาหาร",
+            "ผมจะแนะนำวิธีการจดใบอนุญาติจัดตั้งสถานที่จำหน่ายอาหารแบบ Step by Step "
+            "พร้อมเอกสารที่ต้องใช้ให้คุณนำไปใช้ได้ง่ายที่สุดครับ",
+        ),
+        (
+            "วิธีการลงทะเบียน QR-Payment API",
+            "ผมจะแนะนำวิธีการลงทะเบียน QR-Payment API สำหรับใช้งานกับระบบของเรา"
+            "ให้คุณทำตามได้แบบไม่สับสนครับ",
+        ),
+    ]
+
     def _render_greeting_with_menu(self, state: ConversationState, kind: str, menu_topics: List[str], include_intro: bool) -> str:
         if include_intro:
             intro = (
-                "👋 สวัสดีครับ! ผม \"น้องสุดยอด Consult Restbiz\" ยินดีให้บริการครับ!\n"
+                "👋 สวัสดีครับ! ผม \"น้องสุดยอด Consult Restbiz\"\n"
+                "ยินดีให้บริการครับ!\n"
                 "น้องสุดยอดพร้อมเป็นที่ปรึกษาเรื่องการจัดการร้านอาหาร การจดเอกสารขอใบอนุญาติ ที่จำเป็นสำหรับร้านอาหาร\n"
                 "💡 อยากให้น้องสุดยอดช่วยอะไรครับ?"
             )
             _EMOJI_NUM = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-            selected = (menu_topics or [])[:2]
-            descs = (state.context or {}).get("last_menu_topic_descs") or []
             topic_lines = []
-            for i, t in enumerate(selected):
+            for i, (t, desc) in enumerate(self._FIXED_GREETING_MENU):
                 num = _EMOJI_NUM[i] if i < len(_EMOJI_NUM) else f"{i+1}."
-                desc = descs[i] if i < len(descs) else f"ผมจะแนะนำ{t} ตั้งแต่ต้นจนจบ พร้อมเอกสารที่ต้องใช้ ให้คุณทำตามได้ง่ายที่สุดครับ"
                 topic_lines.append(f"{num} {t} - {desc}")
             footer = "พิมพ์ตัวเลข หรือบอกผมได้เลยว่าต้องการข้อมูลใบอนุญาติ หรือ ทริคการจัดการร้านอาหารด้านใดสำหรับร้านของคุณครับ 😊"
             msg = intro + "\n" + "\n".join(topic_lines) + "\n" + footer
@@ -2230,6 +3729,30 @@ class PersonaSupervisor:
         menu = self._format_numbered_options(menu_topics, max_items=9)
         msg = (prefix.rstrip() + "\n" + menu).strip()
         return self._normalize_male(msg)
+
+    def _handle_typo_prompt(self, state: ConversationState, user_input: str, suggested: str = "") -> Tuple[ConversationState, str]:
+        """
+        Called when input is detected as garbled / typo.
+        - Does NOT clear pending_slot or any context (user should be able to retype and continue)
+        - Does NOT show the topic menu (that would confuse the flow)
+        - Returns a polite ask-to-retype message
+        - If LLM provided a 'suggested' guess, include it as a gentle prompt
+        """
+        state.context = state.context or {}
+        if suggested:
+            msg = self._normalize_male(
+                f"ดูเหมือนพิมพ์ผิดนะครับ 😊 "
+                f"หมายถึง \"{suggested}\" ใช่ไหมครับ? "
+                f"ถ้าใช่ลองพิมพ์ใหม่ได้เลยครับ"
+            )
+        else:
+            msg = self._normalize_male(
+                "ดูเหมือนพิมพ์ผิดนะครับ 😊 ลองพิมพ์ใหม่ได้เลยครับ"
+            )
+        self._add_assistant(state, msg)
+        state.last_action = "typo_prompt"
+        _LOG.info("[Supervisor] typo_prompt input=%r suggested=%r", (user_input or "")[:40], suggested or "")
+        return state, msg
 
     def _handle_greeting(self, state: ConversationState, user_input: str) -> Tuple[ConversationState, str]:
         state.context = state.context or {}
@@ -2247,8 +3770,19 @@ class PersonaSupervisor:
         turns = int(state.context.get("greet_menu_turns") or 0)
         include_intro = turns == 0
 
-        topics = self._compose_menu_topics(state, size=self._MENU_SIZE)
-        topic_descs = self._generate_topic_descriptions(topics[:2])
+        if include_intro:
+            # 🎯 Token: first greeting uses fixed hardcoded menu — zero LLM/retrieval cost
+            topics = [t for t, _ in self._FIXED_GREETING_MENU]
+            topic_descs = [d for _, d in self._FIXED_GREETING_MENU]
+        else:
+            # Subsequent greetings (re-greet): use dynamic random topics as before
+            topics = self._compose_menu_topics(state, size=self._MENU_SIZE)
+            _cached_descs = (state.context or {}).get("last_menu_topic_descs")
+            _cached_topics = (state.context or {}).get("last_menu_topics")
+            if _cached_descs and _cached_topics == topics:
+                topic_descs = _cached_descs
+            else:
+                topic_descs = self._generate_topic_descriptions(topics[:2])
 
         state.context["pending_slot"] = {"key": "topic", "options": topics, "allow_multi": False}
         state.context["main_menu_shown"] = True
@@ -2303,6 +3837,16 @@ class PersonaSupervisor:
         state.persona_id = "academic"
         state.context["persona_id"] = "academic"
         state.last_action = "academic_auto_switch"
+
+        # Reset any stale academic flow so a fresh intake starts (not stuck at stage='done'
+        # from a previous session, which would cause academic to return the generic fallback).
+        _old_flow = (state.context or {}).get("academic_flow") or {}
+        if str(_old_flow.get("stage") or "") in ("done", ""):
+            state.context.pop("academic_flow", None)
+            state.context.pop("section_catalog", None)
+            state.context.pop("academic_question", None)
+            state.context.pop("academic_resume_available", None)
+
         # Use user_input if it looks like a legal question; else replay last known topic
         ctx = state.context or {}
         if self._looks_like_legal_question(user_input):
@@ -2388,7 +3932,7 @@ class PersonaSupervisor:
         _t0 = _time.perf_counter()
         st, reply = self._handle_inner(state, user_input)
         if hasattr(st, "trim_messages"):
-            st.trim_messages(keep_last=12)
+            st.trim_messages(keep_last=12)  # เก็บ state 12 (ไม่ใช่ส่งไป LLM ทั้งหมด)
         # Trim large context fields that bloat the prompt (topic_pool can be 100+ items)
         if st.context and len(st.context.get("topic_pool") or []) > 10:
             st.context["topic_pool"] = st.context["topic_pool"][:10]
@@ -2439,6 +3983,11 @@ class PersonaSupervisor:
         # Triggered when academic_resume_available=True AND (regex matches OR LLM detects elaborate/continue intent).
         # GUARD: If the user has since asked about a different topic (last_retrieval_query differs from
         # academic_question), do NOT resume the old session — clear the flag and fall through to fresh routing.
+        # FIX #3: cache the LLM fallback-intent result here so step 2.3 (style detection)
+        # can reuse it without firing a second LLM call on the same input.
+        # _cached_fallback_intent is None when 2.2b was skipped or returned early.
+        _cached_fallback_intent: Optional[Dict[str, Any]] = None
+
         if state.context.get("academic_resume_available") and raw_stripped:
             _academic_q = (state.context or {}).get("academic_question", "").strip()
             _current_q = (state.get_last_retrieval_query() or "").strip()
@@ -2458,18 +4007,23 @@ class PersonaSupervisor:
             else:
                 _is_resume = bool(self._ACADEMIC_RESUME_RE.search(raw_stripped))
                 if not _is_resume:
-                    # LLM fallback: check if user wants to elaborate on the last academic topic
-                    try:
-                        _last_q = state.get_last_retrieval_query() or (state.context or {}).get("last_topic", "")
-                        _fi = self.llm_fallback_intent_call(raw_stripped, _last_q or "", "academic") or {}
-                        _intent = str(_fi.get("intent") or "").strip().lower()
-                        # Only "elaborate" (wants more detail on SAME topic) triggers resume.
-                        # "legal_question" means a NEW question — must NOT resume old session.
-                        if _intent == "elaborate" and float(_fi.get("confidence") or 0.0) >= 0.55:
-                            _is_resume = True
-                            _LOG.info("[Supervisor] academic_resume via LLM fallback intent=%r conf=%s", _intent, _fi.get("confidence"))
-                    except Exception:
-                        pass
+                    # Guard: new legal questions must never trigger academic resume.
+                    # Only call LLM when input doesn't look like a legal/follow-up question.
+                    if not self._looks_like_legal_question(raw_stripped):
+                        # LLM fallback: check if user explicitly wants to elaborate on last academic topic.
+                        # Store result in _cached_fallback_intent so step 2.3 can reuse it.
+                        try:
+                            _last_q = state.get_last_retrieval_query() or (state.context or {}).get("last_topic", "")
+                            _fi = self.llm_fallback_intent_call(raw_stripped, _last_q or "", "academic") or {}
+                            _cached_fallback_intent = _fi
+                            _intent = str(_fi.get("intent") or "").strip().lower()
+                            # Only "elaborate" (wants more detail on SAME topic) triggers resume.
+                            # Raise threshold 0.75 to avoid false positives on practical follow-ups.
+                            if _intent == "elaborate" and float(_fi.get("confidence") or 0.0) >= 0.75:
+                                _is_resume = True
+                                _LOG.info("[Supervisor] academic_resume via LLM fallback intent=%r conf=%s", _intent, _fi.get("confidence"))
+                        except Exception:
+                            pass
                 if _is_resume:
                     _LOG.info("[Supervisor] academic_resume triggered input=%r", raw_stripped[:40])
                     state.context.pop("academic_resume_available", None)
@@ -2488,10 +4042,28 @@ class PersonaSupervisor:
                     return st2, reply
 
         # 2.3) style request -> silent switch (no confirmation dialog)
+        # FIX #2: A legal question that happens to contain words like "รายละเอียด/ทั้งหมด"
+        # must NOT be intercepted here.  Style detection only applies when the input is
+        # a PURE style modifier with no independent legal content.  If the input already
+        # has legal signal it will be answered correctly by step 2.9 (legal routing).
+        # EXCEPTION: short follow-up depth requests like "ขอเรื่อง X แบบละเอียด" or
+        # "ละเอียดกว่านี้" — these are style requests even if they contain a legal keyword.
+        # Heuristic: wants_long + short input (≤10 words) + explicit depth modifier present.
+        _raw_is_legal = self._looks_like_legal_question(raw_stripped)
         style = self._infer_user_style_request_hybrid(raw_stripped)
-        if style.get("wants_long"):
+        _DEPTH_MODIFIER_RE = re.compile(
+            r"(แบบละเอียด|ละเอียดกว่า|ละเอียดหน่อย|ละเอียดขึ้น|เชิงลึก|แบบเต็ม|ครบถ้วน|ทั้งหมดเลย|แบบวิชาการ|อธิบายละเอียด)",
+            re.IGNORECASE,
+        )
+        _is_short_depth_followup = (
+            style.get("wants_long")
+            and _raw_is_legal
+            and len(raw_stripped.split()) <= 10
+            and bool(_DEPTH_MODIFIER_RE.search(raw_stripped))
+        )
+        if style.get("wants_long") and (not _raw_is_legal or _is_short_depth_followup):
             return self._silent_switch_to_academic(state, raw_stripped)
-        # wants_short: just continue to practical routing below (no-op if already practical)
+        # wants_short or legal question: continue to practical routing below
 
         # 2.4) explicit target in text + switch verb -> silent switch
         explicit_target = self._infer_target_persona_from_text(raw_stripped)
@@ -2507,24 +4079,83 @@ class PersonaSupervisor:
                 return self._silent_switch_to_academic(state, raw_stripped)
             # Already in academic but intake not active (section 2.1 would've caught that) → ignore
 
-        # 2.5.5) Number typed but no pending_slot → try to recover from last_topic_menu
+        # 2.5.5) Number typed but no pending_slot → promote queue item OR recover from last_topic_menu
         if not self._has_pending_slot(state) and self._LIKELY_SELECTION_RE.match(raw_stripped):
-            last_menu = (state.context or {}).get("last_topic_menu") or []
-            if last_menu:
-                idxs = self._parse_indices(raw_stripped)
-                valid = [i for i in idxs if 1 <= i <= len(last_menu)]
-                if valid:
-                    # Restore pending_slot temporarily so 2.6 can route it normally
+            _active_queue = (state.context or {}).get("topic_slot_queue") or []
+            # Sanitize: drop non-dict entries that Gemini might have smuggled in as strings
+            _active_queue = [s for s in _active_queue if isinstance(s, dict)]
+            if _active_queue:
+                # topic_slot_queue has priority: promote next queued slot to pending_slot
+                # so 2.6 can map the user's number to the correct slot options.
+                # (Prevents last_topic_menu from overwriting a pending entity/area/op question.)
+                _next_slot = _active_queue[0]
+                _remaining_q = _active_queue[1:]
+                _qkey = _next_slot.get("key", "")
+                _qopts = _next_slot.get("options", [])
+                if _qkey and _qopts:
                     state.context["pending_slot"] = {
-                        "key": "topic",
-                        "options": last_menu,
-                        "allow_multi": len(valid) > 1,
+                        "key": _qkey,
+                        "options": list(_qopts),
+                        "allow_multi": False,
                     }
-                    _LOG.info("[Supervisor] restored last_topic_menu for number input %r", raw_stripped)
+                    if _remaining_q:
+                        state.context["topic_slot_queue"] = _remaining_q
+                    else:
+                        state.context.pop("topic_slot_queue", None)
+                    _LOG.info("[Supervisor] slot_queue priority: promoted key=%r to pending_slot for number input %r",
+                              _qkey, raw_stripped)
+            else:
+                last_menu = (state.context or {}).get("last_topic_menu") or []
+                if last_menu:
+                    idxs = self._parse_indices(raw_stripped)
+                    valid = [i for i in idxs if 1 <= i <= len(last_menu)]
+                    if valid:
+                        # Restore pending_slot temporarily so 2.6 can route it normally
+                        state.context["pending_slot"] = {
+                            "key": "topic",
+                            "options": last_menu,
+                            "allow_multi": len(valid) > 1,
+                        }
+                        _LOG.info("[Supervisor] restored last_topic_menu for number input %r", raw_stripped)
 
         # 2.6) pending slot route
         if self._should_route_pending_slot_now(state, raw_stripped):
             return self._route_pending_slot_to_persona(state, raw_stripped)
+
+        # 2.6b) Typo / garbled input detection — runs BEFORE greeting/noise check so that
+        #        single garbled chars (e.g. "ๅ") are caught here rather than triggering a
+        #        full greeting menu refresh.
+        #        Priority: rule-based fast check first, then LLM for ambiguous cases.
+        #        IMPORTANT: preserve pending_slot — user should be able to retype and continue.
+        if raw_stripped:
+            _is_typo = False
+            _typo_suggested = ""
+
+            if self._is_likely_typo_rule(raw_stripped):
+                # Obviously garbled — no need for LLM
+                _is_typo = True
+                _LOG.info("[Supervisor] typo_rule_fast input=%r", raw_stripped[:30])
+            elif (
+                not self._looks_like_greeting_or_thanks(raw_stripped)
+                and not self._looks_like_legal_question(raw_stripped)
+                and not self._LIKELY_SELECTION_RE.match(raw_stripped)
+                and 1 <= len(raw_stripped) <= 20  # only check short ambiguous inputs
+                and not self._LEGAL_SIGNAL_RE.search(raw_stripped)
+                and not self._QUESTION_MARKERS_RE.search(raw_stripped)
+            ):
+                # Ambiguous short input — ask LLM
+                try:
+                    _last_topic = (state.context or {}).get("last_user_legal_query", "") or (state.context or {}).get("last_topic", "")
+                    _typo_res = self.llm_typo_check_call(raw_stripped, _last_topic) or {}
+                    if _typo_res.get("is_typo") and float(_typo_res.get("confidence") or 0.0) >= 0.75:
+                        _is_typo = True
+                        _typo_suggested = str(_typo_res.get("suggested") or "").strip()
+                        _LOG.info("[Supervisor] typo_llm input=%r suggested=%r conf=%s", raw_stripped[:30], _typo_suggested, _typo_res.get("confidence"))
+                except Exception as _te:
+                    _LOG.debug("[Supervisor] typo_check_llm error: %s", _te)
+
+            if _is_typo:
+                return self._handle_typo_prompt(state, raw_stripped, _typo_suggested)
 
         # 2.7) greeting/noise -> always show refreshed menu
         if self._looks_like_greeting_or_thanks(raw_stripped) or self._is_noise(raw_stripped) or not raw_stripped:
@@ -2542,6 +4173,30 @@ class PersonaSupervisor:
         if self._looks_like_legal_question(raw_stripped):
             state.context["last_user_legal_query"] = raw_stripped
 
+            # Legal question interrupts a pending non-topic slot — clear stale slot context.
+            # Without this, practical's _consume_pending_slot_from_user() would accept the
+            # legal question text as a free-text slot fill (line 966), corrupting collected_slots.
+            # Exemptions:
+            #   - "topic": a legal phrase IS a valid topic selection
+            #   - "operation_group": options contain legal keywords (จดทะเบียน, ต่ออายุ, etc.)
+            #   - "registration_type": option text triggers LEGAL_SIGNAL_RE (บริษัทจำกัด etc.)
+            _INTERRUPT_EXEMPT = {"topic", "operation_group", "registration_type"}
+            _int_ps = (state.context or {}).get("pending_slot")
+            if isinstance(_int_ps, dict) and _int_ps.get("key") not in _INTERRUPT_EXEMPT and _int_ps.get("key"):
+                _LOG.info(
+                    "[Supervisor] 2.9 legal interrupt: clearing pending_slot(%r) and topic_slot_queue",
+                    _int_ps.get("key"),
+                )
+                state.context.pop("pending_slot", None)
+                state.context.pop("topic_slot_queue", None)
+            elif isinstance(_int_ps, dict) and _int_ps.get("key") in _INTERRUPT_EXEMPT:
+                # These slots must be answered first — route back to slot handler
+                _LOG.info(
+                    "[Supervisor] 2.9 legal interrupt SKIPPED — pending_slot(%r) is exempt, routing as slot reply",
+                    _int_ps.get("key"),
+                )
+                return self._route_pending_slot_to_persona(state, raw_stripped)
+
             pid = normalize_persona_id(state.persona_id)
             if pid == "academic":
                 st2, reply = self._academic.handle(state, raw_stripped, _internal=False)
@@ -2553,6 +4208,7 @@ class PersonaSupervisor:
                 return st2, reply
 
             self._ensure_practical_retrieval_for_legal(state, raw_stripped)
+            self._maybe_build_slot_queue_from_docs(state, raw_stripped)
             st2, reply = self._practical.handle(state, raw_stripped, _internal=False)
             reply = self._normalize_male(reply)
             self._add_assistant(st2, reply)
@@ -2596,15 +4252,21 @@ class PersonaSupervisor:
                 return st2, reply
 
         # 4) LLM fallback intent classifier — no hardcode, no dead-end error message
+        # FIX #3 (part 2): reuse the cached fallback-intent result from step 2.2b if available,
+        # so we never call llm_fallback_intent_call twice on the same input in one turn.
         _LOG.info("[Supervisor] fallback_intent_llm persona=%s input=%r", getattr(state, "persona_id", "?"), raw_stripped[:60])
         intent_res: Dict[str, Any] = {}
-        try:
-            last_q_fb = (state.context or {}).get("last_user_legal_query", "")
-            persona_fb = normalize_persona_id(getattr(state, "persona_id", "practical"))
-            intent_res = self.llm_fallback_intent_call(raw_stripped, last_q_fb, persona_fb) or {}
-        except Exception as _e:
-            _LOG.warning("[Supervisor] fallback_intent_llm error: %s", _e)
-            intent_res = {}
+        if _cached_fallback_intent is not None:
+            intent_res = _cached_fallback_intent
+            _LOG.info("[Supervisor] fallback_intent reused from step 2.2b cache")
+        else:
+            try:
+                last_q_fb = (state.context or {}).get("last_user_legal_query", "")
+                persona_fb = normalize_persona_id(getattr(state, "persona_id", "practical"))
+                intent_res = self.llm_fallback_intent_call(raw_stripped, last_q_fb, persona_fb) or {}
+            except Exception as _e:
+                _LOG.warning("[Supervisor] fallback_intent_llm error: %s", _e)
+                intent_res = {}
 
         fallback_intent = (intent_res.get("intent") or "unknown").strip().lower()
         _LOG.info("[Supervisor] fallback_intent=%r confidence=%s", fallback_intent, intent_res.get("confidence"))
@@ -2629,6 +4291,7 @@ class PersonaSupervisor:
             _LOG.info("[Supervisor] fallback_llm→legal_question q=%r", q_fb[:40])
             state.context["last_user_legal_query"] = q_fb
             self._ensure_practical_retrieval_for_legal(state, q_fb)
+            self._maybe_build_slot_queue_from_docs(state, q_fb)
             st2, reply = self._practical.handle(state, q_fb, _internal=False)
             reply = self._normalize_male(reply)
             self._add_assistant(st2, reply)

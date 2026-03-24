@@ -56,6 +56,27 @@ app.add_middleware(
 app.include_router(api_v1, prefix="/api/v1")
 app.include_router(monitoring_router)
 
+
+@app.get("/health", tags=["health"], include_in_schema=False)
+async def root_health():
+    """
+    Root-level health check — used by Docker/load-balancer.
+    Returns 200 only after the embedding model and vector store are fully loaded.
+    """
+    import time
+    from router.monitoring import _start_time
+    try:
+        from service.local_vector_store import get_vs_manager
+        mgr = get_vs_manager()
+        ready = mgr.vectorstore is not None and (mgr._collection_count() or 0) > 0
+    except Exception:
+        ready = False
+    return {
+        "status": "ok" if ready else "starting",
+        "ready": ready,
+        "uptime_seconds": round(time.time() - _start_time, 1),
+    }
+
 static_dir = Path(__file__).parent / "static"
 static_dir.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")

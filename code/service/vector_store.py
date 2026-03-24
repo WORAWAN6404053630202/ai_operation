@@ -36,10 +36,18 @@ class VectorStoreManager:
 
     def initialize_embeddings(self) -> None:
         print(f"[Embedding] Loading: {conf.EMBEDDING_MODEL}")
+        _model = conf.EMBEDDING_MODEL
+        _is_e5 = "e5" in _model.lower()
+        _encode_kw = {"normalize_embeddings": True}
+        _query_encode_kw = {"normalize_embeddings": True}
+        if _is_e5:
+            _encode_kw["prompt"] = "passage: "
+            _query_encode_kw["prompt"] = "query: "
         self.embedding_model = HuggingFaceEmbeddings(
-            model_name=conf.EMBEDDING_MODEL,
+            model_name=_model,
             model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
+            encode_kwargs=_encode_kw,
+            query_encode_kwargs=_query_encode_kw,
         )
         print("[Embedding] Loaded successfully")
 

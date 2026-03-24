@@ -34,5 +34,6 @@ gradio-client>=2,<3
 pytest>=7.4.0
 
 # --- Utilities ---
+psutil>=5.9.0  # System monitoring (CPU, memory, disk)
 requests>=2.31.0
 tqdm>=4.66.0

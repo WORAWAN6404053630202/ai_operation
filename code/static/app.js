@@ -283,21 +283,89 @@ async function sendMessage() {
   messageInput.value = "";
   autoResizeTextarea();
 
+  // สร้าง bubble ว่างไว้ก่อน แล้วค่อย append ทีละ chunk
+  hideWelcome();
+  const row = document.createElement("div");
+  row.className = "message-row assistant";
+  row.innerHTML = `
+    <div class="message-card">
+      <img class="message-avatar" src="https://supercoconut.co/wp-content/uploads/2025/04/cropped-Untitled-design-18.png" alt="bot" />
+      <div class="message-bubble-wrap">
+        <div class="message-role">RESTBIZ</div>
+        <div class="message-bubble" id="streamingBubble"><span class="typing-cursor">▋</span></div>
+      </div>
+    </div>
+  `;
+  chatMessages.appendChild(row);
+  scrollToBottom();
+
+  const bubble = document.getElementById("streamingBubble");
+  let fullText = "";
+
   try {
-    const data = await apiPost("/api/v1/chat", {
-      message: text,
-      session_id: sessionId,
+    const response = await fetch("/api/v1/chat/stream", {
+      method: "POST",
+      headers: getDefaultHeaders(),
+      body: JSON.stringify({ message: text, session_id: sessionId }),
     });
 
-    sessionId = data.session_id || sessionId;
-    currentPersona = data.persona_id || currentPersona;
-    botSelect.value = currentPersona;
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      throw new Error(errData.detail || `HTTP ${response.status}`);
+    }
 
-    renderMessage("assistant", data.response || "ไม่มีข้อความตอบกลับ");
-    await refreshSessions();
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // แยก SSE events ด้วย \n\n
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop(); // ส่วนที่ยังไม่สมบูรณ์เก็บไว้ใน buffer
+
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith("data: ")) continue;
+
+        try {
+          const payload = JSON.parse(line.slice(6));
+
+          if (payload.type === "chunk") {
+            fullText += payload.text;
+            // แสดงข้อความพร้อม cursor กระพริบ
+            bubble.innerHTML = escapeHtml(fullText).replace(/\n/g, "<br>") + '<span class="typing-cursor">▋</span>';
+            scrollToBottom();
+
+          } else if (payload.type === "done") {
+            // จบแล้ว ลบ cursor ออก
+            bubble.innerHTML = escapeHtml(fullText).replace(/\n/g, "<br>");
+            sessionId = payload.session_id || sessionId;
+            currentPersona = payload.persona_id || currentPersona;
+            botSelect.value = currentPersona;
+            await refreshSessions();
+
+          } else if (payload.type === "error") {
+            bubble.innerHTML = `<span style="color:#e53e3e">เกิดข้อผิดพลาด: ${escapeHtml(payload.message)}</span>`;
+          }
+        } catch (_) {
+          // JSON parse error — ข้ามไป
+        }
+      }
+    }
+
+    // ถ้า stream จบโดยไม่ได้รับ done event ให้ลบ cursor ออก
+    if (bubble.innerHTML.includes("typing-cursor")) {
+      bubble.innerHTML = escapeHtml(fullText).replace(/\n/g, "<br>");
+    }
+
   } catch (error) {
     console.error(error);
-    renderMessage("assistant", `เกิดข้อผิดพลาดระหว่างส่งข้อความ: ${error.message}`);
+    bubble.innerHTML = `<span style="color:#e53e3e">เกิดข้อผิดพลาด: ${escapeHtml(error.message)}</span>`;
   }
 }
 

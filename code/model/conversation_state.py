@@ -211,7 +211,7 @@ class ConversationState(BaseModel):
     # --------------------------
     # State trimming (NEW)
     # --------------------------
-    def trim_messages(self, keep_last: int = 20) -> None:
+    def trim_messages(self, keep_last: int = 8) -> None:
         """
         Keep only the last N messages to prevent unbounded memory growth.
         System messages (role='system') are always preserved.

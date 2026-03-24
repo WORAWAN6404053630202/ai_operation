@@ -153,6 +153,15 @@ class StateManager:
             data = json.load(f)
 
         data.pop("_meta", None)
+
+        # Sanitize context: pending_slot must always be a dict or absent
+        _ctx = data.get("context") or {}
+        if isinstance(_ctx, dict):
+            _ps = _ctx.get("pending_slot")
+            if _ps is not None and not isinstance(_ps, dict):
+                _ctx.pop("pending_slot", None)
+                data["context"] = _ctx
+
         return ConversationState(**data)
 
     def delete(self, session_id: str) -> None:

@@ -506,3 +506,16 @@ textarea{
     padding:14px 16px 18px;
   }
 }
+
+/* Typewriter cursor กระพริบตอน streaming */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+.typing-cursor {
+  display: inline-block;
+  margin-left: 1px;
+  animation: blink 0.8s step-start infinite;
+  color: var(--brand-blue);
+  font-weight: bold;
+}

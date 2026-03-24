@@ -5,11 +5,12 @@ import re
 from typing import Tuple, Dict, Any, List, Optional
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 import conf
 from model.conversation_state import ConversationState
-from utils.llm_call import llm_invoke
+from model.persona_practical import _classify_link, _parse_link_entries
+from utils.llm_call import llm_invoke, extract_llm_text
 from utils.prompts_academic import SYSTEM_PROMPT as SYSTEM_PROMPT_ACADEMIC
 
 _LOG = logging.getLogger("restbiz.academic")
@@ -79,7 +80,7 @@ class AcademicPersonaService:
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
             temperature=getattr(conf, "TEMPERATURE_ACADEMIC", 0.3),
-            max_tokens=getattr(conf, "MAX_TOKENS_ACADEMIC", 8000),
+            max_tokens=getattr(conf, "MAX_TOKENS_ACADEMIC", 10000),
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
@@ -215,8 +216,8 @@ class AcademicPersonaService:
     # Retrieval (only once per intake)
     # ----------------------------
     def _retrieve_docs(self, query: str, metadata_filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        max_docs = int(getattr(conf, "LLM_DOCS_MAX_ACADEMIC", 10) or 10)
-        max_chars = int(getattr(conf, "LLM_DOC_CHARS_ACADEMIC", 350) or 350)
+        max_docs = int(getattr(conf, "LLM_DOCS_MAX_ACADEMIC", 12) or 12)
+        max_chars = int(getattr(conf, "LLM_DOC_CHARS_ACADEMIC", 700) or 700)
 
         if metadata_filter:
             vectorstore = getattr(self.retriever, "vectorstore", None)
@@ -277,30 +278,177 @@ class AcademicPersonaService:
         # Enrich query with entity type if already known (from practical slot memory)
         if hasattr(state, "get_collected_slots"):
             slots = state.get_collected_slots() or {}
-            for v in slots.values():
+            for k, v in slots.items():
                 sv = str(v).strip()
-                if any(kw in sv for kw in ("นิติบุคคล", "บุคคลธรรมดา")):
-                    if sv not in q:
-                        q = f"{q} {sv}"
+                if k == "entity_type" and sv and sv not in q:
+                    q = f"{q} {sv}"
                     break
 
         state.context["academic_question"] = q
 
-        # Reuse pre-retrieved docs from supervisor (e.g. entity-type filtered) if already populated.
-        # Only retrieve fresh when state.current_docs is empty or too few.
-        if len(state.current_docs or []) >= 2:
+        # Decide whether to reuse pre-retrieved docs from supervisor or do a fresh retrieval.
+        # Re-retrieve whenever:
+        #   1. state.current_docs is empty / too few (< 2 docs)
+        #   2. The new academic question is meaningfully different from the query used for
+        #      the pre-retrieved docs (topic changed → must fetch relevant docs fresh).
+        def _query_changed(new_q: str, state: "ConversationState") -> bool:  # type: ignore[name-defined]
+            """Return True when the stored retrieval query doesn't match the new question."""
+            if hasattr(state, "get_last_retrieval_query"):
+                old_q = (state.get_last_retrieval_query() or "").strip().lower()
+            else:
+                old_q = (getattr(state, "last_retrieval_query", "") or "").strip().lower()
+            nq = new_q.strip().lower()
+            if not old_q:
+                return True  # nothing stored → must retrieve
+            # Use simple keyword-overlap: if < 30 % of significant words overlap → different topic
+            old_words = set(w for w in old_q.split() if len(w) > 2)
+            new_words = set(w for w in nq.split() if len(w) > 2)
+            if not old_words:
+                return True
+            overlap = len(old_words & new_words) / len(old_words | new_words)
+            changed = overlap < 0.30
+            if changed:
+                _LOG.info(
+                    "[Academic] Query changed (overlap=%.0f%%) — will re-retrieve. old=%r new=%r",
+                    overlap * 100, old_q[:60], nq[:60],
+                )
+            return changed
+
+        needs_fresh = len(state.current_docs or []) < 2 or _query_changed(q, state)
+
+        # ✅ Force fresh retrieval when collected slots (entity_type, shop_area_type) were
+        # not yet applied to the pre-retrieved docs. Supervisor retrieves unfiltered docs at
+        # topic-selection time; academic must re-retrieve with proper metadata filters once
+        # the user has answered entity_type / shop_area_type / location_type etc.
+        if not needs_fresh and hasattr(state, "get_collected_slots"):
+            _slots = state.get_collected_slots() or {}
+            _filter_slots = {k: v for k, v in _slots.items()
+                             if k in ("entity_type", "shop_area_type", "location_type",
+                                      "operation_group", "registration_type")}
+            if _filter_slots:
+                # Check if current_docs already reflect the entity filter.
+                # Many shared docs have entity_type_normalized='' (applies to all entity types).
+                # Consider stale ONLY when pre-retrieved docs have NO entity-matched docs
+                # and we have MORE than 0 entity-specific docs available.
+                _docs_entity = {
+                    (d.get("metadata") or {}).get("entity_type_normalized", "").strip()
+                    for d in (state.current_docs or [])
+                }
+                _entity_val = _filter_slots.get("entity_type", "")
+                # Pre-retrieved docs are stale when: entity_type is known AND
+                # none of the docs carry that entity value (all are unfiltered/empty).
+                if _entity_val and _entity_val not in _docs_entity:
+                    needs_fresh = True
+                    _LOG.info(
+                        "[Academic] Force fresh retrieve: entity_type=%r not in docs (docs have %s)",
+                        _entity_val, _docs_entity,
+                    )
+                # ✅ Force fresh when registration_type is known but not yet reflected in the
+                # last retrieval query (Chroma has no clean registration_type filter field,
+                # so we enrich the query string — but only if the retrieval hasn't done so yet).
+                if not needs_fresh:
+                    _reg_val = _filter_slots.get("registration_type", "")
+                    if _reg_val:
+                        _last_q = ""
+                        if hasattr(state, "get_last_retrieval_query"):
+                            _last_q = (state.get_last_retrieval_query() or "").lower()
+                        else:
+                            _last_q = (getattr(state, "last_retrieval_query", "") or "").lower()
+                        if _reg_val.lower() not in _last_q:
+                            needs_fresh = True
+                            _LOG.info(
+                                "[Academic] Force fresh retrieve: registration_type=%r not in last query %r",
+                                _reg_val, _last_q[:80],
+                            )
+
+        if not needs_fresh:
             _LOG.info("[Academic] Reusing %d pre-retrieved docs from supervisor", len(state.current_docs))
         else:
-            # Build metadata filter from known entity_type slot (same pattern as practical)
+            # Build metadata filter from collected slots:
+            # - entity_type → $or filter: entity_type_normalized = collected_value OR ''
+            #   (shared docs with entity='' apply to all entity types, must NOT be excluded)
+            # - shop_area_type / location_type → enrich query string only
             metadata_filter: Optional[Dict[str, Any]] = None
+            _q_enrichments: list = []
             if hasattr(state, "get_collected_slots"):
                 slots = state.get_collected_slots() or {}
-                for v in slots.values():
+                _entity_val_for_filter = None
+                for k, v in slots.items():
                     sv = str(v).strip()
-                    if sv in ("นิติบุคคล", "บุคคลธรรมดา"):
-                        metadata_filter = {"entity_type_normalized": sv}
-                        break
-            state.current_docs = self._retrieve_docs(q, metadata_filter=metadata_filter)
+                    if not sv:
+                        continue
+                    if k == "entity_type":
+                        _entity_val_for_filter = sv
+                    elif k in ("shop_area_type", "location_type", "operation_group", "registration_type"):
+                        if sv not in q:
+                            _q_enrichments.append(sv)
+                # Use $or so shared docs (entity_type_normalized='') are always included
+                if _entity_val_for_filter:
+                    metadata_filter = {
+                        "$or": [
+                            {"entity_type_normalized": _entity_val_for_filter},
+                            {"entity_type_normalized": ""},
+                        ]
+                    }
+            if _q_enrichments:
+                q = f"{q} {' '.join(_q_enrichments)}".strip()
+                _LOG.info("[Academic] Query enriched with slots: %r", _q_enrichments)
+
+            # Multi-topic retrieval: if the question covers multiple distinct topics,
+            # retrieve for each sub-topic separately then merge (de-dup by content hash).
+            # This ensures "VAT + เหล้า" gets docs for both, not just whichever topic
+            # happens to rank highest in a single embedding query.
+            _MULTI_TOPIC_PATTERNS = [
+                # (keyword_in_question, sub_query_to_retrieve)
+                (["vat", "ภาษีมูลค่าเพิ่ม", "ภพ", "ภาษี"],
+                 "การจดทะเบียนภาษีมูลค่าเพิ่ม VAT เงื่อนไข ขั้นตอน เอกสาร"),
+                (["เหล้า", "สุรา", "แอลกอฮอล์", "เครื่องดื่มแอลกอฮอล์", "ใบอนุญาตสุรา"],
+                 "ใบอนุญาตจำหน่ายสุราแอลกอฮอล์ เงื่อนไข ขั้นตอน เอกสาร"),
+                (["บุหรี่", "ยาสูบ"],
+                 "ใบอนุญาตจำหน่ายยาสูบบุหรี่ เงื่อนไข ขั้นตอน"),
+                (["สุขาภิบาล", "สุขลักษณะ", "อาหาร"],
+                 "ใบอนุญาตสุขาภิบาลอาหาร ร้านอาหาร เงื่อนไข"),
+                (["ประกันสังคม", "ลูกจ้าง", "พนักงาน"],
+                 "การขึ้นทะเบียนประกันสังคม นายจ้าง"),
+            ]
+
+            q_lower = q.lower()
+            matched_sub_queries = []
+            for keywords, sub_q in _MULTI_TOPIC_PATTERNS:
+                if any(kw in q_lower for kw in keywords):
+                    matched_sub_queries.append(sub_q)
+
+            if len(matched_sub_queries) >= 2:
+                # Multi-topic: retrieve for each sub-topic and merge (interleaved so each topic
+                # is represented when we later take [:_MAX_DOCS_ACADEMIC]).
+                _LOG.info("[Academic] Multi-topic question detected — retrieving for %d sub-queries", len(matched_sub_queries))
+                seen_hashes: set = set()
+                per_topic: list = []  # list of lists
+                for sq in matched_sub_queries:
+                    sub_docs = self._retrieve_docs(sq, metadata_filter=metadata_filter)
+                    per_topic.append(sub_docs)
+                # Interleave: take 1 from each topic in round-robin, then de-dup
+                merged: list = []
+                max_len = max((len(t) for t in per_topic), default=0)
+                for i in range(max_len):
+                    for topic_docs in per_topic:
+                        if i < len(topic_docs):
+                            doc = topic_docs[i]
+                            h = hash(doc.get("content", "")[:100])
+                            if h not in seen_hashes:
+                                seen_hashes.add(h)
+                                merged.append(doc)
+                # Also add broad-query docs that weren't captured by sub-queries
+                broad_docs = self._retrieve_docs(q, metadata_filter=metadata_filter)
+                for doc in broad_docs:
+                    h = hash(doc.get("content", "")[:100])
+                    if h not in seen_hashes:
+                        seen_hashes.add(h)
+                        merged.append(doc)
+                state.current_docs = merged
+                _LOG.info("[Academic] Multi-topic interleaved merge → %d total docs", len(merged))
+            else:
+                state.current_docs = self._retrieve_docs(q, metadata_filter=metadata_filter)
 
         if hasattr(state, "set_last_retrieval_query"):
             state.set_last_retrieval_query(q, cache_to_context=True)
@@ -427,7 +575,7 @@ class AcademicPersonaService:
         )
         try:
             resp = llm_invoke(self.llm_slots, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/section_bind")
-            text = (resp.content or "").strip()
+            text = extract_llm_text(resp).strip()
             if "```" in text:
                 text = text.split("```")[1].split("```")[0].strip() if text.count("```") >= 2 else text
             obj = json.loads(text)
@@ -449,7 +597,30 @@ class AcademicPersonaService:
     )
 
     def _build_slot_generation_prompt(self, user_question: str, docs: List[Dict], known_slots: Dict[str, str]) -> str:
-        # Use only 3 docs, key metadata fields + content snippet, 120-char limit per value
+        # Scan ALL docs for fields that vary across docs (= real branching conditions in data)
+        _DIVERSITY_KEYS = (
+            ("entity_type_normalized", "ประเภทผู้ประกอบการ"),
+            ("operation_by_department", "ประเภทการดำเนินการ"),
+            ("operation_topic", "หัวข้อย่อย"),
+            ("location", "ที่ตั้ง"),
+            ("area_size", "ขนาดพื้นที่"),
+            ("registration_type", "ประเภทการจดทะเบียน"),
+        )
+        diversity: Dict[str, set] = {}
+        for d in (docs or []):
+            raw_md = d.get("metadata") or {}
+            for field, _ in _DIVERSITY_KEYS:
+                v = raw_md.get(field)
+                if v and str(v).strip() and str(v).lower() not in ("nan", "none", ""):
+                    diversity.setdefault(field, set()).add(str(v).strip()[:80])
+
+        diversity_lines = []
+        for field, label in _DIVERSITY_KEYS:
+            vals = diversity.get(field)
+            if vals and len(vals) > 1:
+                diversity_lines.append(f"- {label}: {sorted(vals)[:8]}")
+
+        # Content snippets from first 3 docs (for context on answer shape)
         doc_summary = []
         for d in (docs or [])[:3]:
             raw_md = d.get("metadata") or {}
@@ -458,8 +629,6 @@ class AcademicPersonaService:
                 v = raw_md.get(key)
                 if v and str(v).strip() and str(v).lower() != "nan":
                     md[key] = str(v).strip()[:120]
-            # Include a short content snippet so LLM can detect branching cases
-            # (e.g. "นายจ้างบุคคลธรรมดา", "ลูกจ้างใหม่", "ลูกจ้างที่เคยมีสิทธิ์") in the actual text
             snippet = (d.get("content") or "")[:200].strip()
             if snippet:
                 md["_content"] = snippet
@@ -469,21 +638,31 @@ class AcademicPersonaService:
         known_str = json.dumps(known_slots, ensure_ascii=False) if known_slots else "{}"
         docs_str = json.dumps(doc_summary, ensure_ascii=False)
 
+        diversity_section = ""
+        if diversity_lines:
+            diversity_section = (
+                "\nตัวแปรที่ทำให้คำตอบต่างกัน (สแกนจากเอกสารทั้งหมด — fields ที่มีหลายค่า):\n"
+                + "\n".join(diversity_lines)
+                + "\n"
+            )
+
         return f"""หน้าที่: วิเคราะห์คำถามและเอกสาร แล้วสร้าง "ข้อมูลบริบทที่ต้องถาม" เพื่อให้ตอบถูกกรณีตามกฎหมาย
 
 คำถามผู้ใช้: {user_question}
 
 ข้อมูลที่รู้แล้ว (ห้ามถามซ้ำ): {known_str}
 (หมายเหตุ: key อาจต่างกันแต่ความหมายเหมือนกัน เช่น registration_type / entity_type / business_type ล้วนหมายถึงประเภทกิจการ ให้ถือว่ารู้แล้วถ้า value ตรงกัน)
-
+{diversity_section}
 ตัวอย่าง metadata + เนื้อหาจากเอกสาร: {docs_str}
 
 กติกา:
 - ถามเฉพาะ "บริบทของผู้ใช้" ที่ทำให้ตอบถูกกรณีกฎหมาย เช่น ประเภทกิจการ, สถานะผู้ใช้, จำนวนลูกจ้าง, ที่ตั้ง, รายได้
-- ถ้าเอกสารมีกรณีแยกชัดเจน (เช่น ลูกจ้างใหม่ vs ลูกจ้างที่เคยมีประกันสังคม, ออนไลน์ vs ยื่นตรง) ให้ถามว่า user อยู่ในกรณีไหน
+- ถ้า "ตัวแปรที่ทำให้คำตอบต่างกัน" ด้านบนมี field ที่ยังไม่รู้ (ไม่อยู่ใน known_slots) ให้ถาม field นั้น — นี่คือเงื่อนไขจริงในข้อมูล
+- ถ้าเอกสารมีกรณีแยกชัดเจน (เช่น ลูกจ้างใหม่ vs ลูกจ้างที่เคยมีประกันสังคม, ออนไลน์ vs ยื่นตรง, ตั้งใหม่ vs แก้ไข/เปลี่ยนแปลง vs ยกเลิก) ให้ถามว่า user อยู่ในกรณีไหน
 - ห้ามถาม "หัวข้อ/ส่วนที่อยากรู้" เช่น ขั้นตอน/เอกสาร/ค่าธรรมเนียม/ระยะเวลา — ระบบจัดการส่วนนี้แยกต่างหากแล้ว
-- ถ้ามีตัวเลือกชัดเจนจากเอกสาร ให้ใส่ใน choices
-- ถ้าไม่มีตัวเลือกชัดเจน ให้ choices เป็น null
+- ถ้ามีตัวเลือกชัดเจนจากเอกสาร ให้ใส่ใน choices — ห้ามใส่ตัวอย่าง "(เช่น ...)" ใน question text เด็ดขาด ตัวเลือกต้องอยู่ใน choices เท่านั้น
+- ถ้าไม่มีตัวเลือกชัดเจน ให้ choices เป็น null — และห้ามเพิ่มตัวอย่างใน question text
+- ถ้า known_slots มี registration_type หรือ entity_type อยู่แล้ว ห้ามถามเรื่องประเภทกิจการ/ประเภทธุรกิจ/ประเภทนิติบุคคล/industry ซ้ำอีก ถือว่าทราบแล้ว
 - ห้ามเกิน 3 ข้อ
 - ภาษาไทย สุภาพ เข้าใจง่าย เหมาะกับคนทั่วไป (ไม่ใช่ภาษากฎหมาย)
 - ถ้าคำถามที่ user ถามเฉพาะเจาะจงมากพอแล้ว อาจไม่ต้องถาม slot เลยก็ได้ (return slots เป็น list ว่าง)
@@ -492,7 +671,7 @@ class AcademicPersonaService:
   ตัวอย่างห้าม: ถาม "บุคคลธรรมดา หรือ นิติบุคคล?" แล้วค่อยถาม sub-type แยกอีก 1 รอบ
 
 ตอบเป็น JSON เท่านั้น:
-{{"slots": [{{"key": "entity_type", "question": "ร้านของคุณเปิดในนามอะไรครับ?", "choices": ["บุคคลธรรมดา", "บริษัทจำกัด", "ห้างหุ้นส่วนจำกัด", "ห้างหุ้นส่วนสามัญ"]}}]}}"""
+{{"slots": [{{"key": "entity_type", "question": "ร้านของคุณเปิดในนามอะไรครับ?", "choices": ["บุคคลธรรมดา", "บริษัทจำกัด", "ห้างหุ้นส่วนจำกัด", "ห้างหุ้นส่วนสามัญ"]}}, {{"key": "operation_type", "question": "ต้องการดำเนินการด้านใดครับ?", "choices": ["ตั้งใหม่", "แก้ไข/เปลี่ยนแปลง", "ยกเลิก"]}}]}}"""
 
     def _parse_slots_llm_response(self, raw: str) -> List[Dict]:
         """Parse LLM JSON response into list of slot dicts. Returns [] on failure."""
@@ -563,7 +742,7 @@ class AcademicPersonaService:
         slots_data: List[Dict] = []
         try:
             resp = llm_invoke(self.llm_slots, [HumanMessage(content=prompt_a)], logger=_LOG, label="Academic/slots", state=state)
-            slots_data = self._parse_slots_llm_response(resp.content or "")
+            slots_data = self._parse_slots_llm_response(extract_llm_text(resp))
         except Exception as e:
             _LOG.warning("[Academic] Slot generation (A) failed: %s — retrying with lean prompt", e)
 
@@ -585,13 +764,33 @@ class AcademicPersonaService:
             )
             try:
                 resp_b = llm_invoke(self.llm_slots, [HumanMessage(content=prompt_b)], logger=_LOG, label="Academic/slots_retry", state=state)
-                slots_data = self._parse_slots_llm_response(resp_b.content or "")
+                slots_data = self._parse_slots_llm_response(extract_llm_text(resp_b))
             except Exception as e2:
                 _LOG.warning("[Academic] Slot generation (B) also failed: %s", e2)
 
-        # Filter out already-known slot keys
+        # Filter out already-known slot keys (exact match)
         needed = [s for s in slots_data
                   if isinstance(s, dict) and s.get("key") and s["key"] not in known_slots]
+
+        # Semantic dedup: if known_slots already has registration/entity type info,
+        # drop any LLM-generated slot that is semantically equivalent (LLM may use different key names)
+        _ENTITY_REG_KEYS = {
+            "registration_type", "entity_type", "entity_type_normalized",
+            "business_type", "juristic_type", "company_type", "org_type", "organization_type",
+        }
+        _known_has_reg = bool(known_slots.keys() & _ENTITY_REG_KEYS)
+        if _known_has_reg:
+            needed = [s for s in needed if s.get("key") not in _ENTITY_REG_KEYS]
+
+        # Semantic dedup: if known_slots already has location/area info,
+        # drop any LLM-generated slot with a different key name for the same concept
+        _LOCATION_KEYS = {
+            "location", "area_size", "location_scope", "shop_area_type",
+            "operation_location", "province", "region",
+        }
+        _known_has_location = bool(known_slots.keys() & _LOCATION_KEYS)
+        if _known_has_location:
+            needed = [s for s in needed if s.get("key") not in _LOCATION_KEYS]
 
         if not needed:
             # LLM confirmed no slots needed (question specific enough) OR both attempts failed
@@ -635,14 +834,22 @@ class AcademicPersonaService:
         slot_choice_maps = ctx.get("dynamic_slot_choice_maps") or {}  # per-slot (authoritative)
         slot_keys = ctx.get("dynamic_slot_keys") or []
 
-        # Parse multi-answer responses like "ก ค ก" into per-slot values using per-slot maps.
+        # Parse multi-answer responses like "ก ค ก" or "1 3 2" into per-slot values using per-slot maps.
         # Labels repeat across questions (each question has its own ก/ข/ค/ง), so we must use
         # the per-slot map for the i-th answer → i-th slot key.
+        # Also support numeric answers "1"/"2"/"3"/"4" → mapped to ก/ข/ค/ง index.
         if slot_keys and slot_choice_maps:
             tokens = re.split(r"[\s,/]+", raw)
-            # Keep only tokens that are valid Thai labels (ก ข ค ง, case-insensitive)
             _valid_labels = set(self._CHOICE_LABELS) | {l.lower() for l in self._CHOICE_LABELS}
-            labels = [t for t in tokens if t.strip() in _valid_labels]
+            _num_to_label = {"1": "ก", "2": "ข", "3": "ค", "4": "ง"}
+            # Normalise each token: numeric → Thai label; keep existing Thai labels; drop rest
+            labels = []
+            for t in tokens:
+                t = t.strip()
+                if t in _valid_labels:
+                    labels.append(t)
+                elif t in _num_to_label:
+                    labels.append(_num_to_label[t])
             for i, key in enumerate(slot_keys):
                 if i >= len(labels):
                     break
@@ -653,12 +860,16 @@ class AcademicPersonaService:
                     slots[key] = val
                     try:
                         state.save_collected_slot(key, val)
-                    except Exception:
-                        pass
+                    except Exception as _e:
+                        _LOG.warning("[Academic] save_collected_slot failed key=%r val=%r: %s", key, val, _e)
 
-        # Fallback: resolve single-label input "ก" → actual text via global map
+        # Fallback: resolve single-label/numeric input "ก"/"1" → actual text via global map
         resolved_raw = raw
-        if choice_map and raw in choice_map:
+        _num_to_label_fb = {"1": "ก", "2": "ข", "3": "ค", "4": "ง"}
+        _lookup_key = _num_to_label_fb.get(raw.strip(), raw.strip())
+        if choice_map and _lookup_key in choice_map:
+            resolved_raw = choice_map[_lookup_key]
+        elif choice_map and raw in choice_map:
             resolved_raw = choice_map[raw]
 
         slots["raw"] = resolved_raw
@@ -709,14 +920,17 @@ class AcademicPersonaService:
             (["fees", "fee", "ค่าธรรมเนียม"], "ค่าธรรมเนียม", ["ค่าธรรมเนียม", "fee", "ชำระ"]),
             (["operation_duration", "duration", "ระยะเวลา การดำเนินการ", "ระยะเวลาดำเนินการ"], "ระยะเวลา", ["ระยะเวลา", "วันทำการ", "duration"]),
             (["service_channel", "channel", "ช่องทางการ ให้บริการ", "ช่องทาง", "หน่วยงาน", "department"], "ช่องทาง/สถานที่ยื่น", ["ช่องทาง", "หน่วยงาน", "สำนักงาน", "department"]),
-            (["terms_and_conditions", "conditions", "เงื่อนไขและหลักเกณฑ์"], "เงื่อนไขและหลักเกณฑ์", ["เงื่อนไข", "หลักเกณฑ์", "conditions"]),
-            (["legal_regulatory", "law", "regulation", "ข้อกำหนดทางกฎหมาย และข้อบังคับ", "บทลงโทษ"], "ข้อกฎหมาย/ข้อควรระวัง/บทลงโทษ", ["กฎหมาย", "ข้อบังคับ", "บทลงโทษ", "regulation"]),
+            # ❗ metadata-only: content keywords เป็น false positive สูง — เปิด choice เฉพาะเมื่อมี field ส่งให้ LLM จริงๆ
+            (["terms_and_conditions", "conditions", "เงื่อนไขและหลักเกณฑ์"], "เงื่อนไขและหลักเกณฑ์", None),
+            (["legal_regulatory", "law", "regulation", "ข้อกำหนดทางกฎหมาย และข้อบังคับ", "บทลงโทษ"], "ข้อกฎหมาย/ข้อควรระวัง/บทลงโทษ", None),
             (["research_reference"], "แบบฟอร์มและเอกสารที่เกี่ยวข้อง", ["แบบ บอจ", "แบบ ภพ", "แบบ ก.", "แบบ ว.", "ดาวน์โหลด", "คู่มือ", "http"]),
         ]
 
         out: List[Dict[str, str]] = []
         for keys, label, kws in candidates:
-            if has_any_metadata(keys) or has_any_content(kws):
+            if has_any_metadata(keys):
+                out.append({"key": keys[0], "label": label})
+            elif kws and has_any_content(kws):  # content fallback only when kws is not None
                 out.append({"key": keys[0], "label": label})
         return out
 
@@ -787,8 +1001,8 @@ class AcademicPersonaService:
         last_err = None
         for _ in range(max_retries):
             try:
-                resp = llm_invoke(self.llm, [HumanMessage(content=prompt)], logger=_LOG, label="Academic/json", state=state)
-                text = (resp.content or "").strip()
+                resp = llm_invoke(self.llm, [SystemMessage(content=SYSTEM_PROMPT_ACADEMIC), HumanMessage(content=prompt)], logger=_LOG, label="Academic/json", state=state)
+                text = extract_llm_text(resp).strip()
 
                 if "```json" in text:
                     text = text.split("```json")[1].split("```")[0].strip()
@@ -798,6 +1012,11 @@ class AcademicPersonaService:
                 obj = json.loads(text)
                 return obj if isinstance(obj, dict) else {}
             except Exception as e:
+                # 🎯 LengthFinishReasonError: input เดิม → ผลเดิม — break ทันที ไม่เสียเวลา retry
+                if "LengthFinishReasonError" in type(e).__name__ or "LengthFinishReason" in str(e)[:80]:
+                    _LOG.warning("[Academic/json] LengthFinishReasonError — max_tokens น้อยเกินไป, skip retry")
+                    last_err = e
+                    break
                 last_err = e
                 continue
 
@@ -819,93 +1038,168 @@ class AcademicPersonaService:
         slots = ctx.get("academic_slots") or {}
         selected = ctx.get("selected_sections") or {"type": "all", "keys": []}
 
+        # 🎯 Token: เหลือแค่ 12 docs (academic needs full coverage)
+        _MAX_DOCS_ACADEMIC = int(getattr(conf, "LLM_DOCS_MAX_ACADEMIC", 12))
+        # 🎯 Whitelist + per-field caps — research_reference/operation_steps are long (~600-2285 chars)
+        _ACADEMIC_META_WHITELIST = {
+            "license_type", "operation_topic",
+            "entity_type_normalized", "registration_type", "department",
+            "fees", "operation_duration",
+            # ✅ Section-backing fields: must be whitelisted so LLM can actually answer these sections
+            "terms_and_conditions", "conditions",
+            "legal_regulatory", "law", "regulation",
+            "service_channel", "service_hours", "service_location",
+        }
+        # research_reference is aggregated separately below (deduped) — skip from per-doc metadata
+        _ACADEMIC_FIELD_CAPS = {
+            "fees": 150, "operation_duration": 150,
+            # cap the longer legal/condition fields to avoid token explosion
+            "terms_and_conditions": 400, "conditions": 400,
+            "legal_regulatory": 600, "law": 400, "regulation": 400,
+            "service_channel": 300, "service_hours": 150, "service_location": 150,
+        }
+        # Long fields: send once (first doc that has them) to avoid ×N repetition
+        _ACADEMIC_LONG_FIELDS = {"operation_steps", "identification_documents"}
+        _academic_long_sent = False
         docs_json = []
-        for d in (state.current_docs or [])[:20]:
+        for d in (state.current_docs or [])[:_MAX_DOCS_ACADEMIC]:
             md = d.get("metadata", {}) or {}
+            filtered_md = {}
+            for k, v in md.items():
+                if k not in _ACADEMIC_META_WHITELIST and k not in _ACADEMIC_LONG_FIELDS:
+                    continue
+                if v in (None, "", "nan", "None"):
+                    continue
+                if k in _ACADEMIC_LONG_FIELDS and _academic_long_sent:
+                    continue
+                v_str = str(v)
+                cap = _ACADEMIC_FIELD_CAPS.get(k)
+                filtered_md[k] = v_str[:cap] if cap and len(v_str) > cap else v_str
+            if any(k in filtered_md for k in _ACADEMIC_LONG_FIELDS):
+                _academic_long_sent = True
             docs_json.append(
                 {
-                    "metadata": {k: ("" if v is None else str(v)) for k, v in md.items()
-                                 if k not in _LLM_HIDDEN_METADATA_KEYS},
+                    "metadata": filtered_md,
                     # content already clipped to LLM_DOC_CHARS_ACADEMIC by _retrieve_docs()
                     "content": (d.get("content", "") or ""),
                 }
             )
 
-        # Aggregate form_links filtered to the primary license_type.
-        # Retriever may return docs from multiple topics — include only the dominant topic's links
-        # to prevent unrelated topics from polluting the form section.
+        # Aggregate form_links.
+        # For multi-topic questions, include links from ALL retrieved docs (not filtered to single topic).
+        # For single-topic questions, still deduplicate by license_type naturally.
         _lt_counts: Dict[str, int] = {}
-        for d in (state.current_docs or [])[:20]:
+        for d in (state.current_docs or [])[:_MAX_DOCS_ACADEMIC]:
             lt = ((d.get("metadata") or {}).get("license_type") or "").strip()
             if lt:
                 _lt_counts[lt] = _lt_counts.get(lt, 0) + 1
+        # _primary_lt used only for display label, not as a filter anymore
         _primary_lt = max(_lt_counts, key=_lt_counts.__getitem__) if _lt_counts else None
+        _is_multi_topic = len(_lt_counts) >= 2
 
-        # Aggregate research_reference lines from docs of the primary topic only.
-        # Only injected when user explicitly selected section 8 or 9.
-        _agg_links: List[str] = []
-        for d in (state.current_docs or [])[:20]:
-            md = d.get("metadata") or {}
-            # Skip docs from other topics to prevent link pollution
-            if _primary_lt and (md.get("license_type") or "").strip() != _primary_lt:
-                continue
-            rr = (md.get("research_reference") or "").strip()
-            for _ln in rr.split('\n'):
-                _ln = _ln.strip()
-                if _ln and _ln not in _agg_links:
-                    _agg_links.append(_ln)
+        # Parse research_reference into (desc, url) pairs — deduplicated across docs.
+        # Using shared _parse_link_entries from persona_practical (same format).
+        _seen_ref_keys: set = set()
+        _link_entries: list = []            # (desc, url) pairs, deduplicated
+        for _d in (state.current_docs or [])[:_MAX_DOCS_ACADEMIC]:
+            _md = _d.get("metadata") or {}
+            _rr = (_md.get("research_reference") or "").strip()
+            for _rd, _ru in _parse_link_entries(_rr):
+                _rkey = _ru or _rd
+                if _rkey and _rkey not in _seen_ref_keys:
+                    _seen_ref_keys.add(_rkey)
+                    _link_entries.append((_rd, _ru))
 
         # ✅ NEW POLICY: Only inject links when user explicitly selected sections (not default/auto)
         # Links are shown ONLY when:
         # - User completed section selection (not auto-finalized), AND
-        # - Selected "research_reference" section (แบบฟอร์มและเอกสาร) OR "all" (ทั้งหมด)
-        # This prevents default link spam when Academic auto-answers without section menu.
-        # NOTE: We check metadata key "research_reference", NOT hardcoded choice numbers (menu position varies by case)
-        _user_selected_sections = selected.get("type") in ("specific", "all")
+        # - Selected "research_reference" section (แบบฟอร์มและเอกสาร) OR "all"/"picked-all" (ทั้งหมด)
+        # NOTE: type ที่เป็นไปได้: "all", "picked", "specific" — ต้องรวม "picked" ด้วย
+        _user_selected_sections = selected.get("type") in ("all", "picked", "specific")
         _ref_section_requested = (
             _user_selected_sections
-            and (selected.get("type") == "all" or "research_reference" in (selected.get("keys") or []))
+            and (
+                selected.get("type") == "all"
+                or "research_reference" in (selected.get("keys") or [])
+            )
         )
 
+        # ตรวจว่า user ถาม "อ้างอิง" โดยตรงหรือเปล่า (เพื่อ unlock reference links)
+        _user_asked_reference = bool(re.search(
+            r"(อ้างอิง|reference|research|เอกสารอ้างอิง|แหล่งอ้างอิง|กฎหมายอ้างอิง)",
+            user_question, re.IGNORECASE
+        ))
+
+        # ── 4-category link classification using shared _classify_link ──────────────
+        # Type 4: registration  → always shown (service portals)
+        # Type 1: form/document → shown in both bots when section is selected
+        # Type 2: guide/tutorial→ academic only, max 1 most important link
+        # Type 3: ref/FAQ/law   → only when user explicitly asks for อ้างอิง
+        _service_entries: list = []
+        _form_entries:    list = []
+        _guide_entries:   list = []
+        _ref_entries:     list = []
+
+        for _rd, _ru in _link_entries:
+            _cat = _classify_link(_rd, _ru)
+            if _cat == "registration":
+                _service_entries.append((_rd, _ru))
+            elif _cat == "form":
+                _form_entries.append((_rd, _ru))
+            elif _cat == "guide":
+                _guide_entries.append((_rd, _ru))
+            else:
+                _ref_entries.append((_rd, _ru))
+
+        if _is_multi_topic:
+            _instruction = f" (หลาย topics: {', '.join(_lt_counts.keys())})"
+        elif _primary_lt:
+            _instruction = f" (topic: '{_primary_lt}')"
+        else:
+            _instruction = ""
+
+        def _fmt_link(desc: str, url: str) -> str:
+            if desc and url:
+                return f"- {desc}\n  {url}"
+            return f"- {url or desc}"
+
+        # SERVICE_LINKS → always injected, no section condition
+        _service_section = ""
+        if _service_entries:
+            _service_section = (
+                f"\n🌐 SERVICE_LINKS{_instruction} — copy เหล่านี้ into section '🌐 ช่องทางยื่นออนไลน์' ทุก answer (แสดง URL ตรงๆ ห้าม paraphrase):\n"
+                + "\n".join(_fmt_link(d, u) for d, u in _service_entries) + "\n"
+            )
+
+        # FORM + GUIDE + REF → only when user selected research_reference section
         _agg_section = ""
-        if _agg_links and _ref_section_requested:
-            # ✅ Filter links by category:
-            # - แบบฟอร์ม: ALWAYS include (all form links)
-            # - คู่มือ: include ONLY essential/critical ones (LLM decides)
-            # - อ้างอิง: NEVER include (unless user explicitly asks "อ้างอิงคืออะไร")
-            _form_links = []
-            _guide_links = []
-            for lnk in _agg_links:
-                lnk_lower = lnk.lower()
-                # Detect form links (แบบฟอร์ม, บอจ., ภพ., แบบ, form, application)
-                if any(kw in lnk_lower for kw in ["แบบฟอร์ม", "บอจ", "ภพ", "แบบ", "/form", "application", ".pdf"]):
-                    _form_links.append(lnk)
-                # Detect guide links (คู่มือ, guide, manual)
-                elif any(kw in lnk_lower for kw in ["คู่มือ", "guide", "manual"]):
-                    _guide_links.append(lnk)
-                # Anything else: skip (likely research reference)
-            
-            # Build instruction for LLM
-            _instruction = f" (กรองเฉพาะ topic '{_primary_lt}')"
-            if _form_links:
-                _agg_section += f"\n📄 FORM_LINKS{_instruction} — แสดงทั้งหมด:\n" + "\n".join(f"- {lnk}" for lnk in _form_links) + "\n"
-            if _guide_links:
-                _agg_section += f"\n📖 GUIDE_LINKS{_instruction} — เลือกเฉพาะคู่มือที่จำเป็นโดยตรงกับกระบวนการที่ถาม (ไม่ใช่ทั้งหมด):\n" + "\n".join(f"- {lnk}" for lnk in _guide_links) + "\n"
+        if _link_entries and _ref_section_requested:
+            if _form_entries:
+                _agg_section += f"\n📄 FORM_LINKS{_instruction} — แสดงทั้งหมด:\n" + "\n".join(_fmt_link(d, u) for d, u in _form_entries) + "\n"
+            if _guide_entries:
+                _agg_section += (
+                    f"\n📖 GUIDE_LINKS{_instruction} — เลือกแค่ 1 ลิงก์สำคัญที่สุดเท่านั้น ห้ามเกิน 1 ลิงก์:\n"
+                    + "\n".join(_fmt_link(d, u) for d, u in _guide_entries) + "\n"
+                )
+            if _ref_entries and _user_asked_reference:
+                _agg_section += f"\n🔗 REFERENCE_LINKS{_instruction} — แสดงเฉพาะเมื่อ user ถาม:\n" + "\n".join(_fmt_link(d, u) for d, u in _ref_entries) + "\n"
 
-        return f"""
-{SYSTEM_PROMPT_ACADEMIC}
-
-USER_QUESTION:
+        return f"""USER_QUESTION:
 {user_question}
 
 SLOTS:
-{json.dumps(slots, ensure_ascii=False, indent=2)}
+{json.dumps(slots, ensure_ascii=False)}
 
 SELECTED_SECTIONS:
-{json.dumps(selected, ensure_ascii=False, indent=2)}
-{_agg_section}
+{json.dumps(selected, ensure_ascii=False)}
+{_service_section}{_agg_section}
+FORMATTING RULES:
+- operation_steps in source data may have "Step 1 ...", "Step 2 ..." prefixes from the database.
+  When writing the ขั้นตอน section, STRIP the "Step X" prefix completely and present as plain numbered list: "1. ...", "2. ..." etc.
+  NEVER output "1) Step 1 ..." or "• Step 1 ..." — the word "Step" must not appear in the output.
+
 DOCUMENTS ({len(state.current_docs or [])} found):
-{json.dumps(docs_json, ensure_ascii=False, indent=2)}
+{json.dumps(docs_json, ensure_ascii=False)}
 
 Return JSON:
 """.strip()
@@ -927,7 +1221,13 @@ Return JSON:
         prompt = self._build_final_prompt(state, user_question=uq)
         decision = self._call_llm_json(prompt, state=state)
 
-        ex = (decision.get("execution") or {})
+        _ex_raw = decision.get("execution") or {}
+        if isinstance(_ex_raw, str):
+            try:
+                _ex_raw = json.loads(_ex_raw)
+            except Exception:
+                _ex_raw = {}
+        ex = _ex_raw if isinstance(_ex_raw, dict) else {}
         ans = (ex.get("answer") or "").strip()
         if not ans:
             ans = "ขอโทษครับ ตอนนี้ยังไม่พบข้อมูลที่ยืนยันได้ในเอกสาร"
@@ -1025,17 +1325,13 @@ Return JSON:
         # Stage: awaiting_slots
         # -----------------------
         if stage == "awaiting_slots":
-            # force_intake: greeting/noise must re-ask slots and keep stage
-            if force_intake and self._looks_like_greeting_or_noise(user_text):
-                q = self._ask_required_slots(state)
-                self._append_assistant(state, q)
-                return state, q
-
-            # If empty/garbage -> re-ask
+            # Noise/greeting/empty input while waiting for slots — re-ask (or proceed if all slots known)
             if not user_text or self._looks_like_greeting_or_noise(user_text):
                 q = self._ask_required_slots(state)
-                self._append_assistant(state, q)
-                return state, q
+                if q.strip():
+                    self._append_assistant(state, q)
+                    return state, q
+                # All slots already known — fall through to sections below
 
             # Otherwise treat as slot answer (do NOT retrieve again here)
             self._save_slots_best_effort(state, user_text)

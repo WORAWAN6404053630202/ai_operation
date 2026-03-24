@@ -27,10 +27,10 @@ Prefix = "/api/operation"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-6")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-5")
 
 OPENROUTER_MODEL_ACADEMIC = os.getenv("OPENROUTER_MODEL_ACADEMIC", "openai/gpt-5.1")
-OPENROUTER_MODEL_PRACTICAL = os.getenv("OPENROUTER_MODEL_PRACTICAL", "anthropic/claude-sonnet-4-6")
+OPENROUTER_MODEL_PRACTICAL = os.getenv("OPENROUTER_MODEL_PRACTICAL", "anthropic/claude-sonnet-4-5")
 
 OPENROUTER_SWITCH_MODEL = os.getenv("OPENROUTER_SWITCH_MODEL", "anthropic/claude-haiku-4-5")
 # Separate fast model for topic_picker (non-critical, fail-fast friendly)
@@ -56,24 +56,24 @@ TEMPERATURE_PRACTICAL = _safe_float("TEMPERATURE_PRACTICAL", 0.2)
 
 MAX_TOKENS_ACADEMIC = _safe_int("MAX_TOKENS_ACADEMIC", 8000)
 MAX_TOKENS_ACADEMIC_SLOTS = _safe_int("MAX_TOKENS_ACADEMIC_SLOTS", 3000)
-MAX_TOKENS_PRACTICAL = _safe_int("MAX_TOKENS_PRACTICAL", 2000)
+MAX_TOKENS_PRACTICAL = _safe_int("MAX_TOKENS_PRACTICAL", 4500)
 
 EMBEDDING_MODEL = os.getenv(
     "EMBEDDING_MODEL",
-    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    "intfloat/multilingual-e5-large"
 )
 
 MAX_ROUNDS = _safe_int("MAX_ROUNDS", 7)
-RETRIEVAL_TOP_K = _safe_int("RETRIEVAL_TOP_K", 12)
+RETRIEVAL_TOP_K = _safe_int("RETRIEVAL_TOP_K", 20)
 
 # 🎯 Token Optimization: ลดจำนวนเอกสารและความยาว
 # เดิม: Practical=5/500, Academic=8/700 → ใช้ ~8,000-12,000 tokens
 # ใหม่: Practical=3/400, Academic=5/500 → ใช้ ~5,000-7,000 tokens (ประหยัด 40%!)
-LLM_DOCS_MAX_PRACTICAL = _safe_int("LLM_DOCS_MAX_PRACTICAL", 3)  # จาก 5 → 3
-LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 5)    # จาก 8 → 5
+LLM_DOCS_MAX_PRACTICAL = _safe_int("LLM_DOCS_MAX_PRACTICAL", 6)    # raised 4→6: more docs = richer, more complete answers
+LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 12)    # raised: 5 → 12 (academic needs full coverage)
 
-LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 400)  # จาก 500 → 400
-LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 500)    # จาก 700 → 500
+LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 1200)  # raised 600→1200: show full metadata fields
+LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 700)    # raised: 500 → 700 (need full metadata fields)
 
 # 🎯 RAG Quality: Minimum similarity threshold
 RETRIEVAL_MIN_SIMILARITY = _safe_float("RETRIEVAL_MIN_SIMILARITY", 0.6)
@@ -95,11 +95,11 @@ ZILLIZ_API_KEY = os.getenv("ZILLIZ_API_KEY")
 
 LOCAL_MILVUS_URI = os.getenv("LOCAL_MILVUS_URI", "./milvus_lite.db")
 
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "thai_food_business_v2")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "thai_food_business_v3")
 
 LOCAL_VECTOR_DIR = os.getenv(
     "LOCAL_VECTOR_DIR",
-    str(Path(__file__).parent.parent / "local_chroma_v2"),
+    str(Path(__file__).parent.parent / "local_chroma_v3"),
 )
 
 # NEW: centralized default retrieval fallback query — single source of truth

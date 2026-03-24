@@ -3,12 +3,15 @@ FastAPI Router
 API endpoints for Thai Regulatory AI
 """
 
+import asyncio
 import datetime
+import json
 import logging
 import uuid
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from adapter.response.response_custom import HandleSuccess
@@ -264,10 +267,11 @@ async def chat(request: ChatRequest):
         
         if cached_result is not None:
             logger.info(f"[{session_id}] 🎯 Cache HIT! Skipping LLM call (saved ${cached_result.get('cost', 0):.3f})")
-            
+
             # Update state with cached message (but don't call LLM)
-            state.messages.append({"role": "user", "content": request.message})
-            state.messages.append({"role": "assistant", "content": cached_result["response"]})
+            # Use dedup helpers to avoid duplicate messages when same question asked repeatedly
+            state.add_user_message_once(request.message)
+            state.add_assistant_message_once(cached_result["response"])
             state_manager.save(session_id, state)
             
             return HandleSuccess(
@@ -311,4 +315,113 @@ async def chat(request: ChatRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Chat failed: {str(e)}",
         )
-    
+
+
+async def _stream_reply(session_id: str, message: str) -> AsyncGenerator[str, None]:
+    """
+    Generator ที่ส่งคำตอบทีละ chunk แบบ SSE (Server-Sent Events)
+    Format: data: <json>\n\n
+    Events:
+      - {"type": "chunk", "text": "..."}   ← ตัวอักษรที่ทยอยส่ง
+      - {"type": "done", "session_id": "...", "persona_id": "..."}  ← จบ
+      - {"type": "error", "message": "..."}  ← กรณี error
+    """
+    if supervisor is None or state_manager is None:
+        yield f"data: {json.dumps({'type': 'error', 'message': 'Services not initialized'})}\n\n"
+        return
+
+    try:
+        saved = state_manager.load(session_id)
+        state = saved if saved else ConversationState(
+            session_id=session_id, persona_id="practical", context={}
+        )
+
+        # ตรวจ cache ก่อน
+        cache = get_cache()
+        cached_result = cache.get(session_id, message, state.persona_id)
+
+        if cached_result is not None:
+            # Cache hit → stream ตัวอักษรจาก cache ทีละ chunk เพื่อให้ดูเหมือน typewriter
+            logger.info(f"[{session_id}] 🎯 Cache HIT (stream)")
+            full_text = cached_result["response"]
+            # Use dedup helpers to avoid duplicate messages when same question asked repeatedly
+            state.add_user_message_once(message)
+            state.add_assistant_message_once(full_text)
+            state_manager.save(session_id, state)
+
+            # ส่งทีละ ~5 ตัวอักษร เพื่อให้ดู smooth
+            chunk_size = 5
+            for i in range(0, len(full_text), chunk_size):
+                chunk = full_text[i:i + chunk_size]
+                yield f"data: {json.dumps({'type': 'chunk', 'text': chunk})}\n\n"
+                await asyncio.sleep(0.01)  # หน่วงเล็กน้อยให้เห็น effect
+
+            yield f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'persona_id': state.persona_id, 'cached': True})}\n\n"
+            return
+
+        # Cache miss → เรียก LLM จริง (blocking แต่ stream ผลลัพธ์หลังได้คำตอบ)
+        logger.info(f"[{session_id}] ❌ Cache MISS (stream) - Calling LLM")
+
+        # เรียก supervisor ใน thread pool ไม่บล็อก event loop
+        loop = asyncio.get_running_loop()
+        state, bot_reply = await loop.run_in_executor(
+            None, supervisor.handle, state, message
+        )
+        state_manager.save(session_id, state)
+
+        # เก็บ cache
+        cache.set(
+            session_id=session_id,
+            question=message,
+            value={"response": bot_reply, "cost": 0.033, "persona": state.persona_id},
+            persona=state.persona_id,
+        )
+
+        # Stream คำตอบทีละ chunk
+        chunk_size = 5
+        for i in range(0, len(bot_reply), chunk_size):
+            chunk = bot_reply[i:i + chunk_size]
+            yield f"data: {json.dumps({'type': 'chunk', 'text': chunk})}\n\n"
+            await asyncio.sleep(0.008)
+
+        yield f"data: {json.dumps({'type': 'done', 'session_id': session_id, 'persona_id': state.persona_id, 'cached': False})}\n\n"
+
+    except Exception as e:
+        logger.error(f"[{session_id}] Stream failed: {e}", exc_info=True)
+        yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+
+@api_v1.post("/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """
+    Streaming version ของ /chat
+    ส่งคำตอบทีละ chunk แบบ SSE ทำให้ user เห็นข้อความทยอยขึ้น
+    ไม่ต้องรอจนครบก่อนแสดง
+    """
+    if supervisor is None or state_manager is None:
+        raise HTTPException(status_code=503, detail="Services not initialized")
+
+    if not request.message or not request.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    _cleanup_old_sessions()
+
+    session_id = request.session_id or f"s_{uuid.uuid4().hex[:8]}"
+
+    # Rate limiting
+    rate_limiter = get_rate_limiter()
+    allowed, rate_info = rate_limiter.is_allowed(session_id)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many requests. Please wait {rate_info['retry_after']} seconds.",
+        )
+
+    return StreamingResponse(
+        _stream_reply(session_id, request.message.strip()),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # บอก nginx ไม่ให้ buffer
+        },
+    )

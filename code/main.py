@@ -141,7 +141,9 @@ def main():
             # keep state file for postmortem; do not delete automatically
             break
         except Exception as e:
+            import traceback
             console.print(f"[red]Unexpected error:[/red] {e}")
+            console.print(f"[red]{traceback.format_exc()}[/red]")
 
 
 if __name__ == "__main__":

@@ -5,11 +5,11 @@ import re
 from typing import Tuple, Dict, Any, List, Optional, Callable
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 import conf
 from model.conversation_state import ConversationState
-from utils.llm_call import llm_invoke
+from utils.llm_call import llm_invoke, extract_llm_text
 from utils.prompts_practical import SYSTEM_PROMPT as SYSTEM_PROMPT_PRACTICAL
 
 # Import professional logging
@@ -20,6 +20,178 @@ logger = get_logger(__name__)  # ใช้ logger ใหม่ (มี structure
 
 # Metadata fields with no semantic value for the LLM — always hidden from docs_json
 _LLM_HIDDEN_METADATA_KEYS = frozenset({"row_id", "source"})
+
+
+def _classify_link(desc: str, url: str) -> str:
+    """
+    Classify a (description, url) pair into one of 4 categories:
+      'registration' — เว็บลงทะเบียน/ยื่นออนไลน์ (type 4: show in BOTH bots always)
+      'form'         — แบบฟอร์ม/เอกสาร/แบบ        (type 1: show in BOTH bots)
+      'guide'        — คู่มือ/youtube/สอน/วิธีการ   (type 2: academic only, max 1 link)
+      'ref'          — อ้างอิงทั่วไป/FAQ/กฎหมาย    (type 3: show only when user asks)
+
+    Priority order (first match wins):
+      1. registration (URL-based service portal keywords)
+      2. form (PDF with form-desc, OR form keyword in desc)
+      3. guide (PDF with guide-desc, OR guide/video URL/keywords in desc)
+      4. ref (fallback)
+    """
+    url_l  = url.lower()
+    desc_l = desc.lower()
+
+    # ── Type 4: Registration/service portals ──────────────────────────────────
+    # Check URL first (most reliable) — covers all known online filing systems
+    # But skip if URL is a PDF — PDFs are always form or guide even if hosted on portal domain
+    _REG_URL_KW = (
+        "eservice.", "e-service.", "bmaoss.", "edbr.dbd", ".webportal.",
+        "webportal.bangkok", "info.go.th/procedure",
+        "efiling.rd.go.th", "elc.excise.go.th",
+        "reserve.dbd.go.th", "sso.go.th/wpr/main/service",
+        "foodhandler.anamai", "e-service.doe.go.th",
+    )
+    if ".pdf" not in url_l and any(kw in url_l for kw in _REG_URL_KW):
+        return "registration"
+    # Also catch "ยื่นออนไลน์" or "สำหรับลงทะเบียน" in desc when URL is a non-PDF site
+    if ".pdf" not in url_l:
+        if any(kw in desc_l for kw in ("ยื่นออนไลน์", "สำหรับลงทะเบียน", "ยื่นจดทะเบียน")):
+            return "registration"
+
+    # ── Type 1: Forms/documents ────────────────────────────────────────────────
+    # PDF whose desc signals it's a downloadable form (not a guide/law/reference)
+    _FORM_DESC_KW = ("แบบฟอร์ม", "แบบ ", "เอกสาร", "บอจ", "ภพ", "ภส.", "ภป.",
+                     "อส.", "สปส.", "สณ.", "ดาวน์โหลดเอกสาร", "แบบคำขอ",
+                     "แบบแจ้ง", "แบบแสดง", "แบบประเมิน", "ใบสมัคร")
+    _GUIDE_DESC_KW = ("คู่มือ", "guide", "manual", "วิธีการ", "วิธีใช้",
+                      "ขั้นตอนการ", "การสอน", "สอน", "tutorial")
+    if ".pdf" in url_l:
+        # FAQ PDFs are reference, not forms
+        if any(kw in desc_l for kw in ("faq", "คำถามที่พบบ่อย", "ถาม-ตอบ", "โทษ", "บทลงโทษ",
+                                        "พระราชบัญญัติ", "พ.ร.บ.", "กฎกระทรวง", "กฎหมาย")):
+            return "ref"
+        is_guide_pdf = (any(kw in desc_l for kw in _GUIDE_DESC_KW)
+                        and not any(kw in desc_l for kw in ("แบบ ", "แบบฟอร์ม", "บอจ", "ภพ", "เอกสาร")))
+        return "guide" if is_guide_pdf else "form"
+
+    # Non-PDF: form keywords in desc
+    if any(kw in desc_l for kw in _FORM_DESC_KW):
+        return "form"
+
+    # ── Type 2: Guides/tutorials ────────────────────────────────────────────────
+    _GUIDE_URL_KW = ("youtube", "youtu.be", "drive.google.com", "facebook.com",
+                     "fb.me", "canva.com", "lin.ee", "line.me")
+    if any(kw in url_l for kw in _GUIDE_URL_KW):
+        return "guide"
+    if any(kw in desc_l for kw in _GUIDE_DESC_KW):
+        return "guide"
+
+    # ── Type 3: Reference (fallback) ───────────────────────────────────────────
+    return "ref"
+
+
+def _parse_link_entries(text: str) -> list:
+    """Parse research_reference text into list of (desc, url) tuples.
+
+    Handles URLs split across multiple lines (newline inside URL) by joining
+    continuation lines that don't start a new entry (no bullet, not empty, not http).
+    Filters out truncated URLs that are clearly incomplete.
+    """
+    lines = text.split("\n")
+    # Step 1: re-join URL lines that were split mid-URL (no bullet prefix, not empty)
+    merged: list = []
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            merged.append("")
+            continue
+        # Continuation of a URL: previous line is a URL fragment AND current line has no spaces
+        # and doesn't start a new entry (no bullet/dash/asterisk/http)
+        if (
+            merged
+            and merged[-1].startswith("http")
+            and not stripped.startswith(("http", "•", "-", "*", "Website", "website"))
+            and " " not in stripped  # URL fragment has no spaces
+        ):
+            merged[-1] = merged[-1] + stripped
+        else:
+            merged.append(stripped)
+
+    entries: list = []
+    i = 0
+    while i < len(merged):
+        stripped = merged[i]
+        if not stripped:
+            i += 1
+            continue
+        if stripped.startswith("http"):
+            if entries:
+                entries[-1] = (entries[-1][0], stripped)
+            i += 1
+            continue
+        desc = stripped
+        url = ""
+        # Detect URL embedded in description line (e.g., "desc text  https://url")
+        _emb = re.search(r'\s+(https?://\S+)$', desc)
+        if _emb:
+            url = _emb.group(1)
+            desc = desc[:_emb.start()].strip()
+            i += 1
+        elif i + 1 < len(merged) and merged[i + 1].startswith("http"):
+            url = merged[i + 1]
+            i += 2
+        else:
+            i += 1
+        entries.append((desc, url))
+
+    # Step 2: filter entries with clearly truncated/incomplete URLs
+    # A valid URL must end with a path character (not % or partial percent-encoding)
+    import re as _re
+    clean: list = []
+    for desc, url in entries:
+        if url and _re.search(r'%[0-9A-Fa-f]?$', url):
+            # URL ends with incomplete percent-encoding → truncated, skip
+            continue
+        clean.append((desc, url))
+    return clean
+
+
+def _filter_research_links(text: str) -> str:
+    """
+    Filter research_reference for practical bot:
+      - Type 4 (registration portals) → KEEP (always show)
+      - Type 1 (forms/documents)      → KEEP (always show)
+      - Type 2 (guides/tutorials)     → DROP (academic only)
+      - Type 3 (reference/FAQ/law)    → DROP (show only on user request)
+    Returns filtered text with registration links first, then form links.
+    """
+    entries = _parse_link_entries(text)
+    reg_parts: list = []
+    form_parts: list = []
+    for desc, url in entries:
+        cat = _classify_link(desc, url)
+        if cat == "registration":
+            if desc: reg_parts.append(desc)
+            if url:  reg_parts.append(url)
+        elif cat == "form":
+            if desc: form_parts.append(desc)
+            if url:  form_parts.append(url)
+        # guide → dropped, ref → dropped
+    return "\n".join(reg_parts + form_parts)
+
+# 🎯 Token: Whitelist — ส่ง metadata keys ที่ LLM ต้องการโดยตรง
+# content ถูกตัดที่ LLM_DOC_CHARS_PRACTICAL (400 chars) ดังนั้น fields สำคัญต้องอยู่ใน metadata
+_LLM_METADATA_WHITELIST = frozenset({
+    "license_type",            # ประเภทใบอนุญาต
+    "operation_topic",         # หัวข้อการดำเนินการ
+    "entity_type_normalized",  # ประเภทนิติบุคคล
+    "registration_type",       # ประเภทการจดทะเบียน
+    "department",              # หน่วยงาน
+    "fees",                    # ค่าธรรมเนียม
+    "operation_duration",      # ระยะเวลาดำเนินการ
+    "service_channel",         # ช่องทางยื่น
+    "research_reference",      # ลิงก์แบบฟอร์ม / คู่มือ / เว็บไซต์ราชการ
+    "operation_steps",         # ขั้นตอนการดำเนินการ (สำคัญ — content อาจถูกตัดก่อนถึงส่วนนี้)
+    "identification_documents",# รายการเอกสารที่ต้องใช้ (สำคัญ — ต้องเห็นทั้งหมด)
+})
 
 # P0: practical policy "last gate"
 try:
@@ -142,10 +314,10 @@ class PracticalPersonaService:
     # Greeting prefix (Practical fallback)
     # --------------------------
     _GREET_PREFIX_FALLBACKS: Dict[str, str] = {
-        "greet": "สวัสดีครับ อยากให้ช่วยเรื่องไหนเกี่ยวกับร้านอาหารครับ",
+        "greet": "สวัสดีครับ ต้องการข้อมูลด้านใดสำหรับร้านอาหารของคุณครับ",
         "thanks": "ยินดีครับ อยากไปต่อหัวข้อไหนครับ",
-        "smalltalk": "แล้วอยากให้ช่วยเรื่องไหนเกี่ยวกับร้านอาหารครับ",
-        "blank": "อยากให้ช่วยเรื่องไหนเกี่ยวกับร้านอาหารครับ",
+        "smalltalk": "แล้วต้องการข้อมูลด้านใดสำหรับร้านของคุณครับ",
+        "blank": "มีเรื่องอะไรให้ช่วยสำหรับร้านอาหารของคุณครับ",
     }
 
     def _default_greet_llm_call(self) -> Callable[[str, List[str], int], dict]:
@@ -182,7 +354,7 @@ class PracticalPersonaService:
             try:
                 # ✅ วัดเวลาการเรียก LLM
                 with TimingContext(logger, "llm_greet_call"):
-                    text = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greet").content.strip()
+                    text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/greet")).strip()
                     
                 # ✅ Log สำเร็จ
                 logger.log_with_data("info", "💬 สร้างคำทักทายสำเร็จ", {
@@ -249,10 +421,11 @@ class PracticalPersonaService:
     # Strip standalone "documents" lines (LLM prompt bleed-through)
     _DOCUMENTS_LINE_RE = re.compile(r"(?m)^[ \t]*documents[ \t]*$", re.IGNORECASE)
 
-    def _fallback_single_question(self, text: str) -> str:
+    def _fallback_single_question(self, text: str, slot_key: str = "") -> str:
+        """Clean and return a single question string. Never hardcode a fixed question —
+        use the LLM-provided text as-is (after cleanup), or derive a sensible question
+        from the slot_key context."""
         t = re.sub(r"\s+", " ", (text or "")).strip()
-        if not t:
-            return "อยากให้ช่วยเรื่องไหนเกี่ยวกับร้านอาหารครับ?"
 
         t = self._META_TALK_RE.sub("", t).strip()
         t = re.sub(r"\s+", " ", t).strip()
@@ -264,8 +437,19 @@ class PracticalPersonaService:
 
         t = re.sub(r"(\d+\)|[-•])\s*", "", t).strip()
 
-        if not re.search(r"(ไหม|หรือ|ยังไง|อย่างไร|อะไร|มั้ย|ได้ไหม|ต้องการ|อยาก)", t):
-            t = "อยากให้ช่วยเรื่องไหนเกี่ยวกับร้านอาหารครับ?"
+        # If still no question phrasing — derive from slot_key context, not a fixed string
+        if not re.search(r"(ไหม|หรือ|ยังไง|อย่างไร|อะไร|มั้ย|ได้ไหม|ต้องการ|อยาก|เป็นแบบ|รูปแบบ|ประเภท|ขนาด|พื้นที่|เท่าไหร่|เท่าใด|ตั้งอยู่|ใด|ดำเนินการ)", t):
+            _SLOT_QUESTIONS = {
+                "entity_type":         "ธุรกิจของคุณเป็นรูปแบบใดครับ?",
+                "operation_location":  "ร้านของคุณตั้งอยู่ในพื้นที่ไหนครับ?",
+                "shop_area_type":      "ร้านของคุณมีขนาดพื้นที่ประมาณเท่าไหร่ครับ?",
+                "area_size":           "ร้านของคุณมีพื้นที่เท่าไหร่ครับ?",
+                "area_type":           "ร้านของคุณมีพื้นที่เท่าไหร่ครับ?",
+                "registration_type":   "การจดทะเบียนของคุณเป็นรูปแบบใดครับ?",
+                "operation_group":     "ต้องการดำเนินการเรื่องใดครับ?",
+                "topic":               "ต้องการข้อมูลเกี่ยวกับอะไรครับ?",
+            }
+            t = _SLOT_QUESTIONS.get(slot_key, "ช่วยบอกข้อมูลเพิ่มเติมหน่อยได้ไหมครับ?")
         else:
             if not t.endswith("ครับ"):
                 t = t.rstrip(" .") + "ครับ"
@@ -292,12 +476,47 @@ class PracticalPersonaService:
         # Preserve newlines — only collapse horizontal whitespace (spaces/tabs)
         t = re.sub(r"[ \t]+", " ", t)
         # Insert newlines before numbered sections (1) or 1. format) and bullet points if missing
-        t = re.sub(r"(?<!\n)\s+(\d+[).])\s*", r"\n\1 ", t)
+        # Use negative lookahead (?!\d) to avoid splitting sub-steps like 1.1, 1.2 → "1. 1"
+        t = re.sub(r"(?<!\n)\s+(\d+[).])(?!\d)\s*", r"\n\1 ", t)
+        # Insert newlines before sub-steps like 1.1, 1.2, 2.3 (indent with 2 spaces)
+        t = re.sub(r"(?<!\n)\s+(\d+\.\d+)\s+", r"\n  \1 ", t)
         t = re.sub(r"(?<!\n)\s+([-•*])\s+", r"\n\1 ", t)
+        # Insert newlines before emoji-prefixed steps (✅ ❌ 🔴 etc.) that start a new step
+        t = re.sub(r"(?<!\n)\s+([\u2705\u274c\u26a0\u2139\U0001F4CB\U0001F4CC\U0001F4CD\U0001F4CE\U0001F4CF\U0001F534\U0001F7E2\U0001F7E1\U0001F7E0\U0001F535])", r"\n\1", t)
         t = "\n".join(ln.strip() for ln in t.split("\n") if ln.strip())
 
         if "?" in t or "？" in t:
-            t = re.split(r"[?？]", t, maxsplit=1)[0].strip()
+            # Only strip at a "?" if what follows looks like a new question sentence or menu option,
+            # not if "?" appears mid-answer as part of a section header or inline phrase.
+            # Safe to cut when: "?" is near the END and is followed by only whitespace/options.
+            _q_pos = min(
+                (t.find("?") if "?" in t else len(t)),
+                (t.find("？") if "？" in t else len(t)),
+            )
+            _after = t[_q_pos + 1:].strip()
+            # Cut only if "?" is at or near the end (trailing question), not mid-body
+            if len(_after) < 120:
+                t = t[:_q_pos].strip()
+
+        # Dedup URLs: remove from links section any URL already present in the body
+        _links_hdr = re.search(r'(?m)^📎[^\n]*$', t)
+        if _links_hdr:
+            _body_part = t[:_links_hdr.start()]
+            _links_part = t[_links_hdr.start():]
+            _body_urls = set(re.findall(r'https?://\S+', _body_part))
+            if _body_urls:
+                _links_lines = []
+                for _ln in _links_part.split('\n'):
+                    _found = re.search(r'https?://\S+', _ln)
+                    if _found and _found.group(0) in _body_urls:
+                        continue  # skip duplicate
+                    _links_lines.append(_ln)
+                # If links section is now empty (only header left), remove it entirely
+                _remaining = [l for l in _links_lines[1:] if l.strip()]
+                if _remaining:
+                    t = _body_part + '\n'.join(_links_lines)
+                else:
+                    t = _body_part.rstrip()
 
         # Strip trailing emoji/spaces before checking ending (avoids "ครับ 😊ครับ")
         t_check = re.sub(r"[\U0001F300-\U0001FFFF\U00002600-\U000027BF\s]+$", "", t).strip()
@@ -323,18 +542,54 @@ class PracticalPersonaService:
             # Only apply meta-talk cleanup + newline normalization via _fallback_practical_answer.
             return self._fallback_practical_answer(t)
 
-        # For "ask" only: apply full practical policy enforcement
+        if kind == "ask":
+            # Split question text from numbered option lines BEFORE policy enforcement.
+            # enforce_practical_policy must not see the option lines — they inflate line count
+            # and trigger max_lines fallback, replacing the whole text with a generic question.
+            lines = t.splitlines()
+            opts_start = next(
+                (i for i, ln in enumerate(lines) if re.match(r"^\d+[).]", ln.strip())),
+                len(lines),
+            )
+            question_text = " ".join(ln.strip() for ln in lines[:opts_start] if ln.strip())
+            opts_text = "\n".join(lines[opts_start:])
+
+            # Apply policy only to the question part (not the options)
+            if callable(enforce_practical_policy) and question_text:
+                try:
+                    out = enforce_practical_policy(question_text)
+                    if isinstance(out, str):
+                        question_text = out.strip() or question_text
+                    elif isinstance(out, tuple) and len(out) == 2:
+                        new_t, lint_meta = out
+                        if isinstance(new_t, str) and new_t.strip():
+                            old_len = len(question_text)
+                            question_text = new_t.strip()
+                            if old_len != len(question_text):
+                                _LOG.info("[Practical/lint] Policy fallback triggered: old_len=%d new_len=%d", old_len, len(question_text))
+                        if isinstance(lint_meta, dict) and lint_meta.get("ok") is False:
+                            _LOG.warning("[Practical/lint] Policy validation failed: %s", lint_meta)
+                    elif isinstance(out, dict):
+                        new_t = out.get("text") or out.get("output") or out.get("result")
+                        if isinstance(new_t, str) and new_t.strip():
+                            question_text = new_t.strip()
+                except Exception:
+                    pass
+
+            cleaned_q = self._fallback_single_question(question_text)
+            return (cleaned_q + "\n" + opts_text).strip() if opts_text else cleaned_q
+
+        # For non-ask: apply full practical policy enforcement
         if callable(enforce_practical_policy):
             try:
                 out = enforce_practical_policy(t)
                 if isinstance(out, str):
                     t = out.strip() or t
                 elif isinstance(out, tuple) and len(out) == 2:
-                    new_t, lint_meta = out  # enforce_practical_policy returns (text, meta_dict)
+                    new_t, lint_meta = out
                     if isinstance(new_t, str) and new_t.strip():
                         old_len = len(t)
                         t = new_t.strip()
-                        # ✅ LOG: fallback triggered
                         if old_len != len(t):
                             _LOG.info("[Practical/lint] Policy fallback triggered: old_len=%d new_len=%d", old_len, len(t))
                     if isinstance(lint_meta, dict) and lint_meta.get("ok") is False:
@@ -349,19 +604,6 @@ class PracticalPersonaService:
                         raise ValueError("practical_lint_failed")
             except Exception:
                 pass
-
-        if kind == "ask":
-            # Split question text from numbered option lines before applying single-question lint.
-            # _fallback_single_question collapses newlines + strips \d+\) markers — would destroy options.
-            lines = t.splitlines()
-            opts_start = next(
-                (i for i, ln in enumerate(lines) if re.match(r"^\d+[).]", ln.strip())),
-                len(lines),
-            )
-            question_text = " ".join(ln.strip() for ln in lines[:opts_start] if ln.strip())
-            opts_text = "\n".join(lines[opts_start:])
-            cleaned_q = self._fallback_single_question(question_text)
-            return (cleaned_q + "\n" + opts_text).strip() if opts_text else cleaned_q
 
         return t
 
@@ -457,7 +699,7 @@ class PracticalPersonaService:
             openai_api_key=conf.OPENROUTER_API_KEY,
             openai_api_base=conf.OPENROUTER_BASE_URL,
             temperature=getattr(conf, "TEMPERATURE_PRACTICAL", 0.2),
-            max_tokens=getattr(conf, "MAX_TOKENS_PRACTICAL", 650),
+            max_tokens=getattr(conf, "MAX_TOKENS_PRACTICAL", 4000),
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
@@ -626,12 +868,13 @@ class PracticalPersonaService:
 
     def _infer_slot_key_from_question(self, question: str) -> str:
         q = self._normalize_for_intent(question)
-        if "ตารางเมตร" in q or "พื้นที่" in q:
+        # Location check FIRST — จังหวัด/เขต are strong signals for location, not area size
+        if "จังหวัด" in q or ("เขต" in q and "พื้นที่" not in q) or "เทศบาล" in q:
+            return "location_scope"
+        if "ตารางเมตร" in q or ("พื้นที่" in q and "จังหวัด" not in q):
             return "area_size"
         if "บุคคลธรรมดา" in q or "นิติบุคคล" in q or "นิติ" in q:
             return "entity_type"
-        if "จังหวัด" in q or "เขต" in q or "เทศบาล" in q or "พื้นที่" in q:
-            return "location_scope"
         if "ขายสุรา" in q or "แอลกอฮอล์" in q:
             return "alcohol_business"
         if "topic" in q or "หัวข้อ" in q:
@@ -855,8 +1098,8 @@ class PracticalPersonaService:
         last_err = None
         for _ in range(max_retries):
             try:
-                resp = llm_invoke(self.llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/json", state=state)
-                text = (resp.content or "").strip()
+                resp = llm_invoke(self.llm, [SystemMessage(content=SYSTEM_PROMPT_PRACTICAL), HumanMessage(content=prompt)], logger=_LOG, label="Practical/json", state=state)
+                text = extract_llm_text(resp).strip()
 
                 if "```json" in text:
                     text = text.split("```json")[1].split("```")[0].strip()
@@ -869,38 +1112,85 @@ class PracticalPersonaService:
                 if isinstance(obj, dict):
                     action = obj.get("action", "?")
                     exec_data = obj.get("execution", {})
-                    q = exec_data.get("question", "") if isinstance(exec_data, dict) else ""
+                    q = (exec_data.get("question") or "") if isinstance(exec_data, dict) else ""
                     _LOG.info("[Practical/json] LLM response: action=%r question=%r", action, q[:100])
                 
                 return obj if isinstance(obj, dict) else {}
             except Exception as e:
+                # 🎯 ถ้า LengthFinishReasonError → retry ไม่ช่วย (input เดิม = ผลเดิม) → break ทันที
+                if "LengthFinishReasonError" in type(e).__name__ or "LengthFinishReason" in str(e)[:80]:
+                    _LOG.warning("[Practical/json] LengthFinishReasonError — max_tokens น้อยเกินไป, skip retry")
+                    last_err = e
+                    break
+                import traceback as _tb
+                _LOG.warning("[Practical/json] exception (attempt): %s\n%s", e, _tb.format_exc())
                 last_err = e
                 continue
 
         if last_err:
             _LOG.warning("[Practical] LLM JSON parse failed: %s", last_err)
 
+        # BUG-A fix: returning action='ask' with empty question would pop topic_slot_queue
+        # and show a wrong context menu. Use action='answer' with a safe fallback message instead.
         return {
             "input_type": "new_question",
             "analysis": "Parse error",
-            "action": "ask",
-            "execution": {"question": "อยากให้ช่วยเรื่องไหนเกี่ยวกับร้านอาหารครับ?", "context_update": {}},
+            "action": "answer",
+            "execution": {"answer": "ขออภัยครับ ระบบประมวลผลคำถามไม่สำเร็จ กรุณาลองถามใหม่อีกครั้งครับ", "context_update": {}},
         }
 
-    def _retrieve_docs(self, query: str, metadata_filter: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    def _retrieve_docs(self, query: str, metadata_filter: Optional[Dict[str, Any]] = None, max_docs: Optional[int] = None) -> List[Dict[str, Any]]:
         import time
         start = time.time()
-        
-        max_docs = getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 8)
+
+        max_docs = max_docs if max_docs is not None else int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 8))
         max_chars = getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 250)
 
+        # 🎯 Query expansion: short/abbrev keywords → full Thai terms for better embedding match
+        # e.g. "vat" alone has low cosine similarity to "ภาษีมูลค่าเพิ่ม ภพ.20"
+        _EXPAND_PATTERNS = [
+            (r"\bvat\b", "ภาษีมูลค่าเพิ่ม ภพ.20 จด VAT กรมสรรพากร"),
+            (r"\bภพ\.?20\b", "ภาษีมูลค่าเพิ่ม ภพ.20 จด VAT กรมสรรพากร"),
+            (r"ภาษีมูลค่าเพิ่ม", "ภาษีมูลค่าเพิ่ม ภพ.20 จด VAT กรมสรรพากร"),
+            (r"สุรา|เหล้า|ขายเหล้า", "ใบอนุญาตจำหน่ายสุรา สรรพสามิต ภส.08"),
+            (r"ประกันสังคม", "ขึ้นทะเบียนประกันสังคม นายจ้าง ลูกจ้าง"),
+            (r"ป้ายร้าน|ภาษีป้าย", "แบบแสดงรายการภาษีป้ายร้านอาหาร"),
+        ]
+        _expansions: list = []
+        for pattern, expansion in _EXPAND_PATTERNS:
+            if re.search(pattern, query, re.IGNORECASE) and expansion not in _expansions:
+                _expansions.append(expansion)
+        expanded_query = (query + " " + " ".join(_expansions)).strip() if _expansions else query
+        if _expansions:
+            _LOG.info("[Practical] query expanded: %r → appended %d term(s)", query[:60], len(_expansions))
+
+        vectorstore = getattr(self.retriever, "vectorstore", None)
+
+        def _scored_search(q: str, k: int, flt: Optional[dict] = None) -> list:
+            """Use similarity_search_with_relevance_scores and attach _sim to metadata."""
+            if vectorstore is None:
+                return list(self.retriever.invoke(q))
+            kwargs: dict = {"k": k}
+            if flt:
+                kwargs["filter"] = flt
+            try:
+                pairs = vectorstore.similarity_search_with_relevance_scores(q, **kwargs)
+                result = []
+                for _d, _s in pairs:
+                    if _s is not None:
+                        _d.metadata["_sim"] = float(_s)
+                    result.append(_d)
+                return result
+            except Exception as _ex:
+                _LOG.debug("[Practical] scored_search failed (%s), falling back to basic", _ex)
+                return list(self.retriever.invoke(q))
+
+        top_k = int(getattr(conf, "RETRIEVAL_TOP_K", 8))
+
         if metadata_filter:
-            vectorstore = getattr(self.retriever, "vectorstore", None)
             if vectorstore is not None:
                 try:
-                    tmp = vectorstore.as_retriever(search_kwargs={"k": max_docs, "filter": metadata_filter})
-                    docs = tmp.invoke(query)
-                    # ✅ Structured log - เห็นว่าใช้ filter อะไร ได้เอกสารกี่ฉบับ
+                    docs = _scored_search(query, max_docs, metadata_filter)
                     logger.log_with_data("info", "🔍 ค้นหาเอกสารแบบกรอง", {
                         "action": "filtered_retrieval",
                         "query": query[:60],
@@ -908,18 +1198,23 @@ class PracticalPersonaService:
                         "docs_found": len(docs),
                         "persona": "practical"
                     })
+                    if not docs:
+                        logger.log_with_data("warning", "⚠️ กรอง metadata แต่ไม่พบเอกสาร — ใช้การค้นหาปกติ", {
+                            "action": "filtered_retrieval_empty_fallback",
+                            "filter": str(metadata_filter),
+                        })
+                        docs = _scored_search(query, top_k)
                 except Exception as e:
-                    # ✅ Log error พร้อม fallback
                     logger.log_with_data("warning", "⚠️ ค้นหาแบบกรองล้มเหลว ใช้วิธีปกติ", {
                         "action": "filtered_retrieval_failed",
                         "error": str(e),
                         "fallback": "standard_retrieval"
                     })
-                    docs = self.retriever.invoke(query)
+                    docs = _scored_search(expanded_query, top_k)
             else:
-                docs = self.retriever.invoke(query)
+                docs = _scored_search(expanded_query, top_k)
         else:
-            docs = self.retriever.invoke(query)
+            docs = _scored_search(expanded_query, top_k)
 
         retrieval_ms = (time.time() - start) * 1000
         
@@ -930,7 +1225,7 @@ class PracticalPersonaService:
         low_quality_docs = []
         
         for d in docs:
-            score = getattr(d, 'score', None)
+            score = (getattr(d, "metadata", {}) or {}).get("_sim") or getattr(d, 'score', None)
             if score is not None and score >= min_similarity:
                 filtered_docs.append(d)
             elif score is not None:
@@ -954,11 +1249,22 @@ class PracticalPersonaService:
             })
         
         docs = filtered_docs
-        
+
+        # Dedup: remove docs with identical page_content (retriever may return duplicates
+        # when multiple Chroma rows share the same embedding text)
+        _seen_h: set = set()
+        _deduped: list = []
+        for _d in docs:
+            _h = hash((getattr(_d, "page_content", "") or "")[:120])
+            if _h not in _seen_h:
+                _seen_h.add(_h)
+                _deduped.append(_d)
+        docs = _deduped
+
         # Extract similarity scores if available
         scores = []
         for d in docs:
-            score = getattr(d, 'score', None)
+            score = (getattr(d, "metadata", {}) or {}).get("_sim") or getattr(d, 'score', None)
             if score is not None:
                 scores.append(score)
         
@@ -970,10 +1276,34 @@ class PracticalPersonaService:
             if topic and topic not in topics:
                 topics.append(topic)
         
+        # 🎯 Token: filter + cap metadata at retrieval time — prevents raw metadata accumulating in state
+        _STORE_META_WHITELIST = frozenset({
+            "license_type", "operation_topic",
+            "entity_type_normalized", "registration_type", "department",
+            "fees", "operation_duration", "service_channel",
+            "research_reference", "operation_steps", "identification_documents",
+            "operation_group",
+        })
+        _STORE_FIELD_CAPS = {
+            # Must be >= the per-field caps used in the handle() prompt loop below,
+            # otherwise the storage cut dominates and the prompt cap has no effect.
+            "operation_steps": 1500, "identification_documents": 900,
+            "research_reference": 5000, "fees": 600, "service_channel": 600,
+        }
         results: List[Dict[str, Any]] = []
         for d in docs[:max_docs]:
+            raw_md = getattr(d, "metadata", {}) or {}
+            slim_md = {}
+            for k, v in raw_md.items():
+                if k not in _STORE_META_WHITELIST:
+                    continue
+                if v in (None, "", "nan", "None"):
+                    continue
+                v_str = str(v)
+                cap = _STORE_FIELD_CAPS.get(k)
+                slim_md[k] = v_str[:cap] if cap and len(v_str) > cap else v_str
             results.append(
-                {"content": (getattr(d, "page_content", "") or "")[:max_chars], "metadata": getattr(d, "metadata", {}) or {}}
+                {"content": (getattr(d, "page_content", "") or "")[:max_chars], "metadata": slim_md}
             )
 
         # ✅ Enhanced RAG metrics logging for AI Engineers
@@ -1008,22 +1338,26 @@ class PracticalPersonaService:
                 "risk": "คำตอบอาจไม่แม่นยำ"
             })
         
-        # Log รายละเอียดแต่ละเอกสาร (debug level)
+        # Log รายละเอียดแต่ละเอกสาร (info level เพื่อให้เห็นใน terminal)
         for i, r in enumerate(results):
             md = r.get("metadata", {}) or {}
             topic = md.get("operation_topic") or md.get("topic") or md.get("filename") or "?"
             etype = md.get("entity_type_normalized") or md.get("entity_type") or ""
-            section = md.get("section") or md.get("doc_type") or ""
-            snippet = (r.get("content", "") or "")[:80].replace("\n", " ")
-            
-            logger.log_with_data("debug", f"📄 เอกสารที่ {i+1}", {
+            dept = md.get("department") or ""
+            license_t = md.get("license_type") or ""
+            sim = scores[i] if i < len(scores) else None
+            sim_str = f"{sim:.3f}" if sim is not None else "n/a"
+            snippet = (r.get("content", "") or "")[:60].replace("\n", " ")
+
+            logger.log_with_data("info", f"📄 Doc[{i+1}/{len(results)}] topic={topic!r} entity={etype!r} sim={sim_str}", {
                 "doc_index": i + 1,
                 "total_docs": len(results),
                 "topic": topic,
+                "department": dept,
+                "license_type": license_t,
                 "entity_type": etype,
-                "section": section,
+                "similarity": sim,
                 "snippet": snippet,
-                "similarity": scores[i] if i < len(scores) else None
             })
 
         return results
@@ -1079,8 +1413,7 @@ class PracticalPersonaService:
         )
         try:
             resp = llm_invoke(self.llm, [HumanMessage(content=prompt)], logger=_LOG, label="Practical/topic_select")
-            text = (resp.content or "").strip()
-            # extract JSON array
+            text = extract_llm_text(resp).strip()
             m = re.search(r"\[[\d,\s]*\]", text)
             if not m:
                 return []
@@ -1100,39 +1433,8 @@ class PracticalPersonaService:
             return []
 
     def _retrieve_multi_topic(self, question: str) -> List[Dict[str, Any]]:
-        """Multi-topic retrieval using Topic Registry.
-        Automatically discovers relevant topics from the DB, retrieves per topic, and merges."""
-        registry = self._get_topic_registry()
-        if not registry:
-            # registry unavailable → fall back to single retrieval
-            return self._retrieve_docs(question)
-
-        selected_topics = self._select_relevant_topics(question, registry)
-
-        if len(selected_topics) <= 1:
-            # single topic (or none found) → normal retrieval is sufficient
-            return self._retrieve_docs(question)
-
-        # Multi-topic: retrieve per topic then merge+dedup
-        _LOG.info("[Practical] Multi-topic retrieval for %d topics: %s", len(selected_topics), selected_topics)
-        seen_ids: set = set()
-        merged: List[Dict[str, Any]] = []
-        for topic in selected_topics:
-            try:
-                docs = self._retrieve_docs(topic)
-            except Exception as e:
-                _LOG.warning("[Practical] Retrieval failed for topic %r: %s", topic, e)
-                continue
-            for d in docs:
-                md = d.get("metadata", {}) or {}
-                doc_id = md.get("doc_id") or md.get("row_id") or md.get("chunk_id") or (d.get("content", "") or "")[:40]
-                if doc_id not in seen_ids:
-                    seen_ids.add(doc_id)
-                    merged.append(d)
-
-        max_docs = getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 8) * 2
-        _LOG.info("[Practical] Multi-topic merged: %d unique docs (cap=%d)", len(merged), max_docs)
-        return merged[:max_docs]
+        """Multi-topic retrieval — uses direct vector search (saves ~300 tokens vs LLM topic selection)."""
+        return self._retrieve_docs(question)
 
     def _debug_log(self, stage: str, query: str, docs_json: List[Dict[str, Any]]):
         if not _LOG.isEnabledFor(logging.DEBUG):
@@ -1273,7 +1575,8 @@ class PracticalPersonaService:
                     return self.handle(state, forced, _internal=True)
 
             if pending_status == "INVALID":
-                pending = state.context.get("pending_slot") or {}
+                _ps_inv = state.context.get("pending_slot")
+                pending = _ps_inv if isinstance(_ps_inv, dict) else {}
                 options = pending.get("options") if isinstance(pending, dict) else None
                 if isinstance(options, list) and options:
                     msg = "ตอบเป็นตัวเลขได้ครับ\n" + self._format_numbered_options(options)
@@ -1339,7 +1642,12 @@ class PracticalPersonaService:
             return self.handle(state, "__auto_post_retrieve__", _internal=True)
 
         # Practical retrieval: new-topic aware (uses multi-topic registry for compound questions)
-        if (not _internal) and self._looks_like_legal_question(user_text):
+        # Skip if supervisor already built topic_slot_queue from entity-filtered docs — overwriting
+        # those docs would cause the LLM to see mixed-entity docs and generate wrong choices.
+        # Also skip if supervisor already did multi-topic merge — overwriting loses the merged docs.
+        _has_slot_queue = bool((state.context or {}).get("topic_slot_queue"))
+        _is_multi_topic_merged = bool((state.context or {}).get("_multi_topic_retrieval"))
+        if (not _internal) and (not _has_slot_queue) and (not _is_multi_topic_merged) and self._looks_like_legal_question(user_text):
             if self._should_retrieve_new_topic(state, user_text):
                 state.current_docs = self._retrieve_multi_topic(user_text)
                 state.last_retrieval_query = user_text
@@ -1350,69 +1658,226 @@ class PracticalPersonaService:
                 self._debug_log("post_retrieve", query=user_text, docs_json=tmp)
                 return self.handle(state, "__auto_post_retrieve__", _internal=True)
 
-        recent_msgs = state.messages[-12:]
+        recent_msgs = state.messages[-6:]  # ส่งไป LLM 6 ล่าสุด
 
+        _prompt_max_docs = int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 3))
+        _FIELD_CAPS = {
+            "operation_steps": 1500,
+            "identification_documents": 900,
+            "research_reference": 5000,
+            "fees": 600,
+            "operation_duration": 200,
+            "service_channel": 600,
+        }
+        _LONG_FIELDS_DEDUP = {"operation_steps", "identification_documents"}
+
+        # For multi-license merged docs, don't cap at _prompt_max_docs — each license needs its
+        # own metadata sent. For single-license, cap as normal to control token usage.
+        _all_docs = state.current_docs or []
+        _lt_order: list = []  # license_types in order of first appearance
+        for _d0 in _all_docs:
+            _lt0 = ((_d0.get("metadata") or {}).get("license_type") or "").strip()
+            if _lt0 and _lt0 not in _lt_order:
+                _lt_order.append(_lt0)
+        _is_multi_license_docs = len(_lt_order) > 1
+        _docs_to_process = _all_docs if _is_multi_license_docs else _all_docs[:_prompt_max_docs]
+
+        # Pass 1: collect research_reference links per license_type (deduped within each license)
+        _rr_seen_by_lt: dict = {}   # lt → set of seen keys
+        _rr_parts_by_lt: dict = {}  # lt → list of link lines
+        for _d1 in _docs_to_process:
+            _lt1 = ((_d1.get("metadata") or {}).get("license_type") or "").strip()
+            _rr_raw = str((_d1.get("metadata") or {}).get("research_reference") or "").strip()
+            if not _rr_raw or _rr_raw in ("nan", "None"):
+                continue
+            _rr_filtered = _filter_research_links(_rr_raw)
+            if not _rr_filtered:
+                continue
+            if _lt1 not in _rr_seen_by_lt:
+                _rr_seen_by_lt[_lt1] = set()
+                _rr_parts_by_lt[_lt1] = []
+            for _desc1, _url1 in _parse_link_entries(_rr_filtered):
+                _key1 = (_url1 or _desc1).strip()
+                if _key1 and _key1 not in _rr_seen_by_lt[_lt1]:
+                    _rr_seen_by_lt[_lt1].add(_key1)
+                    if _desc1: _rr_parts_by_lt[_lt1].append(_desc1)
+                    if _url1:  _rr_parts_by_lt[_lt1].append(_url1)
+        _rr_agg_by_lt = {lt: "\n".join(parts)[:5000] for lt, parts in _rr_parts_by_lt.items()}
+
+        # Pass 2: build docs_json with per-license dedup for long fields and research_reference
+        _long_fields_sent_by_lt: dict = {}  # lt → bool
+        _rr_injected_by_lt: set = set()
         docs_json = []
-        for d in (state.current_docs or [])[:12]:
+        for d in _docs_to_process:
             md = d.get("metadata", {}) or {}
-            filtered_md = {
-                k: ("" if v is None else str(v))
-                for k, v in md.items()
-                if k not in _LLM_HIDDEN_METADATA_KEYS
-            }
+            _lt2 = (md.get("license_type") or "").strip()
+            filtered_md = {}
+            for k, v in md.items():
+                if k not in _LLM_METADATA_WHITELIST:
+                    continue
+                if v in (None, "", "nan", "None"):
+                    continue
+                # Per-license dedup: skip long fields already sent for this license_type
+                if k in _LONG_FIELDS_DEDUP and _long_fields_sent_by_lt.get(_lt2):
+                    continue
+                # research_reference injected below as aggregated version
+                if k == "research_reference":
+                    continue
+                v_str = str(v)
+                cap = _FIELD_CAPS.get(k)
+                if cap and len(v_str) > cap:
+                    v_str = v_str[:cap]
+                filtered_md[k] = v_str
+            if any(k in filtered_md for k in _LONG_FIELDS_DEDUP):
+                _long_fields_sent_by_lt[_lt2] = True
+            # Inject per-license aggregated research_reference into first doc of each license
+            if _lt2 not in _rr_injected_by_lt and _rr_agg_by_lt.get(_lt2):
+                filtered_md["research_reference"] = _rr_agg_by_lt[_lt2]
+                _rr_injected_by_lt.add(_lt2)
             docs_json.append(
                 {
                     "metadata": filtered_md,
-                    # Use full content as-is — _retrieve_docs() already applied LLM_DOC_CHARS_PRACTICAL cap
                     "content": (d.get("content", "") or ""),
                 }
             )
 
         self._debug_log("pre_llm", query=user_text, docs_json=docs_json)
 
-        prompt = f"""
-{SYSTEM_PROMPT_PRACTICAL}
+        # 🎯 Token: ตัด context ให้เล็กลง — เก็บเฉพาะ keys ที่ LLM ต้องการจริงๆ
+        _ctx_keys_needed = {"topic", "slots", "pending_slot", "last_user_legal_query",
+                            "last_topic", "topic_slot_queue", "topic_operation_groups",
+                            "collected_slots", "multi_license_topics"}
+        slim_context = {k: v for k, v in (state.context or {}).items()
+                        if k in _ctx_keys_needed and v not in (None, {}, [], "")}
 
-USER INPUT:
+        # 🎯 Inject active topic hint so LLM never re-asks what the user already chose
+        _active_topic = (
+            (state.context or {}).get("last_topic")
+            or (state.context or {}).get("last_user_legal_query")
+            or ""
+        )
+        _slots_now = (state.context or {}).get("slots") or {}
+        _active_op = _slots_now.get("operation_group", "") or _slots_now.get("confirmed_operation", "")
+        _confirmed_topic = _slots_now.get("confirmed_topic", "") or ""
+        _topic_hint = ""
+        if _confirmed_topic:
+            # User already picked a specific topic+operation → forbid re-asking
+            _topic_hint = (
+                f"\n\n⚠️ MANDATORY RULES (STRICTLY FOLLOW):\n"
+                f"- User already selected topic: \"{_confirmed_topic}\"\n"
+            )
+            if _active_op:
+                _topic_hint += f"- User already selected operation: \"{_active_op}\"\n"
+            _topic_hint += (
+                "- action MUST be \"answer\" — provide the actual steps/documents for this topic+operation NOW.\n"
+                "- DO NOT ask user to choose a topic or license type again.\n"
+                "- DO NOT generate slot_options or numbered menus asking about license selection.\n"
+                "- Answer directly using the documents provided below."
+            )
+        elif _active_topic:
+            # Topic known from context but not yet confirmed via operation_group —
+            # LLM may still ask clarifying questions, but should bias toward this topic
+            _topic_hint = (
+                f"\n\n💡 CONTEXT HINT: User is currently discussing \"{_active_topic}\"."
+            )
+            if _active_op:
+                _topic_hint += f" Operation in focus: \"{_active_op}\"."
+
+        # Build special instruction when user asked about multiple license types at once
+        _multi_license_topics = (state.context or {}).get("multi_license_topics") or []
+        _multi_license_instruction = ""
+        if _multi_license_topics:
+            _topics_str = ", ".join(_multi_license_topics)
+            _multi_license_instruction = f"""
+
+⚠️ MULTI-TOPIC INSTRUCTION (MANDATORY):
+User asked about {len(_multi_license_topics)} related topics: {_topics_str}
+Rules:
+- action MUST be "answer" — never "ask" or "retrieve"
+- Start execution.answer with a SHORT opening sentence that connects all topics together, e.g.
+  "ร้านของคุณต้องดำเนินการหลายเรื่องพร้อมกัน ได้แก่ [topics] ขอสรุปทีละเรื่องเลยครับ"
+  or "เนื่องจากคุณถามเรื่อง [context] จะต้องจัดการเรื่องเหล่านี้ด้วยครับ:"
+  DO NOT just list section headers without context — open with 1-2 sentences that explain why these topics go together
+- Then list each topic as a numbered section with header: e.g. "📌 1. ชื่อหัวข้อ" then full content
+- Section headers must NOT be questions (no ไหม/อย่างไร/ตอนไหน in headers)
+- Under each header, write the actual steps/requirements/documents — NOT just the header alone
+- Put the most important / legally required items FIRST (e.g. ใบอนุญาตหลักก่อน ใบรับรองเสริมทีหลัง)
+- If a topic has no DOCUMENTS, write "ยังไม่พบข้อมูลในเอกสาร แนะนำติดต่อหน่วยงานที่เกี่ยวข้องโดยตรงครับ"
+- Do NOT stop after writing just one section header
+- Close with a 1-sentence summary: which items are MANDATORY vs optional
+"""
+
+        prompt = f"""USER INPUT:
 {user_input}
 
 LAST ASSISTANT MESSAGE:
-{last_bot}
+{last_bot[:300] if last_bot else ""}
 
 RECENT MESSAGES:
-{json.dumps(recent_msgs, ensure_ascii=False, indent=2)}
+{json.dumps(recent_msgs, ensure_ascii=False)}
 
-CURRENT CONTEXT:
-{json.dumps(state.context, ensure_ascii=False, indent=2)}
+CONTEXT:
+{json.dumps(slim_context, ensure_ascii=False)}
 
-DOCUMENTS ({len(state.current_docs or [])} found):
-{json.dumps(docs_json, ensure_ascii=False, indent=2)}
+DOCUMENTS ({len(docs_json)} found):
+{json.dumps(docs_json, ensure_ascii=False)}
 
-ROUND: {int(getattr(state, "round", 0) or 0)}/{int(getattr(conf, "MAX_ROUNDS", 7) or 7)}
+ROUND: {int(getattr(state, "round", 0) or 0)}/{int(getattr(conf, "MAX_ROUNDS", 7) or 7)}{_topic_hint}{_multi_license_instruction}
 
 Your JSON response:
 """
 
         decision = self._call_llm_json(prompt, state=state)
         action = (decision.get("action") or "ask").strip()
-        exec_ = decision.get("execution", {}) or {}
+        _exec_raw = decision.get("execution", {})
+        # Gemini may return execution as a JSON string instead of a dict — parse it
+        if isinstance(_exec_raw, str):
+            try:
+                _exec_raw = json.loads(_exec_raw)
+            except Exception:
+                _exec_raw = {}
+        exec_ = _exec_raw if isinstance(_exec_raw, dict) else {}
 
         if action == "retrieve":
-            if _internal and user_text == "__auto_post_retrieve__":
-                guard_count = int((state.context or {}).get("_auto_post_retrieve_guard", 0) or 0)
-                if guard_count >= 2:
-                    _LOG.warning(
-                        "[Practical] auto_post_retrieve recursion guard hit (count=%d), forcing ask fallback",
-                        guard_count,
-                    )
-                    action = "ask"
-                    if not isinstance(exec_, dict):
-                        exec_ = {}
-                    exec_.setdefault("question", "อยากได้เช็คลิสต์เอกสารสำหรับเรื่องไหนครับ")
+            # Guard: block LLM re-retrieval when docs are already loaded.
+            # Two conditions — either is sufficient to block:
+            #   1) topic_slot_queue non-empty AND docs exist (original guard — slot ask phase)
+            #   2) _internal=True AND docs exist — supervisor already set the right docs
+            #      (covers the case where queue was JUST cleared after last slot filled,
+            #       but LLM ignores rule 2 and returns action='retrieve' anyway)
+            _pending_queue = (state.context or {}).get("topic_slot_queue") or []
+            if state.current_docs and (_pending_queue or _internal):
+                _LOG.info(
+                    "[Practical] action='retrieve' blocked — docs already loaded (%d), "
+                    "internal=%s queue=%s",
+                    len(state.current_docs),
+                    _internal,
+                    [s.get("key") for s in _pending_queue] if _pending_queue else [],
+                )
+                return self.handle(state, "__auto_post_retrieve__", _internal=True)
 
             if action == "retrieve":
                 q = exec_.get("query") or user_text or user_input
-                state.current_docs = self._retrieve_docs(q)
+                # Retrieve unfiltered so entity='' (universal) docs like location variants are included.
+                # Post-filter: drop docs whose entity_type CONTRADICTS the collected entity_type.
+                # entity='' → keep (applies to all); entity=known → keep; entity=other → drop.
+                _retrieved_all = self._retrieve_docs(q)
+                _known_ent = (state.get_collected_slots() or {}).get("entity_type", "").strip()
+                if _known_ent:
+                    try:
+                        from service.data_loader import DataLoader as _DLR
+                        _known_ent = _DLR._normalize_entity_type(_known_ent)
+                    except Exception:
+                        pass
+                if _known_ent:
+                    _filtered = [
+                        d for d in _retrieved_all
+                        if not ((d.get("metadata") or {}).get("entity_type_normalized") or "").strip()
+                        or ((d.get("metadata") or {}).get("entity_type_normalized") or "").strip() == _known_ent
+                    ]
+                    state.current_docs = _filtered if _filtered else _retrieved_all
+                else:
+                    state.current_docs = _retrieved_all
                 state.last_retrieval_query = q
                 tmp = [
                     {"content": d.get("content", "")[:120], "metadata": d.get("metadata", {})}
@@ -1425,36 +1890,79 @@ Your JSON response:
             question = (exec_.get("question") or "อยากให้ช่วยเรื่องอะไรเกี่ยวกับร้านอาหารครับ?").strip()
 
             if isinstance(exec_.get("context_update", {}), dict):
-                state.context.update(exec_.get("context_update", {}))
+                _ctx_update = dict(exec_.get("context_update", {}))
+                # Strip pending_slot and topic_slot_queue: these are managed by Supervisor/queue logic.
+                # LLM must NOT overwrite them via context_update — it would corrupt slot ordering.
+                _ctx_update.pop("pending_slot", None)
+                _ctx_update.pop("topic_slot_queue", None)
+                state.context.update(_ctx_update)
+                # Sanitize: if anything wrote a non-dict pending_slot, remove it
+                if not isinstance(state.context.get("pending_slot"), (dict, type(None))):
+                    state.context.pop("pending_slot", None)
 
             pending = state.context.get("pending_slot")
 
-            # ✅ BYPASS LLM choices: ถ้ามี topic_registration_types จาก Chroma
-            # ให้ใช้เป็น entity_type slot โดยตรง ไม่ต้องรอ LLM สร้างเอง
-            # เพราะ LLM มักสร้างช้อยจากเนื้อหา doc แทน จึงชื่อไม่ตรงกับ registration_type จริง
-            _chroma_types = (state.context or {}).get("topic_registration_types")
-            if not isinstance(pending, dict) and _chroma_types:
-                question = "ธุรกิจของคุณเป็นประเภทใดครับ?"
-                parsed_opts = list(_chroma_types)
-                slot_key = "entity_type"
-                allow_multi = False
-                state.context["pending_slot"] = {"key": slot_key, "options": parsed_opts, "allow_multi": allow_multi}
-                _LOG.info(
-                    "[Practical] entity_type slot set directly from Chroma registration_types → %s",
-                    parsed_opts,
-                )
+            # ✅ DYNAMIC SLOT QUEUE: pop next slot from topic_slot_queue (set by Supervisor)
+            # Each entry is {"key": "entity_type"|"shop_area_type"|…, "options": [...], "question": "..."}
+            # This replaces all hardcoded topic_registration_types / topic_area_types logic.
+            _slot_queue = (state.context or {}).get("topic_slot_queue")
+            # Sanitize: drop any non-dict entries that Gemini might have smuggled in as strings
+            if isinstance(_slot_queue, list):
+                _slot_queue = [s for s in _slot_queue if isinstance(s, dict)]
+                if _slot_queue:
+                    state.context["topic_slot_queue"] = _slot_queue
+                else:
+                    state.context.pop("topic_slot_queue", None)
+                    _slot_queue = []
+            if not isinstance(pending, dict) and isinstance(_slot_queue, list) and _slot_queue:
+                # Pop first slot from queue — skip identity slots already collected
+                # Only entity_type / registration_type are skippable (topic-agnostic identity).
+                # area_size / location_scope are topic-specific — must always be asked fresh.
+                _QUEUE_SKIP_SLOTS = {"entity_type", "registration_type"}
+                while _slot_queue:
+                    next_slot = _slot_queue[0]
+                    remaining_queue = _slot_queue[1:]
+                    slot_key = next_slot.get("key", "")
+                    slot_opts = next_slot.get("options", [])
+                    slot_q = next_slot.get("question", "")
+                    # Auto-skip identity slots already answered in cross-topic memory
+                    _known_val = (
+                        state.get_collected_slot(slot_key)
+                        if slot_key in _QUEUE_SKIP_SLOTS else None
+                    )
+                    if _known_val:
+                        _LOG.info(
+                            "[Practical] slot_queue → skip %r (already collected=%r)",
+                            slot_key, _known_val,
+                        )
+                        _slots = state.context.setdefault("slots", {})
+                        _slots[slot_key] = _known_val
+                        _slot_queue = remaining_queue
+                        if _slot_queue:
+                            state.context["topic_slot_queue"] = _slot_queue
+                        else:
+                            state.context.pop("topic_slot_queue", None)
+                        continue
+                    break
+                if slot_key and slot_opts and not _known_val:
+                    question = slot_q
+                    state.context["pending_slot"] = {
+                        "key": slot_key,
+                        "options": list(slot_opts),
+                        "allow_multi": False,
+                    }
+                    if remaining_queue:
+                        state.context["topic_slot_queue"] = remaining_queue
+                    else:
+                        state.context.pop("topic_slot_queue", None)
+                    _LOG.info("[Practical] slot_queue → popped key=%r opts=%s remaining=%d",
+                              slot_key, slot_opts, len(remaining_queue))
 
-            # ✅ Level 3: ถ้า entity_type เลือกแล้ว และมี operation_groups → ถามว่าต้องการทำอะไร
-            _op_groups = (state.context or {}).get("topic_operation_groups")
-            if not isinstance(state.context.get("pending_slot"), dict) and _op_groups:
-                question = "ต้องการดำเนินการเรื่องใดครับ?"
-                state.context["pending_slot"] = {
-                    "key": "operation_group",
-                    "options": list(_op_groups),
-                    "allow_multi": False,
-                }
-                state.context.pop("topic_operation_groups", None)
-                _LOG.info("[Practical] operation_group slot set from Chroma groups → %s", _op_groups)
+            # BUG-F fix: re-read pending after queue pop so that if the queue just set
+            # pending_slot (e.g. entity_type), the LLM opts block below is correctly skipped.
+            # Without this, `pending` is the stale pre-pop value (None) and the LLM's own
+            # slot options (e.g. location_type) would overwrite the queue-assigned entity_type.
+            pending = state.context.get("pending_slot")
 
             if not isinstance(pending, dict):
                 # Prefer LLM-provided slot_options over regex extraction
@@ -1464,20 +1972,41 @@ Your JSON response:
                 else:
                     llm_opts = []
                 parsed_opts = llm_opts or self._extract_numbered_options(question)
+                # Fallback: if LLM forgot to include slot_options for known slot types,
+                # inject the standard options so the numbered menu is always shown.
+                if not parsed_opts:
+                    _inferred_key_check = self._infer_slot_key_from_question(question)
+                    if _inferred_key_check == "area_size":
+                        parsed_opts = ["น้อยกว่า 200 ตารางเมตร", "มากกว่า 200 ตารางเมตร"]
+                    elif _inferred_key_check == "location_scope":
+                        parsed_opts = ["กรุงเทพฯ", "ต่างจังหวัด"]
                 if parsed_opts:
                     slot_key = self._infer_slot_key_from_question(question)
-                    # Upgrade slot_options to full deterministic Chroma list when LLM options
-                    # overlap with topic_registration_types — catches cases where LLM only saw
-                    # a subset of entity types due to embedding ranking (e.g., บริษัทจำกัด missing)
-                    if _chroma_types and parsed_opts:
-                        _overlap = set(parsed_opts) & set(_chroma_types)
-                        if _overlap:
-                            parsed_opts = list(_chroma_types)
-                            _LOG.info(
-                                "[Practical] slot_options upgraded via Chroma overlap (%d matched) → %s",
-                                len(_overlap), parsed_opts,
-                            )
                     allow_multi = True if slot_key == self._PHASE3_SLOT_KEY else False
+
+                    # ── AUTO-FILL: if this slot was already answered in an earlier topic,
+                    #    skip re-asking and silently fill it from cross-topic memory.
+                    #    Only applies to "identity" slots (entity_type, registration_type)
+                    #    — NOT area_size / location_scope which are topic-specific. ────────
+                    _AUTOFILL_SLOTS = {"entity_type", "registration_type"}
+                    _already_known = (
+                        state.get_collected_slot(slot_key)
+                        if slot_key in _AUTOFILL_SLOTS else None
+                    )
+                    if _already_known and not bool(state.context.get("_autofill_guard")):
+                        _LOG.info(
+                            "[Practical] auto-fill slot %r = %r from collected_slots (skip re-ask)",
+                            slot_key, _already_known,
+                        )
+                        _slots = state.context.setdefault("slots", {})
+                        _slots[slot_key] = _already_known
+                        # Re-invoke handle() with auto-fill guard to produce a real answer
+                        state.context["_autofill_guard"] = True
+                        _result = self.handle(state, _already_known, _internal=True)
+                        state.context.pop("_autofill_guard", None)
+                        return _result
+                    # ── END AUTO-FILL ────────────────────────────────────────────────────
+
                     state.context["pending_slot"] = {"key": slot_key, "options": parsed_opts, "allow_multi": allow_multi}
 
             pending2 = state.context.get("pending_slot")
@@ -1518,34 +2047,23 @@ Your JSON response:
                 ans = "ตอนนี้ยังไม่พบข้อมูลที่ยืนยันได้ในเอกสารครับ"
 
             if isinstance(exec_.get("context_update", {}), dict):
-                state.context.update(exec_.get("context_update", {}))
+                _cu = dict(exec_.get("context_update", {}))
+                _cu.pop("pending_slot", None)  # never let LLM overwrite pending_slot on answer
+                _cu.pop("topic_slot_queue", None)  # never let LLM overwrite the slot queue
+                state.context.update(_cu)
+                # Sanitize: ensure pending_slot is always dict or absent
+                if not isinstance(state.context.get("pending_slot"), (dict, type(None))):
+                    state.context.pop("pending_slot", None)
 
             ans = self._apply_practical_lint(ans, kind="answer")
-
-            # P1: intent-aware phase3 trigger
-            if not _internal:
-                # These functions must exist in your full file (see note above).
-                available = self._extract_available_phase3_sections(state.current_docs or [])
-                requested_sections = self._user_requests_specific_sections(user_text)
-
-                if not requested_sections and not self._is_continuation_question(user_text):
-                    if self._should_trigger_phase3(ans, available):
-                        menu_text, options = self._render_phase3_menu(available)
-                        state.context["pending_slot"] = {
-                            "key": self._PHASE3_SLOT_KEY,
-                            "options": options,
-                            "allow_multi": True,
-                        }
-                        state.context["phase3_draft_len"] = len(ans)
-
-                        menu_text = self._apply_practical_lint(menu_text, kind="menu")
-                        self._append_assistant(state, menu_text)
-                        state.round = int(getattr(state, "round", 0) or 0) + 1
-                        return state, menu_text
 
             self._append_assistant(state, ans)
             state.context["phase"] = None
             state.round = 0
+            # LLM answered directly — any remaining slot queue is stale, clear it
+            state.context.pop("topic_slot_queue", None)
+            # Clear multi-license signal after it has been consumed in the answer
+            state.context.pop("multi_license_topics", None)
             return state, ans
 
         fallback = "ผมยังไม่เข้าใจครับ บอกหัวข้อที่อยากรู้เกี่ยวกับร้านอาหารหน่อยครับ"

@@ -311,6 +311,59 @@ class DataLoader:
             return "บุคคลธรรมดา"
         return None
 
+    @staticmethod
+    def _extract_location(operation_topic: Optional[str], registration_type: Optional[str],
+                          operation_by_dept: Optional[str]) -> Optional[str]:
+        """
+        Extract location context from text fields.
+        Returns 'กรุงเทพฯ' | 'ต่างจังหวัด' | None.
+
+        Sources (checked in order):
+          1. operation_topic (most reliable — e.g. "ร้านค้าตั้งอยู่ในเขต กรุงเทพฯ")
+          2. registration_type
+          3. operation_by_dept (fallback)
+        """
+        sources = [
+            operation_topic or "",
+            registration_type or "",
+            operation_by_dept or "",
+        ]
+        combined = " ".join(sources)
+        if "กรุงเทพ" in combined:
+            return "กรุงเทพฯ"
+        if "ต่างหวัด" in combined or "ต่างจังหวัด" in combined or "ต่างจังหวัด" in combined:
+            return "ต่างจังหวัด"
+        return None
+
+    @staticmethod
+    def _extract_area_size(registration_type: Optional[str],
+                           operation_topic: Optional[str]) -> Optional[str]:
+        """
+        Extract shop area size from registration_type / operation_topic text.
+        Returns 'มากกว่า 200 ตารางเมตร' | 'ไม่เกิน 200 ตารางเมตร' | None.
+        """
+        combined = " ".join(filter(None, [registration_type or "", operation_topic or ""]))
+        if "มากกว่า 200" in combined or "เกิน 200" in combined:
+            return "มากกว่า 200 ตารางเมตร"
+        if "น้อยกว่า 200" in combined or "ไม่เกิน 200" in combined or "ต่ำกว่า 200" in combined:
+            return "ไม่เกิน 200 ตารางเมตร"
+        return None
+
+    @staticmethod
+    def _extract_entity_from_topic(operation_topic: Optional[str],
+                                   registration_type: Optional[str]) -> Optional[str]:
+        """
+        Additional entity-type extraction from topic/reg fields
+        to supplement the registration_type-based extraction.
+        Covers cases like topic='บุคคลธรรมดา' or topic='นิติบุคคล'.
+        """
+        combined = " ".join(filter(None, [operation_topic or "", registration_type or ""]))
+        if any(kw in combined for kw in ("บริษัท", "ห้างหุ้นส่วน", "นิติบุคคล")):
+            return "นิติบุคคล"
+        if "บุคคลธรรมดา" in combined:
+            return "บุคคลธรรมดา"
+        return None
+
     # -----------------------------
     # RAG: content shaping (NEW)
     # -----------------------------
@@ -320,34 +373,60 @@ class DataLoader:
 
     def _build_page_content(self, md: Dict[str, Optional[str]]) -> str:
         """
-        Build high-signal embedding text only.
-        Keep it compact, procedural, and anchored on what users ask for.
-        """
-        # Headline/context (short)
-        head = self._join_nonempty(
-            [
-                f"หน่วยงาน: {md.get('department')}" if md.get("department") else "",
-                f"ใบอนุญาต: {md.get('license_type')}" if md.get("license_type") else "",
-                f"หัวข้อ: {md.get('operation_topic')}" if md.get("operation_topic") else "",
-                f"ประเภทการจดทะเบียน: {md.get('registration_type')}" if md.get("registration_type") else "",
-                f"ประเภทผู้ประกอบการ: {md.get('entity_type_normalized')}" if md.get("entity_type_normalized") else "",
-            ]
-        )
+        Build high-signal embedding text optimised for multilingual-e5-large.
 
-        # High-signal procedural/legal fields
-        body = self._join_nonempty(
-            [
-                f"ขั้นตอน: {md.get('operation_steps')}" if md.get("operation_steps") else "",
-                f"เอกสาร: {md.get('identification_documents')}" if md.get("identification_documents") else "",
-                f"ค่าธรรมเนียม: {md.get('fees')}" if md.get("fees") else "",
-                f"ระยะเวลา: {md.get('operation_duration')}" if md.get("operation_duration") else "",
-                f"ช่องทาง/หน่วยงานติดต่อ: {md.get('service_channel')}" if md.get("service_channel") else "",
-                f"เงื่อนไข: {md.get('terms_and_conditions')}" if md.get("terms_and_conditions") else "",
-                f"ข้อกฎหมาย/ข้อบังคับ: {md.get('legal_regulatory')}" if md.get("legal_regulatory") else "",
-                f"ฟอร์ม/เอกสาร: {md.get('restaurant_ai_document')}" if md.get("restaurant_ai_document") else "",
-                f"แนวคำตอบ: {md.get('answer_guideline')}" if md.get("answer_guideline") else "",
-            ]
-        )
+        Design principles (senior RAG):
+        1. Lead with the most disambiguating signals: license, operation, location, area, entity
+        2. Include all actionable answer fields so similarity search surfaces the right doc
+        3. Include answer_guideline + conditions for FAQ/knowledge queries
+        4. Cap total length to stay within model token budget (~512 tokens ≈ 1800 Thai chars)
+
+        For e5 models the text is prepended with "passage: " by the embedding layer,
+        so we do NOT add it here.
+        """
+        # ── Context header: high-signal disambiguators ────────────────────────
+        head_parts = []
+        if md.get("license_type"):
+            head_parts.append(f"ใบอนุญาต/ทะเบียน: {md['license_type']}")
+        if md.get("operation_by_department"):
+            head_parts.append(f"การดำเนินการ: {md['operation_by_department']}")
+        if md.get("location"):
+            head_parts.append(f"พื้นที่: {md['location']}")
+        if md.get("area_size"):
+            head_parts.append(f"ขนาดพื้นที่ร้าน: {md['area_size']}")
+        if md.get("entity_type_normalized"):
+            head_parts.append(f"ประเภทผู้ประกอบการ: {md['entity_type_normalized']}")
+        elif md.get("registration_type"):
+            head_parts.append(f"ประเภทการจดทะเบียน: {md['registration_type']}")
+        if md.get("operation_topic"):
+            head_parts.append(f"หัวข้อ: {md['operation_topic']}")
+        if md.get("department"):
+            head_parts.append(f"หน่วยงาน: {md['department']}")
+
+        head = self._join_nonempty(head_parts)
+
+        # ── Answer body: all actionable fields ────────────────────────────────
+        body_parts = []
+        if md.get("operation_steps"):
+            body_parts.append(f"ขั้นตอนการดำเนินการ:\n{md['operation_steps']}")
+        if md.get("identification_documents"):
+            body_parts.append(f"เอกสารที่ต้องใช้:\n{md['identification_documents']}")
+        if md.get("fees"):
+            body_parts.append(f"ค่าธรรมเนียม:\n{md['fees']}")
+        if md.get("operation_duration"):
+            body_parts.append(f"ระยะเวลาดำเนินการ: {md['operation_duration']}")
+        if md.get("service_channel"):
+            body_parts.append(f"ช่องทางยื่นคำขอ/ติดต่อ:\n{md['service_channel']}")
+        if md.get("terms_and_conditions"):
+            body_parts.append(f"เงื่อนไขและหลักเกณฑ์:\n{md['terms_and_conditions']}")
+        if md.get("legal_regulatory"):
+            body_parts.append(f"ข้อกำหนดกฎหมาย:\n{md['legal_regulatory']}")
+        if md.get("answer_guideline"):
+            body_parts.append(f"แนวคำตอบ:\n{md['answer_guideline']}")
+        if md.get("restaurant_ai_document"):
+            body_parts.append(f"เอกสาร/ฟอร์ม: {md['restaurant_ai_document']}")
+
+        body = self._join_nonempty(body_parts)
 
         extra = ""
         if self.include_research_reference_in_content and md.get("research_reference"):
@@ -355,9 +434,10 @@ class DataLoader:
 
         text = self._join_nonempty([head, body, extra])
 
-        # Final clamp to avoid huge embeddings
-        if self.page_content_max_chars and len(text) > self.page_content_max_chars:
-            text = text[: self.page_content_max_chars].rstrip()
+        # Final clamp to avoid huge embeddings (e5-large: 512 tokens ≈ ~2000 Thai chars)
+        max_chars = self.page_content_max_chars or 2000
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip()
 
         return text.strip()
 
@@ -372,14 +452,30 @@ class DataLoader:
                 self.departments_found.add(dept)
 
             reg_type = self._get_row_value(row, colmap.get("registration_type"))
+            op_topic = self._get_row_value(row, colmap.get("operation_topic"))
+            op_by_dept = self._get_row_value(row, colmap.get("operation_by_department"))
+
+            # ── Derived metadata: entity, location, area_size ──────────────────
+            entity_from_reg = self._normalize_entity_type(reg_type)
+            entity_from_topic = self._extract_entity_from_topic(op_topic, reg_type)
+            # Prefer reg-based entity; fill with topic-based if missing
+            entity_normalized = entity_from_reg or entity_from_topic
+
+            location = self._extract_location(op_topic, reg_type, op_by_dept)
+            area_size = self._extract_area_size(reg_type, op_topic)
+
             metadata = {
                 "row_id": int(idx),
-                "department": self._get_row_value(row, colmap.get("department")),
+                "department": dept,
                 "license_type": self._get_row_value(row, colmap.get("license_type")),
-                "operation_by_department": self._get_row_value(row, colmap.get("operation_by_department")),
-                "operation_topic": self._get_row_value(row, colmap.get("operation_topic")),
+                "operation_by_department": op_by_dept,
+                "operation_topic": op_topic,
                 "registration_type": reg_type,
-                "entity_type_normalized": self._normalize_entity_type(reg_type),
+                "entity_type_normalized": entity_normalized,
+                # ── NEW parsed fields ──────────────────────────────────────────
+                "location": location,          # 'กรุงเทพฯ' | 'ต่างจังหวัด' | None
+                "area_size": area_size,        # 'มากกว่า 200 ตารางเมตร' | 'ไม่เกิน 200 ตารางเมตร' | None
+                # ── Answer fields ──────────────────────────────────────────────
                 "terms_and_conditions": self._get_row_value(row, colmap.get("terms_and_conditions")),
                 "service_channel": self._get_row_value(row, colmap.get("service_channel")),
                 "operation_steps": self._get_row_value(row, colmap.get("operation_steps")),
@@ -393,7 +489,7 @@ class DataLoader:
                 "source": source,
             }
 
-            # NEW: page_content is NOT "all columns" anymore (reduce embedding noise)
+            # Build page_content (high-signal embedding text)
             page_content = self._build_page_content(metadata)
 
             # Skip rows with no procedural content — indexing boilerplate degrades search quality

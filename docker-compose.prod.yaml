@@ -20,6 +20,12 @@ services:
       - PYTHONPATH=/app/code
     env_file:
       - ./env.properties
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s      # ตรวจทุก 30 วิ
+      timeout: 5s        # รอ response ไม่เกิน 5 วิ
+      retries: 3         # fail 3 ครั้งติดกันถึงจะ unhealthy
+      start_period: 40s  # รอ 40 วิก่อน check ครั้งแรก (โหลด e5-large ~20 วิ)
     restart: unless-stopped
 
 networks:
