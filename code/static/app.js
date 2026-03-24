@@ -105,6 +105,44 @@ function renderTopicCards(topics = []) {
   });
 }
 
+// Renders topic cards as clickable buttons inside the chat messages area
+function renderTopicCardsInChat(topics = []) {
+  if (!topics.length) return;
+
+  const row = document.createElement("div");
+  row.className = "message-row assistant";
+  row.style.display = "block";
+  row.style.maxWidth = "1120px";
+  row.style.margin = "0 auto 18px";
+  row.style.padding = "0 28px";
+
+  const grid = document.createElement("div");
+  grid.style.display = "grid";
+  grid.style.gridTemplateColumns = "repeat(auto-fit, minmax(200px, 1fr))";
+  grid.style.gap = "10px";
+
+  topics.forEach((topic) => {
+    const btn = document.createElement("button");
+    btn.className = "topic-card";
+    btn.type = "button";
+    btn.innerHTML = `
+      <div class="topic-title">${escapeHtml(topic.title || "")}</div>
+      <div class="topic-desc">${escapeHtml(topic.description || "")}</div>
+    `;
+    btn.addEventListener("click", () => {
+      if (isSending) return;
+      messageInput.value = topic.title || "";
+      autoResize();
+      sendMessage();
+    });
+    grid.appendChild(btn);
+  });
+
+  row.appendChild(grid);
+  chatMessages.appendChild(row);
+  scrollToBottom();
+}
+
 // ─── Session list ─────────────────────────────────────────────────────────────
 function renderSessionList(sessions = []) {
   sessionList.innerHTML = "";
@@ -211,25 +249,21 @@ async function createNewSession() {
 
     sessionId = data.session_id || "";
 
-    // Update welcome title with greeting text, then switch to chat view
     const greeting = data.response || "สวัสดีครับ";
     const topics = data.topics || [];
 
+    // Always show greeting as a chat bubble (same as main.py)
+    appendMessage("assistant", greeting);
+
+    // Show topic cards below the greeting if available
     if (topics.length > 0) {
-      // Show welcome panel with topic cards
-      welcomeTitle.textContent = "ยินดีให้บริการครับ 😊";
-      welcomeSubtitle.textContent = "เลือกหัวข้อที่ต้องการ หรือพิมพ์คำถามได้เลยครับ";
-      renderTopicCards(topics);
-      welcomePanel.style.display = "";
-      chatMessages.style.display = "none";
-    } else {
-      appendMessage("assistant", greeting);
+      renderTopicCardsInChat(topics);
     }
 
     await refreshSessions();
   } catch (err) {
     console.error("createNewSession error:", err);
-    showWelcome("เกิดข้อผิดพลาด", err.message);
+    appendMessage("assistant", `เกิดข้อผิดพลาด: ${err.message}`);
   }
 }
 
