@@ -1822,6 +1822,28 @@ class PersonaSupervisor:
             slots: List[Dict] = []
             seen_keys: set = set()
 
+            # ── Rule -1: department dimension (e.g. multiple banks for QR Payment) ──
+            # Ask FIRST — different departments have completely different procedures/docs.
+            # Only add if ≥2 distinct non-empty department values exist for this license.
+            dept_opts: set = set()
+            for md in mds:
+                dept = ((md or {}).get("department") or "").strip()
+                if dept and dept not in ("nan", "None"):
+                    dept_opts.add(dept)
+            if len(dept_opts) >= 2:
+                slots.append({
+                    "key": "department",
+                    "options": sorted(dept_opts),
+                    "question": "ต้องการสมัครกับธนาคาร/หน่วยงานใดครับ?",
+                })
+                seen_keys.add("department")
+                _LOG.info("[Supervisor] discover_slots[%r]: department → %s", license_type, sorted(dept_opts))
+            else:
+                _LOG.info(
+                    "[Supervisor] discover_slots[%r]: department SKIPPED — only %d value(s)",
+                    license_type, len(dept_opts),
+                )
+
             # ── Rule 0: location dimension (กรุงเทพฯ vs ต่างจังหวัด) ─────────────
             # Ask this FIRST — it determines which service channel/fee/procedure applies.
             # location is a single-value metadata field per doc — if ≥2 distinct values
@@ -2707,6 +2729,31 @@ class PersonaSupervisor:
                 # subsequent action='ask' fallback cannot pop it and show a wrong menu.
                 state.context.pop("topic_slot_queue", None)
                 _LOG.info("[Supervisor] topic_slot_queue cleared after operation_group consumed")
+
+            elif _pending_key == "department":
+                # ✅ Department slot filled (e.g. user chose ธนาคารกสิกรไทย vs ธนาคารไทยพาณิชย์)
+                # Re-retrieve docs filtered by chosen department + entity_type if known.
+                try:
+                    _dept_val = str(mapped).strip()
+                    _saved_entity_dept = (state.get_collected_slots() or {}).get("entity_type")
+                    _dept_filter: dict = {"department": _dept_val}
+                    if _saved_entity_dept:
+                        _dept_filter["entity_type_normalized"] = _saved_entity_dept
+                    _dept_docs = self._practical._retrieve_docs(
+                        state.last_retrieval_query or _dept_val,
+                        metadata_filter=_dept_filter,
+                        max_docs=int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 6)),
+                    )
+                    if _dept_docs:
+                        state.current_docs = _dept_docs
+                        _LOG.info(
+                            "[Supervisor] department retrieval: dept=%r entity=%r docs=%d",
+                            _dept_val, _saved_entity_dept, len(_dept_docs),
+                        )
+                    else:
+                        _LOG.info("[Supervisor] department retrieval: no docs found, keeping existing")
+                except Exception as _e_dept:
+                    _LOG.warning("[Supervisor] department retrieval failed: %s", _e_dept)
 
             elif _pending_key in ("area_size", "shop_area_type", "operation_location", "location_scope", "location"):
                 # ✅ Area/location slot filled → re-retrieve docs with both entity + location/area_size
