@@ -1,0 +1,284 @@
+"""
+Supervisor Prompt Templates
+============================
+All LLM prompt strings used by SupervisorPersonaService live here.
+Each function takes only the dynamic variables it needs and returns a ready-to-send string.
+
+Prompts are grouped by function:
+  1. TOPIC_PICKER         — select k relevant menu topics from candidates
+  2. CONFIRM              — interpret yes / no / ambiguous replies
+  3. STYLE_DETECT         — detect long / short answer preference
+  4. GREET_PREFIX         — generate personalized greeting text
+  5. OP_GROUP_CLASSIFIER  — group raw operation values into human-readable labels
+  6. DEDUPLICATE_OPTIONS  — remove semantically duplicate option entries
+  7. SLOT_MAPPER          — map free-text reply to a pending-slot option
+  8. FALLBACK_INTENT      — classify intent when no deterministic rule matched
+  9. TYPO_CHECK           — detect garbled / accidental input
+ 10. TOPIC_DESC           — generate one-sentence topic menu descriptions
+"""
+
+from __future__ import annotations
+from typing import List
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. TOPIC PICKER
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_topic_picker_prompt(
+    last_hint: str,
+    k: int,
+    banned: List[str],
+    candidates: List[str],
+) -> str:
+    """Select k menu topics from candidates based on relevance and diversity."""
+    return (
+        "หน้าที่: เลือกหัวข้อเมนูจำนวน k ข้อ จากรายการ candidates\n"
+        "เป้าหมาย:\n"
+        "1) เกี่ยวข้องกับบริบท last_topic_hint ให้มากที่สุด\n"
+        "2) หลากหลาย (อย่าเลือกหัวข้อที่ความหมายซ้ำกัน)\n"
+        "3) เป็น 'หัวข้อการทำงาน/ใบอนุญาต/ขั้นตอน' ไม่ใช่เคสเฉพาะหรือชื่อหน่วยงานล้วนๆ\n"
+        "ข้อห้าม:\n"
+        "- ห้ามเลือกคำ generic/placeholder ใน banned\n"
+        "- ห้ามเลือกเคสเฉพาะ เช่น 'กรณี...', 'ถ้า...', 'สำหรับ...' (ยกเว้นจำเป็นจริงๆ)\n"
+        "- ห้ามเลือกชื่อหน่วยงานล้วนๆ เช่น กรม..., สำนักงาน..., เทศบาล..., อบต., อบจ., สำนักงานเขต (ยกเว้นจำเป็นจริงๆ)\n"
+        "- ห้ามเลือกซ้ำ\n"
+        "ให้ตอบเป็น JSON เท่านั้น:\n"
+        '{ "topics": ["..."], "confidence": 0.0 }\n'
+        f"last_topic_hint: {last_hint}\n"
+        f"k: {int(k)}\n"
+        f"banned: {banned}\n"
+        f"candidates: {candidates}\n"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. CONFIRM (yes / no)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_confirm_prompt(user_text: str) -> str:
+    """Interpret whether user is confirming, rejecting, or ambiguous."""
+    return (
+        "หน้าที่: ตีความว่า 'ข้อความผู้ใช้' เป็นการยืนยัน (yes) หรือปฏิเสธ (no) หรือยังไม่ชัดเจน\n"
+        "ให้ดูโทน/เจตนา ไม่ต้องยึดแค่คำว่า 'ใช่/ไม่'\n"
+        "ตัวอย่าง yes: งับ, ได้เลย, โอเค, ถูกต้อง, ยืนยัน, เอาเลย, จัดไป, ไปเลย\n"
+        "ตัวอย่าง no: ไม่เอา, ยกเลิก, ช่างมัน, ไม่ต้อง, ยังไม่\n"
+        "ถ้ากำกวมจริงๆ ให้ confidence ต่ำ\n"
+        "ตอบเป็น JSON เท่านั้น:\n"
+        '{ "yes": true/false, "no": true/false, "confidence": 0.0 }\n'
+        f"ข้อความผู้ใช้: {user_text}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. STYLE DETECT (long / short)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_style_detect_prompt(user_text: str) -> str:
+    """Detect whether user explicitly wants a long/detailed or short/concise answer."""
+    return (
+        "หน้าที่: ตรวจว่า 'ข้อความผู้ใช้' บอกชัดๆ ว่าต้องการ style คำตอบแบบใด\n"
+        "wants_long=true เฉพาะเมื่อมีคำบ่งชี้ชัดๆ ว่าอยากได้ข้อมูลละเอียด/เชิงลึก\n"
+        "  ตัวอย่าง wants_long: ขอละเอียด, อธิบายเชิงลึก, ครบทุกอย่าง, เป็นทางการ, แบบวิชาการ\n"
+        "  ไม่ใช่ wants_long: อยากรู้, ต้องการทราบ, ถามว่า, คืออะไร, มีอะไรบ้าง\n"
+        "wants_short=true เฉพาะเมื่อมีคำบ่งชี้ชัดๆ ว่าอยากได้แบบสั้น\n"
+        "  ตัวอย่าง wants_short: แบบสั้น, กระชับ, สรุปแค่, พอสังเขป\n"
+        "ถ้าไม่ชัดหรือเป็นแค่การถามเรื่อง ให้ confidence ต่ำ (<0.5)\n"
+        "ตอบเป็น JSON เท่านั้น:\n"
+        '{ "wants_long": true/false, "wants_short": true/false, "confidence": 0.0 }\n'
+        f"ข้อความผู้ใช้: {user_text}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. GREET PREFIX
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_greet_prefix_prompt(
+    kind: str,
+    persona_id: str,
+    last_topic_hint: str,
+    include_intro: bool,
+    kind_instructions: str,
+) -> str:
+    """Generate a personalized Thai greeting/response prefix for น้องสุดยอด."""
+    return (
+        "หน้าที่: เขียนข้อความทักทาย/ตอบรับภาษาไทยแบบมนุษย์ ในฐานะ 'น้องสุดยอด' ที่ปรึกษาร้านอาหาร\n"
+        "ข้อกำหนดร่วม:\n"
+        "- 1-2 ประโยคสั้นๆ ลงท้ายด้วยคำถาม 1 ข้อ\n"
+        "- ห้ามใส่รายการหัวข้อ/เลขข้อ/เมนู\n"
+        "- ห้ามสั่ง user ว่า 'เลือก/พิมพ์/กด'\n"
+        "- ต้องลงท้ายด้วย 'ครับ'\n"
+        "- แทนตัวเองว่า 'ผม' หรือ 'น้องสุดยอด' ห้ามใช้ 'ฉัน'\n"
+        "กฎ include_intro:\n"
+        "- ถ้า include_intro=true: แนะนำตัวว่า Restbiz ช่วยเรื่องกฎหมาย/ใบอนุญาต/ภาษีร้านอาหาร\n"
+        "- ถ้า include_intro=false: ห้ามพูดชื่อ Restbiz และห้ามบอกหน้าที่บอทซ้ำ\n"
+        f"กฎเฉพาะสำหรับ kind='{kind}':\n"
+        f"{kind_instructions}"
+        '{"prefix": "..."}\n'
+        f"kind: {kind}\n"
+        f"persona: {persona_id}\n"
+        f"include_intro: {str(bool(include_intro)).lower()}\n"
+        f"last_topic_hint: {last_topic_hint}\n"
+    )
+
+
+def build_greet_kind_instructions(kind: str, last_topic_hint: str) -> str:
+    """Build the kind-specific instruction block for build_greet_prefix_prompt."""
+    if kind == "thanks":
+        if last_topic_hint:
+            return (
+                f"- ผู้ใช้พึ่งขอบคุณหลังจากสอบถามเรื่อง '{last_topic_hint}'\n"
+                "- ตอบรับคำขอบคุณอย่างอบอุ่น แล้วถามว่ายังมีคำถามเรื่องเดิมหรือเรื่องอื่นอีกไหม\n"
+                "- ห้ามพูดแบบ generic เช่น 'มีอะไรให้ช่วยไหม' ให้เชื่อมโยงกับ topic ที่คุยมา\n"
+            )
+        return "- ผู้ใช้ขอบคุณ ตอบรับอย่างอบอุ่นและถามว่ามีอะไรให้ช่วยอีกไหม\n"
+    if kind in ("smalltalk", "blank"):
+        if last_topic_hint:
+            return (
+                f"- ก่อนหน้านี้คุยเรื่อง '{last_topic_hint}' ถ้าผู้ใช้อาจยังสงสัยเรื่องนั้นอยู่ ให้เชิญชวนต่อ\n"
+                "- ตอบรับแบบเป็นกันเองสั้นๆ แล้วถามว่ายังมีเรื่องนั้นหรือเรื่องอื่นให้ช่วยไหม\n"
+            )
+        return "- ตอบรับแบบเป็นกันเองสั้นๆ และถามว่ามีอะไรให้ช่วยไหม\n"
+    return "- ทักทายอย่างอบอุ่น\n"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. OP GROUP CLASSIFIER
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_op_group_classifier_prompt(license_type: str, raw_ops: List[str]) -> str:
+    """Group raw operation values from ChromaDB into human-readable categories."""
+    ops_str = "\n".join(f"- {o}" for o in raw_ops)
+    return (
+        "คุณเป็น AI ที่ช่วยจัดกลุ่มประเภทการดำเนินการสำหรับใบอนุญาตธุรกิจ\n"
+        "หน้าที่: จัดกลุ่ม raw operation values ด้านล่างให้เป็นหมวดหมู่ที่ user เข้าใจง่าย\n"
+        "กฎ:\n"
+        "1. แต่ละกลุ่มต้องมี label ภาษาไทยที่กระชับ ชัดเจน (ไม่เกิน 30 ตัวอักษร)\n"
+        "2. ค่าที่หมายถึงการยื่น/จด/ขอใหม่ → label เช่น 'ยื่นขอใหม่ / จดทะเบียน'\n"
+        "3. ค่าที่หมายถึงต่ออายุ → label 'ต่ออายุ'\n"
+        "4. ค่าที่หมายถึงแก้ไข/เปลี่ยนแปลง → label 'แก้ไข / เปลี่ยนแปลงรายการ'\n"
+        "5. ค่าที่หมายถึงยกเลิก/เลิก → label 'ยกเลิก'\n"
+        "6. ค่าที่หมายถึงย้าย → label 'ย้ายสถานประกอบการ'\n"
+        "7. ค่าที่หมายถึงเพิ่มสาขา → label 'เพิ่มสถานประกอบการ'\n"
+        "8. ค่าที่หมายถึงปิดสาขา → label 'ปิดสถานประกอบการ'\n"
+        "9. ค่าที่ไม่เข้าข้อใดข้างต้น → label 'อื่น ๆ'\n"
+        "10. ถ้าหลาย raw values มีความหมายเดียวกัน ให้รวมไว้ใน group เดียวกัน\n"
+        "11. ห้ามสร้าง label ที่ไม่มีใน raw list\n"
+        f"license_type: {license_type}\n"
+        f"raw operations:\n{ops_str}\n"
+        "Return JSON only:\n"
+        '{"groups": [{"label": "...", "raw": ["..."]}, ...]}'
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6. DEDUPLICATE OPTIONS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_deduplicate_options_prompt(options: List[str]) -> str:
+    """Remove semantically duplicate entries from a list of slot options."""
+    opts_str = "\n".join(f"{i + 1}. {opt}" for i, opt in enumerate(options))
+    return (
+        "คุณเป็น AI ที่ช่วยจัดกลุ่มและกำจัดตัวเลือกที่ซ้ำซ้อน\n"
+        "กติกา:\n"
+        "1. ถ้าตัวเลือกมีความหมายเดียวกัน ให้เลือกเอาแค่ตัวที่เฉพาะเจาะจงกว่า (เช่น 'บริษัทจำกัด' ดีกว่า 'บริษัท')\n"
+        "2. ถ้าตัวเลือกเป็นการรวมกันของหลายประเภท (เช่น '1.ห้างหุ้นส่วนจำกัด 2.ห้างหุ้นส่วนสามัญ') ให้แยกออกมาเป็นรายการเดี่ยว\n"
+        "3. ถ้าตัวเลือกเป็นคำกว้างๆ แล้วมีคำเฉพาะเจาะจงกว่า ให้เอาเฉพาะตัวเจาะจง "
+        "(เช่น มี 'ห้างหุ้นส่วนจำกัด' และ 'ห้างหุ้นส่วน' ให้เก็บทั้งคู่ถ้าต่างกัน "
+        "แต่ถ้าหมายถึงสิ่งเดียวกันเอาตัวเจาะจงกว่า)\n"
+        "4. รักษาคำที่มีความหมายแตกต่างกันไว้ทั้งหมด\n\n"
+        f"ตัวเลือกที่มี:\n{opts_str}\n\n"
+        'Return JSON: {"unique_options": [list ของตัวเลือกที่ไม่ซ้ำกัน เรียงตามความเหมาะสม], '
+        '"reasoning": "อธิบายสั้นๆ ว่าทำไมถึงเลือกแบบนี้"}'
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7. SLOT MAPPER
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_slot_mapper_prompt(slot_key: str, user_text: str, options: List[str]) -> str:
+    """Map a free-text reply to the closest matching pending-slot option."""
+    opts = [str(x).strip() for x in options if str(x).strip()][:12]
+    return (
+        "หน้าที่: จับคู่ข้อความผู้ใช้ให้เข้ากับตัวเลือกที่ใกล้ที่สุด (เลือกได้ 1 ข้อ)\n"
+        "กติกา:\n"
+        "- ถ้าแมพได้ชัดเจน ให้คืน choice_index เป็นเลข 1..N และ choice_text เป็นข้อความของตัวเลือกนั้น\n"
+        "- ถ้าไม่ชัดเจนจริงๆ ให้คืน choice_index=0 และ confidence ต่ำ\n"
+        "- ห้ามเดาแบบสุ่ม\n"
+        "ตอบเป็น JSON เท่านั้น:\n"
+        '{"choice_index": 0, "choice_text": "", "confidence": 0.0}\n'
+        f"slot_key: {slot_key}\n"
+        f"user_text: {user_text}\n"
+        f"options: {opts}\n"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8. FALLBACK INTENT
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_fallback_intent_prompt(user_text: str, last_query: str, persona: str) -> str:
+    """Classify intent when no deterministic routing rule matched."""
+    return (
+        "คุณคือ routing classifier สำหรับ AI ผู้ช่วยธุรกิจร้านอาหารไทย\n"
+        "จงจำแนก intent จากข้อความผู้ใช้ด้านล่าง\n\n"
+        f"user_text: {user_text}\n"
+        f"last_legal_query: {last_query or '(none)'}\n"
+        f"current_persona: {persona}\n\n"
+        "Intent categories:\n"
+        "- new_topic: ต้องการเปลี่ยนหัวข้อ / ขอหัวข้อแนะนำใหม่ / อยากรู้เรื่องอื่น\n"
+        "- elaborate: ขอให้ขยายความ/อธิบายให้ละเอียดขึ้นโดยตรง (เช่น 'ขยายความ', 'อธิบายเพิ่มหน่อย', "
+        "'บอกให้ละเอียดขึ้น') — ต้องเป็นการขอ elaboration อย่างชัดเจน ไม่ใช่การถามแง่มุมใหม่ "
+        "(เอกสาร/ค่าธรรมเนียม/ขั้นตอน) หรือคำถามเกี่ยวกับธุรกิจ\n"
+        "- legal_question: ถามเรื่องกฎหมาย/ใบอนุญาต/ภาษี/จดทะเบียน/ธุรกิจร้านอาหาร\n"
+        "- greeting: ทักทาย/ขอบคุณ/ปิดบทสนทนา\n"
+        "- unknown: ไม่เกี่ยวกับธุรกิจร้านอาหารและไม่สามารถระบุได้\n\n"
+        "ตอบ JSON เท่านั้น:\n"
+        '{"intent": "new_topic", "query": "", "confidence": 0.9}\n'
+        "- query: ถ้า intent=legal_question ให้ใส่คำถามที่ชัดเจนขึ้น, ไม่งั้นเว้นว่าง"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9. TYPO CHECK
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_typo_check_prompt(user_text: str, last_topic: str) -> str:
+    """Detect whether input is garbled/accidental or has genuine intent."""
+    return (
+        "คุณคือ typo-detector สำหรับ AI ผู้ช่วยธุรกิจร้านอาหารไทย\n"
+        "วิเคราะห์ว่า user_text ด้านล่างเป็น 'การพิมพ์ผิด/ตัวอักษรสุ่ม/ไม่มีความหมาย' "
+        "หรือเป็น 'ข้อความที่มีเจตนาชัดเจน'\n\n"
+        f"user_text: {user_text!r}\n"
+        f"บริบทล่าสุด: {last_topic or '(ยังไม่มี)'}\n\n"
+        "เกณฑ์ is_typo=true:\n"
+        "- อักขระสุ่มที่ไม่ก่อเป็นคำหรือประโยคได้\n"
+        "- อักษรผสมกันไม่ได้ตามหลักภาษาไทย/อังกฤษ\n"
+        "- ดูเหมือนกดแป้นพิมพ์โดยไม่ตั้งใจ\n"
+        "เกณฑ์ is_typo=false:\n"
+        "- มีคำ/ประโยคที่อ่านออกความหมายได้ แม้จะสั้น\n"
+        "- เป็นชื่อ, ตัวเลข, หรือคำย่อที่ใช้บ่อย\n\n"
+        "ตอบ JSON เท่านั้น:\n"
+        '{"is_typo": true, "confidence": 0.92, "suggested": ""}\n'
+        "- suggested: ถ้า is_typo=true แต่พอเดาได้ว่าหมายถึงอะไร ใส่คำนั้น ไม่งั้นเว้นว่าง"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10. TOPIC DESC
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_topic_desc_prompt(topics: List[str], context_block: str) -> str:
+    """Generate one-sentence descriptions for topic menu items."""
+    topic_list = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(topics))
+    return (
+        "คุณคือ AI ที่ปรึกษาร้านอาหาร สร้างคำอธิบายสั้น 1 ประโยค (ไม่เกิน 20 คำ) สำหรับแต่ละหัวข้อ\n"
+        "โทน: บอกจากมุมบอทว่า ผมจะแนะนำ/สอน/บอกอะไรคุณได้บ้างในหัวข้อนี้\n"
+        "สำคัญ: ใช้เฉพาะข้อมูลที่มีอยู่ในเอกสารด้านล่าง ห้ามสร้างข้อมูลที่ไม่มี\n"
+        "ห้ามขึ้นต้นด้วย 'ถ้าเลือกหัวข้อนี้' หรือ 'ผมจด' หรือ 'ผมทำ'\n\n"
+        f"หัวข้อ:\n{topic_list}\n\n"
+        f"เอกสารอ้างอิง:\n{context_block}"
+        'ตอบ JSON เท่านั้น รูปแบบ: {"descriptions": ["คำอธิบาย1", "คำอธิบาย2"]}'
+    )

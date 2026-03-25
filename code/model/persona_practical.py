@@ -1144,7 +1144,7 @@ class PracticalPersonaService:
         start = time.time()
 
         max_docs = max_docs if max_docs is not None else int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 8))
-        max_chars = getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 250)
+        max_chars = getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700)
 
         # 🎯 Query expansion: short/abbrev keywords → full Thai terms for better embedding match
         # e.g. "vat" alone has low cosine similarity to "ภาษีมูลค่าเพิ่ม ภพ.20"
@@ -1198,6 +1198,11 @@ class PracticalPersonaService:
                         "docs_found": len(docs),
                         "persona": "practical"
                     })
+                    if not docs:
+                        # Try same filter with larger k before going unfiltered.
+                        # This preserves entity/license filter intent — avoids mixing
+                        # irrelevant entity types into the result.
+                        docs = _scored_search(query, top_k, metadata_filter)
                     if not docs:
                         logger.log_with_data("warning", "⚠️ กรอง metadata แต่ไม่พบเอกสาร — ใช้การค้นหาปกติ", {
                             "action": "filtered_retrieval_empty_fallback",
@@ -1287,8 +1292,8 @@ class PracticalPersonaService:
         _STORE_FIELD_CAPS = {
             # Must be >= the per-field caps used in the handle() prompt loop below,
             # otherwise the storage cut dominates and the prompt cap has no effect.
-            "operation_steps": 1500, "identification_documents": 900,
-            "research_reference": 5000, "fees": 600, "service_channel": 600,
+            "operation_steps": 1000, "identification_documents": 700,
+            "research_reference": 3100, "fees": 500, "service_channel": 500,
         }
         results: List[Dict[str, Any]] = []
         for d in docs[:max_docs]:
@@ -1662,17 +1667,17 @@ class PracticalPersonaService:
 
         _prompt_max_docs = int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 3))
         _FIELD_CAPS = {
-            "operation_steps": 1500,
-            "identification_documents": 900,
-            "research_reference": 5000,
-            "fees": 600,
+            "operation_steps": 1000,
+            "identification_documents": 700,
+            "research_reference": 3100,
+            "fees": 500,
             "operation_duration": 200,
-            "service_channel": 600,
+            "service_channel": 500,
         }
         _LONG_FIELDS_DEDUP = {"operation_steps", "identification_documents"}
 
-        # For multi-license merged docs, don't cap at _prompt_max_docs — each license needs its
-        # own metadata sent. For single-license, cap as normal to control token usage.
+        # Cap docs sent to LLM: _prompt_max_docs per license_type to control token usage.
+        # For multi-license, each license still gets its own metadata via dedup logic below.
         _all_docs = state.current_docs or []
         _lt_order: list = []  # license_types in order of first appearance
         for _d0 in _all_docs:
@@ -1680,7 +1685,17 @@ class PracticalPersonaService:
             if _lt0 and _lt0 not in _lt_order:
                 _lt_order.append(_lt0)
         _is_multi_license_docs = len(_lt_order) > 1
-        _docs_to_process = _all_docs if _is_multi_license_docs else _all_docs[:_prompt_max_docs]
+        # Cap at _prompt_max_docs per license_type (prevents token explosion on multi-topic queries)
+        if _is_multi_license_docs:
+            _lt_counts: dict = {}
+            _docs_to_process = []
+            for _d0 in _all_docs:
+                _lt0 = ((_d0.get("metadata") or {}).get("license_type") or "").strip()
+                _lt_counts[_lt0] = _lt_counts.get(_lt0, 0) + 1
+                if _lt_counts[_lt0] <= _prompt_max_docs:
+                    _docs_to_process.append(_d0)
+        else:
+            _docs_to_process = _all_docs[:_prompt_max_docs]
 
         # Pass 1: collect research_reference links per license_type (deduped within each license)
         _rr_seen_by_lt: dict = {}   # lt → set of seen keys
@@ -1702,7 +1717,8 @@ class PracticalPersonaService:
                     _rr_seen_by_lt[_lt1].add(_key1)
                     if _desc1: _rr_parts_by_lt[_lt1].append(_desc1)
                     if _url1:  _rr_parts_by_lt[_lt1].append(_url1)
-        _rr_agg_by_lt = {lt: "\n".join(parts)[:5000] for lt, parts in _rr_parts_by_lt.items()}
+        _rr_agg_cap = _FIELD_CAPS.get("research_reference", 3100)
+        _rr_agg_by_lt = {lt: "\n".join(parts)[:_rr_agg_cap] for lt, parts in _rr_parts_by_lt.items()}
 
         # Pass 2: build docs_json with per-license dedup for long fields and research_reference
         _long_fields_sent_by_lt: dict = {}  # lt → bool
@@ -1827,7 +1843,16 @@ ROUND: {int(getattr(state, "round", 0) or 0)}/{int(getattr(conf, "MAX_ROUNDS", 7
 Your JSON response:
 """
 
-        decision = self._call_llm_json(prompt, state=state)
+        # ⚡ SHORT-CIRCUIT: when topic_slot_queue is non-empty and docs are loaded,
+        # the next action is always 'ask' — skip the LLM entirely.
+        # The question text and slot options come from the queue entry (not the LLM),
+        # so calling the LLM here wastes tokens without changing the outcome.
+        _pending_sq = (state.context or {}).get("topic_slot_queue") or []
+        if _pending_sq and state.current_docs:
+            _LOG.info("[Practical] slot_queue non-empty (%d) — skipping LLM, action=ask", len(_pending_sq))
+            decision = {"action": "ask", "execution": {"question": "", "slot_options": [], "answer": "", "query": "", "context_update": {}}}
+        else:
+            decision = self._call_llm_json(prompt, state=state)
         action = (decision.get("action") or "ask").strip()
         _exec_raw = decision.get("execution", {})
         # Gemini may return execution as a JSON string instead of a dict — parse it

@@ -74,6 +74,19 @@ from langchain_core.messages import HumanMessage
 import conf
 from model.conversation_state import ConversationState
 from utils.llm_call import llm_invoke, extract_llm_text
+from utils.prompts_supervisor import (
+    build_topic_picker_prompt,
+    build_confirm_prompt,
+    build_style_detect_prompt,
+    build_greet_prefix_prompt,
+    build_greet_kind_instructions,
+    build_op_group_classifier_prompt,
+    build_deduplicate_options_prompt,
+    build_slot_mapper_prompt,
+    build_fallback_intent_prompt,
+    build_typo_check_prompt,
+    build_topic_desc_prompt,
+)
 from utils.persona_profile import (
     normalize_persona_id,
     build_strict_profile,
@@ -406,24 +419,7 @@ class PersonaSupervisor:
             banned2 = [str(x).strip() for x in (banned or []) if str(x).strip()]
             banned2 = banned2[:60]
 
-            prompt = (
-                "หน้าที่: เลือกหัวข้อเมนูจำนวน k ข้อ จากรายการ candidates\n"
-                "เป้าหมาย:\n"
-                "1) เกี่ยวข้องกับบริบท last_topic_hint ให้มากที่สุด\n"
-                "2) หลากหลาย (อย่าเลือกหัวข้อที่ความหมายซ้ำกัน)\n"
-                "3) เป็น 'หัวข้อการทำงาน/ใบอนุญาต/ขั้นตอน' ไม่ใช่เคสเฉพาะหรือชื่อหน่วยงานล้วนๆ\n"
-                "ข้อห้าม:\n"
-                "- ห้ามเลือกคำ generic/placeholder ใน banned\n"
-                "- ห้ามเลือกเคสเฉพาะ เช่น 'กรณี...', 'ถ้า...', 'สำหรับ...' (ยกเว้นจำเป็นจริงๆ)\n"
-                "- ห้ามเลือกชื่อหน่วยงานล้วนๆ เช่น กรม..., สำนักงาน..., เทศบาล..., อบต., อบจ., สำนักงานเขต (ยกเว้นจำเป็นจริงๆ)\n"
-                "- ห้ามเลือกซ้ำ\n"
-                "ให้ตอบเป็น JSON เท่านั้น:\n"
-                '{ "topics": ["..."], "confidence": 0.0 }\n'
-                f"last_topic_hint: {last_hint}\n"
-                f"k: {int(k)}\n"
-                f"banned: {banned2}\n"
-                f"candidates: {cand}\n"
-            )
+            prompt = build_topic_picker_prompt(last_hint, k, banned2, cand)
 
             try:
                 text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/topic_picker")).strip()
@@ -455,16 +451,7 @@ class PersonaSupervisor:
         )
 
         def _call(user_text: str) -> dict:
-            prompt = (
-                "หน้าที่: ตีความว่า 'ข้อความผู้ใช้' เป็นการยืนยัน (yes) หรือปฏิเสธ (no) หรือยังไม่ชัดเจน\n"
-                "ให้ดูโทน/เจตนา ไม่ต้องยึดแค่คำว่า 'ใช่/ไม่'\n"
-                "ตัวอย่าง yes: งับ, ได้เลย, โอเค, ถูกต้อง, ยืนยัน, เอาเลย, จัดไป, ไปเลย\n"
-                "ตัวอย่าง no: ไม่เอา, ยกเลิก, ช่างมัน, ไม่ต้อง, ยังไม่\n"
-                "ถ้ากำกวมจริงๆ ให้ confidence ต่ำ\n"
-                "ตอบเป็น JSON เท่านั้น:\n"
-                '{ "yes": true/false, "no": true/false, "confidence": 0.0 }\n'
-                f"ข้อความผู้ใช้: {user_text}"
-            )
+            prompt = build_confirm_prompt(user_text)
             try:
                 text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm")).strip()
             except Exception:
@@ -492,18 +479,7 @@ class PersonaSupervisor:
         )
 
         def _call(user_text: str) -> dict:
-            prompt = (
-                "หน้าที่: ตรวจว่า 'ข้อความผู้ใช้' บอกชัดๆ ว่าต้องการ style คำตอบแบบใด\n"
-                "wants_long=true เฉพาะเมื่อมีคำบ่งชี้ชัดๆ ว่าอยากได้ข้อมูลละเอียด/เชิงลึก\n"
-                "  ตัวอย่าง wants_long: ขอละเอียด, อธิบายเชิงลึก, ครบทุกอย่าง, เป็นทางการ, แบบวิชาการ\n"
-                "  ไม่ใช่ wants_long: อยากรู้, ต้องการทราบ, ถามว่า, คืออะไร, มีอะไรบ้าง\n"
-                "wants_short=true เฉพาะเมื่อมีคำบ่งชี้ชัดๆ ว่าอยากได้แบบสั้น\n"
-                "  ตัวอย่าง wants_short: แบบสั้น, กระชับ, สรุปแค่, พอสังเขป\n"
-                "ถ้าไม่ชัดหรือเป็นแค่การถามเรื่อง ให้ confidence ต่ำ (<0.5)\n"
-                "ตอบเป็น JSON เท่านั้น:\n"
-                '{ "wants_long": true/false, "wants_short": true/false, "confidence": 0.0 }\n'
-                f"ข้อความผู้ใช้: {user_text}"
-            )
+            prompt = build_style_detect_prompt(user_text)
             try:
                 text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm")).strip()
             except Exception:
@@ -538,49 +514,8 @@ class PersonaSupervisor:
         )
 
         def _call(kind: str, persona_id: str, last_topic_hint: str, include_intro: bool) -> dict:
-            # Build context-aware instructions for each kind
-            kind_instructions = ""
-            if kind == "thanks":
-                if last_topic_hint:
-                    kind_instructions = (
-                        f"- ผู้ใช้พึ่งขอบคุณหลังจากสอบถามเรื่อง '{last_topic_hint}'\n"
-                        "- ตอบรับคำขอบคุณอย่างอบอุ่น แล้วถามว่ายังมีคำถามเรื่องเดิมหรือเรื่องอื่นอีกไหม\n"
-                        "- ห้ามพูดแบบ generic เช่น 'มีอะไรให้ช่วยไหม' ให้เชื่อมโยงกับ topic ที่คุยมา\n"
-                    )
-                else:
-                    kind_instructions = (
-                        "- ผู้ใช้ขอบคุณ ตอบรับอย่างอบอุ่นและถามว่ามีอะไรให้ช่วยอีกไหม\n"
-                    )
-            elif kind in ("smalltalk", "blank"):
-                if last_topic_hint:
-                    kind_instructions = (
-                        f"- ก่อนหน้านี้คุยเรื่อง '{last_topic_hint}' ถ้าผู้ใช้อาจยังสงสัยเรื่องนั้นอยู่ ให้เชิญชวนต่อ\n"
-                        "- ตอบรับแบบเป็นกันเองสั้นๆ แล้วถามว่ายังมีเรื่องนั้นหรือเรื่องอื่นให้ช่วยไหม\n"
-                    )
-                else:
-                    kind_instructions = "- ตอบรับแบบเป็นกันเองสั้นๆ และถามว่ามีอะไรให้ช่วยไหม\n"
-            else:
-                kind_instructions = "- ทักทายอย่างอบอุ่น\n"
-
-            prompt = (
-                "หน้าที่: เขียนข้อความทักทาย/ตอบรับภาษาไทยแบบมนุษย์ ในฐานะ 'น้องสุดยอด' ที่ปรึกษาร้านอาหาร\n"
-                "ข้อกำหนดร่วม:\n"
-                "- 1-2 ประโยคสั้นๆ ลงท้ายด้วยคำถาม 1 ข้อ\n"
-                "- ห้ามใส่รายการหัวข้อ/เลขข้อ/เมนู\n"
-                "- ห้ามสั่ง user ว่า 'เลือก/พิมพ์/กด'\n"
-                "- ต้องลงท้ายด้วย 'ครับ'\n"
-                "- แทนตัวเองว่า 'ผม' หรือ 'น้องสุดยอด' ห้ามใช้ 'ฉัน'\n"
-                "กฎ include_intro:\n"
-                "- ถ้า include_intro=true: แนะนำตัวว่า Restbiz ช่วยเรื่องกฎหมาย/ใบอนุญาต/ภาษีร้านอาหาร\n"
-                "- ถ้า include_intro=false: ห้ามพูดชื่อ Restbiz และห้ามบอกหน้าที่บอทซ้ำ\n"
-                f"กฎเฉพาะสำหรับ kind='{kind}':\n"
-                f"{kind_instructions}"
-                "ตอบเป็น JSON เท่านั้น: {\"prefix\": \"...\"}\n"
-                f"kind: {kind}\n"
-                f"persona: {persona_id}\n"
-                f"include_intro: {str(bool(include_intro)).lower()}\n"
-                f"last_topic_hint: {last_topic_hint}\n"
-            )
+            kind_instructions = build_greet_kind_instructions(kind, last_topic_hint)
+            prompt = build_greet_prefix_prompt(kind, persona_id, last_topic_hint, include_intro, kind_instructions)
             try:
                 text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm")).strip()
             except Exception:
@@ -631,27 +566,7 @@ class PersonaSupervisor:
         def _call(license_type: str, raw_ops: List[str]) -> dict:
             if not raw_ops:
                 return {"groups": []}
-            ops_str = "\n".join(f"- {o}" for o in raw_ops)
-            prompt = (
-                "คุณเป็น AI ที่ช่วยจัดกลุ่มประเภทการดำเนินการสำหรับใบอนุญาตธุรกิจ\n"
-                "หน้าที่: จัดกลุ่ม raw operation values ด้านล่างให้เป็นหมวดหมู่ที่ user เข้าใจง่าย\n"
-                "กฎ:\n"
-                "1. แต่ละกลุ่มต้องมี label ภาษาไทยที่กระชับ ชัดเจน (ไม่เกิน 30 ตัวอักษร)\n"
-                "2. ค่าที่หมายถึงการยื่น/จด/ขอใหม่ → label เช่น 'ยื่นขอใหม่ / จดทะเบียน'\n"
-                "3. ค่าที่หมายถึงต่ออายุ → label 'ต่ออายุ'\n"
-                "4. ค่าที่หมายถึงแก้ไข/เปลี่ยนแปลง → label 'แก้ไข / เปลี่ยนแปลงรายการ'\n"
-                "5. ค่าที่หมายถึงยกเลิก/เลิก → label 'ยกเลิก'\n"
-                "6. ค่าที่หมายถึงย้าย → label 'ย้ายสถานประกอบการ'\n"
-                "7. ค่าที่หมายถึงเพิ่มสาขา → label 'เพิ่มสถานประกอบการ'\n"
-                "8. ค่าที่หมายถึงปิดสาขา → label 'ปิดสถานประกอบการ'\n"
-                "9. ค่าที่ไม่เข้าข้อใดข้างต้น → label 'อื่น ๆ'\n"
-                "10. ถ้าหลาย raw values มีความหมายเดียวกัน ให้รวมไว้ใน group เดียวกัน\n"
-                "11. ห้ามสร้าง label ที่ไม่มีใน raw list\n"
-                f"license_type: {license_type}\n"
-                f"raw operations:\n{ops_str}\n"
-                "Return JSON only:\n"
-                '{"groups": [{"label": "...", "raw": ["..."]}, ...]}'
-            )
+            prompt = build_op_group_classifier_prompt(license_type, raw_ops)
             try:
                 text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)],
                                   logger=_LOG, label="Supervisor/op_group_classify")).strip()
@@ -687,18 +602,7 @@ class PersonaSupervisor:
         def _call(options: List[str]) -> dict:
             if len(options) <= 1:
                 return {"unique_options": options, "reasoning": "Only one option"}
-            
-            opts_str = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(options)])
-            prompt = (
-                "คุณเป็น AI ที่ช่วยจัดกลุ่มและกำจัดตัวเลือกที่ซ้ำซ้อน\n"
-                "กติกา:\n"
-                "1. ถ้าตัวเลือกมีความหมายเดียวกัน ให้เลือกเอาแค่ตัวที่เฉพาะเจาะจงกว่า (เช่น 'บริษัทจำกัด' ดีกว่า 'บริษัท')\n"
-                "2. ถ้าตัวเลือกเป็นการรวมกันของหลายประเภท (เช่น '1.ห้างหุ้นส่วนจำกัด 2.ห้างหุ้นส่วนสามัญ') ให้แยกออกมาเป็นรายการเดี่ยว\n"
-                "3. ถ้าตัวเลือกเป็นคำกว้างๆ แล้วมีคำเฉพาะเจาะจงกว่า ให้เอาเฉพาะตัวเจาะจง (เช่น มี 'ห้างหุ้นส่วนจำกัด' และ 'ห้างหุ้นส่วน' ให้เก็บทั้งคู่ถ้าต่างกัน แต่ถ้าหมายถึงสิ่งเดียวกันเอาตัวเจาะจงกว่า)\n"
-                "4. รักษาคำที่มีความหมายแตกต่างกันไว้ทั้งหมด\n\n"
-                f"ตัวเลือกที่มี:\n{opts_str}\n\n"
-                "Return JSON: {\"unique_options\": [list ของตัวเลือกที่ไม่ซ้ำกัน เรียงตามความเหมาะสม], \"reasoning\": \"อธิบายสั้นๆ ว่าทำไมถึงเลือกแบบนี้\"}"
-            )
+            prompt = build_deduplicate_options_prompt(options)
             
             try:
                 resp = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/deduplicate")
@@ -751,19 +655,7 @@ class PersonaSupervisor:
         )
 
         def _call(slot_key: str, user_text: str, options: List[str]) -> dict:
-            opts = [str(x).strip() for x in (options or []) if str(x).strip()][:12]
-            prompt = (
-                "หน้าที่: จับคู่ข้อความผู้ใช้ให้เข้ากับตัวเลือกที่ใกล้ที่สุด (เลือกได้ 1 ข้อ)\n"
-                "กติกา:\n"
-                "- ถ้าแมพได้ชัดเจน ให้คืน choice_index เป็นเลข 1..N และ choice_text เป็นข้อความของตัวเลือกนั้น\n"
-                "- ถ้าไม่ชัดเจนจริงๆ ให้คืน choice_index=0 และ confidence ต่ำ\n"
-                "- ห้ามเดาแบบสุ่ม\n"
-                "ตอบเป็น JSON เท่านั้น:\n"
-                '{"choice_index": 0, "choice_text": "", "confidence": 0.0}\n'
-                f"slot_key: {slot_key}\n"
-                f"user_text: {user_text}\n"
-                f"options: {opts}\n"
-            )
+            prompt = build_slot_mapper_prompt(slot_key, user_text, options)
             try:
                 text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/llm")).strip()
             except Exception:
@@ -801,22 +693,7 @@ class PersonaSupervisor:
         )
 
         def _call(user_text: str, last_query: str, persona: str) -> dict:
-            prompt = (
-                "คุณคือ routing classifier สำหรับ AI ผู้ช่วยธุรกิจร้านอาหารไทย\n"
-                "จงจำแนก intent จากข้อความผู้ใช้ด้านล่าง\n\n"
-                f"user_text: {user_text}\n"
-                f"last_legal_query: {last_query or '(none)'}\n"
-                f"current_persona: {persona}\n\n"
-                "Intent categories:\n"
-                "- new_topic: ต้องการเปลี่ยนหัวข้อ / ขอหัวข้อแนะนำใหม่ / อยากรู้เรื่องอื่น\n"
-                "- elaborate: ขอให้ขยายความ/อธิบายให้ละเอียดขึ้นโดยตรง (เช่น 'ขยายความ', 'อธิบายเพิ่มหน่อย', 'บอกให้ละเอียดขึ้น') — ต้องเป็นการขอ elaboration อย่างชัดเจน ไม่ใช่การถามแง่มุมใหม่ (เอกสาร/ค่าธรรมเนียม/ขั้นตอน) หรือคำถามเกี่ยวกับธุรกิจ\n"
-                "- legal_question: ถามเรื่องกฎหมาย/ใบอนุญาต/ภาษี/จดทะเบียน/ธุรกิจร้านอาหาร\n"
-                "- greeting: ทักทาย/ขอบคุณ/ปิดบทสนทนา\n"
-                "- unknown: ไม่เกี่ยวกับธุรกิจร้านอาหารและไม่สามารถระบุได้\n\n"
-                "ตอบ JSON เท่านั้น:\n"
-                '{"intent": "new_topic", "query": "", "confidence": 0.9}\n'
-                "- query: ถ้า intent=legal_question ให้ใส่คำถามที่ชัดเจนขึ้น, ไม่งั้นเว้นว่าง"
-            )
+            prompt = build_fallback_intent_prompt(user_text, last_query, persona)
             try:
                 text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/fallback_intent")).strip()
             except Exception:
@@ -971,22 +848,7 @@ class PersonaSupervisor:
         )
 
         def _call(user_text: str, last_topic: str) -> dict:
-            prompt = (
-                "คุณคือ typo-detector สำหรับ AI ผู้ช่วยธุรกิจร้านอาหารไทย\n"
-                "วิเคราะห์ว่า user_text ด้านล่างเป็น 'การพิมพ์ผิด/ตัวอักษรสุ่ม/ไม่มีความหมาย' หรือเป็น 'ข้อความที่มีเจตนาชัดเจน'\n\n"
-                f"user_text: {user_text!r}\n"
-                f"บริบทล่าสุด: {last_topic or '(ยังไม่มี)'}\n\n"
-                "เกณฑ์ is_typo=true:\n"
-                "- อักขระสุ่มที่ไม่ก่อเป็นคำหรือประโยคได้\n"
-                "- อักษรผสมกันไม่ได้ตามหลักภาษาไทย/อังกฤษ\n"
-                "- ดูเหมือนกดแป้นพิมพ์โดยไม่ตั้งใจ\n"
-                "เกณฑ์ is_typo=false:\n"
-                "- มีคำ/ประโยคที่อ่านออกความหมายได้ แม้จะสั้น\n"
-                "- เป็นชื่อ, ตัวเลข, หรือคำย่อที่ใช้บ่อย\n\n"
-                "ตอบ JSON เท่านั้น:\n"
-                '{"is_typo": true, "confidence": 0.92, "suggested": ""}\n'
-                "- suggested: ถ้า is_typo=true แต่พอเดาได้ว่าหมายถึงอะไร ใส่คำนั้น ไม่งั้นเว้นว่าง"
-            )
+            prompt = build_typo_check_prompt(user_text, last_topic)
             try:
                 text = extract_llm_text(llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/typo_check")).strip()
             except Exception:
@@ -1308,7 +1170,7 @@ class PersonaSupervisor:
                 _vstore_mt = getattr(self.retriever, "vectorstore", None)
                 _coll_mt = getattr(_vstore_mt, "_collection", None) if _vstore_mt else None
                 if _coll_mt is not None:
-                    _doc_chars_mt = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 400) or 400)
+                    _doc_chars_mt = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
                     _SUPERVISOR_META_WL_MT = frozenset({
                         "license_type", "operation_topic",
                         "entity_type_normalized", "registration_type", "department",
@@ -1370,7 +1232,7 @@ class PersonaSupervisor:
                         _filt_docs = _filt_result.get("documents") or []
                         _filt_mds = _filt_result.get("metadatas") or []
                         if _filt_docs:
-                            _doc_chars2 = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 400) or 400)
+                            _doc_chars2 = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
                             _SUPERVISOR_META_WL2 = frozenset({
                                 "license_type", "operation_topic", "chunk_type",
                                 "entity_type_normalized", "registration_type", "department",
@@ -1419,7 +1281,7 @@ class PersonaSupervisor:
         docs = self.retriever.invoke(q_expanded)
         results: List[Dict[str, Any]] = []
         top_k = int(getattr(conf, "RETRIEVAL_TOP_K", 15) or 15)
-        _doc_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 400) or 400)
+        _doc_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
         # 🎯 Token: cap long metadata fields before storing — prevent ×N token explosion
         _SUPERVISOR_META_WHITELIST = frozenset({
             "license_type", "operation_topic", "chunk_type",
@@ -2000,6 +1862,28 @@ class PersonaSupervisor:
                         license_type,
                     )
 
+            # ── Rule 2b: area_size metadata field (fallback when Rule 2 skipped) ──
+            # Rule 2 parses registration_type text — misses cases where every doc lists
+            # ALL sizes in one field.  Check the explicit area_size metadata field instead:
+            # if docs have 2+ distinct area_size values, the split is real.
+            if "shop_area_type" not in seen_keys and "area_size" not in seen_keys:
+                area_size_opts: set = set()
+                for md in mds:
+                    as_val = ((md or {}).get("area_size") or "").strip()
+                    if as_val and as_val not in ("nan", "None"):
+                        area_size_opts.add(as_val)
+                if len(area_size_opts) >= 2:
+                    slots.append({
+                        "key": "area_size",
+                        "options": sorted(area_size_opts),
+                        "question": "ร้านของคุณมีพื้นที่เท่าไหร่ครับ?",
+                    })
+                    seen_keys.add("area_size")
+                    _LOG.info(
+                        "[Supervisor] discover_slots[%r]: area_size (metadata) → %s",
+                        license_type, sorted(area_size_opts),
+                    )
+
             # ── Rule 3: standalone registration_type labels (no entity / area noise) ──
             # Collect short, clean labels that survived the two filters above.
             # Skip if the value looks like a combined paragraph (> 80 chars or has bullet •)
@@ -2386,7 +2270,7 @@ class PersonaSupervisor:
                     _vstore_mt2 = getattr(self.retriever, "vectorstore", None)
                     _coll_mt2 = getattr(_vstore_mt2, "_collection", None) if _vstore_mt2 else None
                     if _coll_mt2 is not None:
-                        _doc_chars_mt2 = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 400) or 400)
+                        _doc_chars_mt2 = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
                         _SUPERVISOR_META_WL_MT2 = frozenset({
                             "license_type", "operation_topic",
                             "entity_type_normalized", "registration_type", "department",
@@ -2449,7 +2333,7 @@ class PersonaSupervisor:
                                 where={"license_type": _license_detected},
                                 include=["documents", "metadatas"],
                             )
-                            _max_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 600) or 600)
+                            _max_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
                             _all_docs = [
                                 {"content": (c or "")[:_max_chars], "metadata": m or {}}
                                 for c, m in zip(
@@ -2521,7 +2405,7 @@ class PersonaSupervisor:
                 }
                 _pt_docs: List[Dict[str, Any]] = []
                 _pt_seen: set = set()
-                _pt_doc_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 400) or 400)
+                _pt_doc_chars = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
                 _PT_META_WL = frozenset({
                     "license_type", "operation_topic", "chunk_type",
                     "entity_type_normalized", "registration_type", "department",
@@ -2750,7 +2634,7 @@ class PersonaSupervisor:
                                      if k not in ("entity_type", "operation_group") and v]
                     enriched_q = " ".join(filter(None, [base_q, _op_group_val, _op_prefix or ""] + _slot_q_parts)).strip()
                     try:
-                        _k_for_op = max(int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 4)), 8)
+                        _k_for_op = int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 6))
                         # Build combined filter: entity_type + license_type (if known)
                         _op_meta_filter: dict = {"entity_type_normalized": _saved_entity}
                         if _saved_license:
@@ -2830,7 +2714,7 @@ class PersonaSupervisor:
                     _meta_filter_area = {"entity_type_normalized": _saved_entity2}
 
                 try:
-                    _k_for_area = max(int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 6)), 8)
+                    _k_for_area = int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 6))
                     state.current_docs = self._practical._retrieve_docs(
                         enriched_q_area,
                         metadata_filter=_meta_filter_area,
@@ -2909,7 +2793,7 @@ class PersonaSupervisor:
                                 ]},
                                 include=["documents", "metadatas"],
                             )
-                            _doc_chars_rt = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 400) or 400)
+                            _doc_chars_rt = int(getattr(conf, "LLM_DOC_CHARS_PRACTICAL", 700) or 700)
                             _SUPERVISOR_META_WL_RT = frozenset({
                                 "license_type", "operation_topic", "entity_type_normalized",
                                 "registration_type", "department", "fees", "operation_duration",
@@ -3674,16 +3558,7 @@ class PersonaSupervisor:
             request_timeout=timeout,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
-        topic_list = "\n".join([f"{i+1}. {t}" for i, t in enumerate(topics)])
-        prompt = (
-            "คุณคือ AI ที่ปรึกษาร้านอาหาร สร้างคำอธิบายสั้น 1 ประโยค (ไม่เกิน 20 คำ) สำหรับแต่ละหัวข้อ\n"
-            "โทน: บอกจากมุมบอทว่า ผมจะแนะนำ/สอน/บอกอะไรคุณได้บ้างในหัวข้อนี้\n"
-            "สำคัญ: ใช้เฉพาะข้อมูลที่มีอยู่ในเอกสารด้านล่าง ห้ามสร้างข้อมูลที่ไม่มี\n"
-            "ห้ามขึ้นต้นด้วย 'ถ้าเลือกหัวข้อนี้' หรือ 'ผมจด' หรือ 'ผมทำ'\n\n"
-            f"หัวข้อ:\n{topic_list}\n\n"
-            f"เอกสารอ้างอิง:\n{context_block}"
-            'ตอบ JSON เท่านั้น รูปแบบ: {"descriptions": ["คำอธิบาย1", "คำอธิบาย2"]}'
-        )
+        prompt = build_topic_desc_prompt(topics, context_block)
         try:
             resp = llm_invoke(llm, [HumanMessage(content=prompt)], logger=_LOG, label="Supervisor/topic_desc")
             text = self._strip_code_fences(extract_llm_text(resp).strip())
