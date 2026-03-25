@@ -26,7 +26,13 @@ function escapeHtml(text) {
 }
 
 function textToHtml(text) {
-  return escapeHtml(text).replace(/\n/g, "<br>");
+  // Escape HTML first, then convert URLs to clickable links, then newlines to <br>
+  const escaped = escapeHtml(text);
+  const linked = escaped.replace(
+    /https?:\/\/[^\s&lt;&gt;"]+/g,
+    url => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`
+  );
+  return linked.replace(/\n/g, "<br>");
 }
 
 function formatTime(unixSeconds) {
@@ -200,9 +206,9 @@ function createStreamingBubble() {
       <div class="message-bubble-wrap">
         <div class="message-role">RESTBIZ</div>
         <div class="message-bubble">
-          <span class="typing-cursor">▋</span>
-          <span class="wait-timer"> 0s</span>
+          <span class="typing-cursor">○</span>
         </div>
+        <span class="wait-timer">0s</span>
       </div>
     </div>
   `;
@@ -215,12 +221,15 @@ function createStreamingBubble() {
   let seconds = 0;
   const intervalId = setInterval(() => {
     seconds++;
-    if (timerEl) timerEl.textContent = ` ${seconds}s`;
+    if (timerEl) timerEl.textContent = `${seconds}s`;
   }, 1000);
 
   function stopTimer() {
     clearInterval(intervalId);
-    if (timerEl) timerEl.remove();
+    if (timerEl) {
+      timerEl.textContent = `⏱ ${seconds}s`;
+      timerEl.className = "think-time";
+    }
   }
 
   return { row, bubble, stopTimer };

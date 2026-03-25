@@ -1,0 +1,362 @@
+{
+  "timestamp": "2026-03-17T08:34:55.228066",
+  "num_rounds": 2,
+  "total_cases": 9,
+  "overall_pass_rate_pct": 100.0,
+  "grand_elapsed_seconds": 991.77,
+  "total_cost_usd": 0.0,
+  "cost_per_round_usd": 0.0,
+  "cases": [
+    {
+      "id": "P1",
+      "name": "Practical – Greeting→Answer",
+      "category": "practical",
+      "pass_rate_pct": 100.0,
+      "risk": "🟢 STABLE",
+      "avg_elapsed_s": 43.75,
+      "std_elapsed_s": 0.4,
+      "avg_tokens": 0,
+      "avg_cost_usd": 0.0,
+      "runs": [
+        {
+          "round": 1,
+          "elapsed": 43.349016,
+          "passed": true,
+          "skipped": true,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 3,
+          "error_msg": ""
+        },
+        {
+          "round": 2,
+          "elapsed": 44.143075,
+          "passed": true,
+          "skipped": true,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 3,
+          "error_msg": ""
+        }
+      ]
+    },
+    {
+      "id": "P2",
+      "name": "Practical – Back Navigation",
+      "category": "practical",
+      "pass_rate_pct": 100.0,
+      "risk": "🟢 STABLE",
+      "avg_elapsed_s": 57.33,
+      "std_elapsed_s": 0.33,
+      "avg_tokens": 0,
+      "avg_cost_usd": 0.0,
+      "runs": [
+        {
+          "round": 1,
+          "elapsed": 57.004518,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 4,
+          "error_msg": ""
+        },
+        {
+          "round": 2,
+          "elapsed": 57.655628,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 4,
+          "error_msg": ""
+        }
+      ]
+    },
+    {
+      "id": "P3",
+      "name": "Practical – Follow-up Questions",
+      "category": "practical",
+      "pass_rate_pct": 100.0,
+      "risk": "🟢 STABLE",
+      "avg_elapsed_s": 85.72,
+      "std_elapsed_s": 1.48,
+      "avg_tokens": 0,
+      "avg_cost_usd": 0.0,
+      "runs": [
+        {
+          "round": 1,
+          "elapsed": 87.201286,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 5,
+          "error_msg": ""
+        },
+        {
+          "round": 2,
+          "elapsed": 84.237067,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 5,
+          "error_msg": ""
+        }
+      ]
+    },
+    {
+      "id": "A1",
+      "name": "Academic – Full Flow",
+      "category": "academic",
+      "pass_rate_pct": 100.0,
+      "risk": "🟢 STABLE",
+      "avg_elapsed_s": 38.55,
+      "std_elapsed_s": 0.57,
+      "avg_tokens": 0,
+      "avg_cost_usd": 0.0,
+      "runs": [
+        {
+          "round": 1,
+          "elapsed": 39.121026,
+          "passed": true,
+          "skipped": true,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 3,
+          "error_msg": ""
+        },
+        {
+          "round": 2,
+          "elapsed": 37.987803,
+          "passed": true,
+          "skipped": true,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 3,
+          "error_msg": ""
+        }
+      ]
+    },
+    {
+      "id": "A2",
+      "name": "Academic – Back to Section Selection",
+      "category": "academic",
+      "pass_rate_pct": 100.0,
+      "risk": "🟢 STABLE",
+      "avg_elapsed_s": 75.06,
+      "std_elapsed_s": 0.01,
+      "avg_tokens": 0,
+      "avg_cost_usd": 0.0,
+      "runs": [
+        {
+          "round": 1,
+          "elapsed": 75.048567,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 5,
+          "error_msg": ""
+        },
+        {
+          "round": 2,
+          "elapsed": 75.070036,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 5,
+          "error_msg": ""
+        }
+      ]
+    },
+    {
+      "id": "A3",
+      "name": "Academic – Auto Return to Practical",
+      "category": "academic",
+      "pass_rate_pct": 100.0,
+      "risk": "🟢 STABLE",
+      "avg_elapsed_s": 80.56,
+      "std_elapsed_s": 0.56,
+      "avg_tokens": 0,
+      "avg_cost_usd": 0.0,
+      "runs": [
+        {
+          "round": 1,
+          "elapsed": 81.116535,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 5,
+          "error_msg": ""
+        },
+        {
+          "round": 2,
+          "elapsed": 79.999011,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 5,
+          "error_msg": ""
+        }
+      ]
+    },
+    {
+      "id": "E1",
+      "name": "Edge – Gibberish Input",
+      "category": "edge",
+      "pass_rate_pct": 100.0,
+      "risk": "🟢 STABLE",
+      "avg_elapsed_s": 38.32,
+      "std_elapsed_s": 0.42,
+      "avg_tokens": 0,
+      "avg_cost_usd": 0.0,
+      "runs": [
+        {
+          "round": 1,
+          "elapsed": 38.738607,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 0,
+          "turns": 2,
+          "error_msg": ""
+        },
+        {
+          "round": 2,
+          "elapsed": 37.896567,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 0,
+          "turns": 2,
+          "error_msg": ""
+        }
+      ]
+    },
+    {
+      "id": "E2",
+      "name": "Edge – Very Long Question",
+      "category": "edge",
+      "pass_rate_pct": 100.0,
+      "risk": "🟢 STABLE",
+      "avg_elapsed_s": 33.65,
+      "std_elapsed_s": 0.55,
+      "avg_tokens": 0,
+      "avg_cost_usd": 0.0,
+      "runs": [
+        {
+          "round": 1,
+          "elapsed": 33.09958,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 2,
+          "error_msg": ""
+        },
+        {
+          "round": 2,
+          "elapsed": 34.205825,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 1,
+          "turns": 2,
+          "error_msg": ""
+        }
+      ]
+    },
+    {
+      "id": "E3",
+      "name": "Edge – Mixed Thai/English",
+      "category": "edge",
+      "pass_rate_pct": 100.0,
+      "risk": "🟢 STABLE",
+      "avg_elapsed_s": 42.95,
+      "std_elapsed_s": 0.15,
+      "avg_tokens": 0,
+      "avg_cost_usd": 0.0,
+      "runs": [
+        {
+          "round": 1,
+          "elapsed": 43.097229,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 0,
+          "turns": 2,
+          "error_msg": ""
+        },
+        {
+          "round": 2,
+          "elapsed": 42.794444,
+          "passed": true,
+          "skipped": false,
+          "prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0,
+          "cost_usd": 0.0,
+          "max_docs": 0,
+          "turns": 2,
+          "error_msg": ""
+        }
+      ]
+    }
+  ]
+}

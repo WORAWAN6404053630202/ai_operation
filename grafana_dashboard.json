@@ -1,0 +1,248 @@
+# Grafana Dashboard Configuration
+# Import this JSON into Grafana to create the Thai Regulatory AI dashboard
+
+{
+  "dashboard": {
+    "title": "Thai Regulatory AI - Production Metrics",
+    "tags": ["ai", "llm", "production"],
+    "timezone": "Asia/Bangkok",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Request Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(http_requests_total[5m])",
+            "legendFormat": "{{method}} {{endpoint}}"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "requests/sec",
+            "format": "short"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Request Duration (p95)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
+            "legendFormat": "{{method}} {{endpoint}}"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "seconds",
+            "format": "s"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "LLM Calls (Total)",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "sum(llm_calls_total)",
+            "legendFormat": "Total Calls"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "LLM Call Duration",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(llm_call_duration_seconds_bucket[5m]))",
+            "legendFormat": "{{model}} - {{persona}} (p95)"
+          },
+          {
+            "expr": "histogram_quantile(0.50, rate(llm_call_duration_seconds_bucket[5m]))",
+            "legendFormat": "{{model}} - {{persona}} (p50)"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "LLM Token Usage",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(llm_tokens_total{token_type=\"prompt\"}[5m])",
+            "legendFormat": "Prompt Tokens - {{model}}"
+          },
+          {
+            "expr": "rate(llm_tokens_total{token_type=\"completion\"}[5m])",
+            "legendFormat": "Completion Tokens - {{model}}"
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "LLM Cost (Hourly)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "increase(llm_cost_total[1h])",
+            "legendFormat": "{{model}}"
+          }
+        ],
+        "yaxes": [
+          {
+            "label": "USD",
+            "format": "currencyUSD"
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Cache Hit Rate",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "cache_hit_rate",
+            "legendFormat": "Hit Rate"
+          }
+        ],
+        "options": {
+          "reduceOptions": {
+            "values": false,
+            "calcs": ["lastNotNull"]
+          },
+          "showThresholdLabels": false,
+          "showThresholdMarkers": true
+        },
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            {"value": 0, "color": "red"},
+            {"value": 0.5, "color": "yellow"},
+            {"value": 0.8, "color": "green"}
+          ]
+        }
+      },
+      {
+        "id": 8,
+        "title": "Cache Operations",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(cache_operations_total{result=\"hit\"}[5m])",
+            "legendFormat": "Cache Hits"
+          },
+          {
+            "expr": "rate(cache_operations_total{result=\"miss\"}[5m])",
+            "legendFormat": "Cache Misses"
+          }
+        ]
+      },
+      {
+        "id": 9,
+        "title": "Vector Query Performance",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(vector_query_duration_seconds_bucket[5m]))",
+            "legendFormat": "p95"
+          },
+          {
+            "expr": "histogram_quantile(0.50, rate(vector_query_duration_seconds_bucket[5m]))",
+            "legendFormat": "p50"
+          }
+        ]
+      },
+      {
+        "id": 10,
+        "title": "Active Sessions",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "sessions_active",
+            "legendFormat": "Active Sessions"
+          }
+        ]
+      },
+      {
+        "id": 11,
+        "title": "Conversations by Persona",
+        "type": "piechart",
+        "targets": [
+          {
+            "expr": "sum by (persona) (conversations_total)",
+            "legendFormat": "{{persona}}"
+          }
+        ]
+      },
+      {
+        "id": 12,
+        "title": "Error Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(llm_errors_total[5m])",
+            "legendFormat": "{{model}} - {{error_type}}"
+          }
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {
+                "params": [0.01],
+                "type": "gt"
+              },
+              "operator": {
+                "type": "and"
+              },
+              "query": {
+                "params": ["A", "5m", "now"]
+              },
+              "reducer": {
+                "params": [],
+                "type": "avg"
+              },
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "frequency": "1m",
+          "handler": 1,
+          "name": "High Error Rate Alert",
+          "noDataState": "no_data",
+          "notifications": []
+        }
+      },
+      {
+        "id": 13,
+        "title": "Database Connections",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "database_connections_active",
+            "legendFormat": "Active Connections"
+          }
+        ]
+      },
+      {
+        "id": 14,
+        "title": "Messages per Session (Distribution)",
+        "type": "heatmap",
+        "targets": [
+          {
+            "expr": "messages_per_session",
+            "legendFormat": "Messages"
+          }
+        ]
+      }
+    ],
+    "refresh": "10s",
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    }
+  }
+}

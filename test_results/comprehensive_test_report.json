@@ -1,0 +1,375 @@
+{
+  "timestamp": "2026-03-17T00:51:37.918578",
+  "summary": {
+    "total_tests": 11,
+    "passed": 9,
+    "failed": 0,
+    "skipped": 2,
+    "total_time_seconds": 536.47,
+    "total_prompt_tokens": 35089,
+    "total_completion_tokens": 8303,
+    "estimated_cost_usd": 0.047998
+  },
+  "tests": [
+    {
+      "name": "Practical Greeting to Answer",
+      "category": "practical",
+      "passed": true,
+      "skipped": false,
+      "elapsed_seconds": 62.63,
+      "metrics": {
+        "turns": [
+          {
+            "turn": 1,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 2,
+            "prompt_delta": 6569,
+            "completion_delta": 1237,
+            "total_delta": 7806
+          },
+          {
+            "turn": 3,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          }
+        ],
+        "total_tokens_used": 7806,
+        "total_prompt_tokens": 6569,
+        "total_completion_tokens": 1237,
+        "total_docs": 1,
+        "flow_correctness": "passed"
+      }
+    },
+    {
+      "name": "Practical Back Navigation",
+      "category": "practical",
+      "passed": true,
+      "skipped": false,
+      "elapsed_seconds": 35.8,
+      "metrics": {
+        "turns": [
+          {
+            "turn": 1,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 2,
+            "prompt_delta": 3239,
+            "completion_delta": 357,
+            "total_delta": 3596
+          },
+          {
+            "turn": 3,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          }
+        ],
+        "total_tokens_used": 3596,
+        "total_prompt_tokens": 3239,
+        "total_completion_tokens": 357,
+        "total_docs": 1,
+        "flow_correctness": "passed"
+      }
+    },
+    {
+      "name": "Practical Follow-up",
+      "category": "practical",
+      "passed": true,
+      "skipped": false,
+      "elapsed_seconds": 98.95,
+      "metrics": {
+        "turns": [
+          {
+            "turn": 1,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 2,
+            "prompt_delta": 3081,
+            "completion_delta": 701,
+            "total_delta": 3782
+          },
+          {
+            "turn": 3,
+            "prompt_delta": 2936,
+            "completion_delta": 541,
+            "total_delta": 3477
+          },
+          {
+            "turn": 4,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 5,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          }
+        ],
+        "total_tokens_used": 7259,
+        "total_prompt_tokens": 6017,
+        "total_completion_tokens": 1242,
+        "total_docs": 1,
+        "flow_correctness": "passed"
+      }
+    },
+    {
+      "name": "Academic Full Flow",
+      "category": "academic",
+      "passed": true,
+      "skipped": false,
+      "elapsed_seconds": 51.43,
+      "metrics": {
+        "turns": [
+          {
+            "turn": 1,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 2,
+            "prompt_delta": 1304,
+            "completion_delta": 332,
+            "total_delta": 1636
+          },
+          {
+            "turn": 3,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 4,
+            "prompt_delta": 1089,
+            "completion_delta": 1760,
+            "total_delta": 2849
+          }
+        ],
+        "total_tokens_used": 4485,
+        "total_prompt_tokens": 2393,
+        "total_completion_tokens": 2092,
+        "total_docs": 1,
+        "flow_correctness": "passed"
+      }
+    },
+    {
+      "name": "Academic Back to Section Selection",
+      "category": "academic",
+      "passed": true,
+      "skipped": false,
+      "elapsed_seconds": 63.43,
+      "metrics": {
+        "turns": [
+          {
+            "turn": 1,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 2,
+            "prompt_delta": 1314,
+            "completion_delta": 175,
+            "total_delta": 1489
+          },
+          {
+            "turn": 3,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 4,
+            "prompt_delta": 1036,
+            "completion_delta": 823,
+            "total_delta": 1859
+          },
+          {
+            "turn": 5,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          }
+        ],
+        "total_tokens_used": 3348,
+        "total_prompt_tokens": 2350,
+        "total_completion_tokens": 998,
+        "total_docs": 1,
+        "flow_correctness": "passed"
+      }
+    },
+    {
+      "name": "Academic Auto Return to Practical",
+      "category": "academic",
+      "passed": true,
+      "skipped": false,
+      "elapsed_seconds": 73.92,
+      "metrics": {
+        "turns": [
+          {
+            "turn": 1,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 2,
+            "prompt_delta": 1314,
+            "completion_delta": 394,
+            "total_delta": 1708
+          },
+          {
+            "turn": 3,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 4,
+            "prompt_delta": 1036,
+            "completion_delta": 916,
+            "total_delta": 1952
+          },
+          {
+            "turn": 5,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          }
+        ],
+        "total_tokens_used": 3660,
+        "total_prompt_tokens": 2350,
+        "total_completion_tokens": 1310,
+        "total_docs": 1,
+        "flow_correctness": "passed"
+      }
+    },
+    {
+      "name": "Edge: Gibberish Input",
+      "category": "edge",
+      "passed": true,
+      "skipped": false,
+      "elapsed_seconds": 46.96,
+      "metrics": {
+        "turns": [
+          {
+            "turn": 1,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 2,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          }
+        ],
+        "total_tokens_used": 0,
+        "total_prompt_tokens": 0,
+        "total_completion_tokens": 0,
+        "total_docs": 0,
+        "flow_correctness": "passed"
+      }
+    },
+    {
+      "name": "Edge: Very Long Question",
+      "category": "edge",
+      "passed": true,
+      "skipped": false,
+      "elapsed_seconds": 49.21,
+      "metrics": {
+        "turns": [
+          {
+            "turn": 1,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 2,
+            "prompt_delta": 9045,
+            "completion_delta": 554,
+            "total_delta": 9599
+          }
+        ],
+        "total_tokens_used": 9599,
+        "total_prompt_tokens": 9045,
+        "total_completion_tokens": 554,
+        "total_docs": 1,
+        "flow_correctness": "passed"
+      }
+    },
+    {
+      "name": "Edge: Mixed Thai English",
+      "category": "edge",
+      "passed": true,
+      "skipped": false,
+      "elapsed_seconds": 35.32,
+      "metrics": {
+        "turns": [
+          {
+            "turn": 1,
+            "prompt_delta": 0,
+            "completion_delta": 0,
+            "total_delta": 0
+          },
+          {
+            "turn": 2,
+            "prompt_delta": 3126,
+            "completion_delta": 513,
+            "total_delta": 3639
+          }
+        ],
+        "total_tokens_used": 3639,
+        "total_prompt_tokens": 3126,
+        "total_completion_tokens": 513,
+        "total_docs": 1,
+        "flow_correctness": "passed"
+      }
+    },
+    {
+      "name": "Quality: RAGAS Faithfulness",
+      "category": "quality",
+      "passed": true,
+      "skipped": true,
+      "elapsed_seconds": 10.08,
+      "metrics": {
+        "turns": [],
+        "total_tokens_used": 0,
+        "total_prompt_tokens": 0,
+        "total_completion_tokens": 0,
+        "total_docs": 0,
+        "flow_correctness": "skipped"
+      }
+    },
+    {
+      "name": "Quality: BERTScore Similarity",
+      "category": "quality",
+      "passed": true,
+      "skipped": true,
+      "elapsed_seconds": 8.75,
+      "metrics": {
+        "turns": [],
+        "total_tokens_used": 0,
+        "total_prompt_tokens": 0,
+        "total_completion_tokens": 0,
+        "total_docs": 0,
+        "flow_correctness": "skipped"
+      }
+    }
+  ]
+}
