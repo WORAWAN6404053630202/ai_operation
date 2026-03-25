@@ -186,11 +186,19 @@ class ConversationState(BaseModel):
         self.context["collected_slots"] = slots
 
     def get_collected_slots(self) -> Dict[str, str]:
-        """Return all cross-persona collected slots (key→value map)."""
+        """Return all cross-persona collected slots (key→value map).
+        Merges collected_slots and context['slots'] so entity_type stored via
+        Practical's slot-queue mechanism is always visible."""
         raw = (self.context or {}).get("collected_slots")
-        if isinstance(raw, dict):
-            return {str(k): str(v) for k, v in raw.items() if k and v}
-        return {}
+        cs = {str(k): str(v) for k, v in (raw or {}).items() if k and v} if isinstance(raw, dict) else {}
+        # Also include context["slots"] entries for identity keys that may not have been
+        # saved via save_collected_slot (e.g. entity_type stored by Practical auto-skip)
+        ctx_slots = (self.context or {}).get("slots")
+        if isinstance(ctx_slots, dict):
+            for k, v in ctx_slots.items():
+                if k and v and str(k).strip() not in cs:
+                    cs[str(k).strip()] = str(v).strip()
+        return cs
 
     def get_collected_slot(self, key: str) -> Optional[str]:
         """Return a single slot value, or None if not collected yet."""

@@ -1508,9 +1508,15 @@ class PersonaSupervisor:
             return
 
         # Filter out already-collected slots
+        # Check BOTH collected_slots (save_collected_slot) AND context["slots"] (Practical's
+        # slot-queue mechanism stores answers there too) so we never re-ask slots already known.
         try:
-            collected_keys = set((state.get_collected_slots() or {}).keys())
+            _cs_lq = state.get_collected_slots() or {}
+            _ctx_slots_lq = (state.context or {}).get("slots") or {}
+            collected_keys = set(_cs_lq.keys()) | set(_ctx_slots_lq.keys())
         except Exception:
+            _cs_lq = {}
+            _ctx_slots_lq = {}
             collected_keys = set()
         remaining = [s for s in all_slots if s["key"] not in collected_keys]
 
@@ -1521,7 +1527,8 @@ class PersonaSupervisor:
         # and apply entity-specific filtering + enriched retrieval + op_group slot
         _known_entity_lq: Optional[str] = None
         if "entity_type" in collected_keys:
-            _raw_et_lq = (state.get_collected_slots() or {}).get("entity_type", "")
+            # Look in both stores
+            _raw_et_lq = _cs_lq.get("entity_type") or _ctx_slots_lq.get("entity_type") or ""
             try:
                 from service.data_loader import DataLoader as _DL_lq
                 _known_entity_lq = _DL_lq._normalize_entity_type(_raw_et_lq)
@@ -2695,7 +2702,9 @@ class PersonaSupervisor:
             # (e.g. entity_type answered in previous topic → don't ask again)
             if _slot_queue:
                 try:
-                    _prev_slots = state.get_collected_slots() or {}
+                    _prev_slots_cs = state.get_collected_slots() or {}
+                    _prev_slots_ctx = (state.context or {}).get("slots") or {}
+                    _prev_slots = {**_prev_slots_ctx, **_prev_slots_cs}  # collected_slots wins
                 except Exception:
                     _prev_slots = {}
 
@@ -3108,9 +3117,11 @@ class PersonaSupervisor:
                             break
                     if _license_type_for_area:
                         _all_slots = self._discover_slots_for_license(_license_type_for_area)
-                        # Remove slots already collected
+                        # Remove slots already collected (check both collected_slots and context["slots"])
                         try:
-                            _collected_keys = set((state.get_collected_slots() or {}).keys())
+                            _cs_area = state.get_collected_slots() or {}
+                            _ctx_slots_area = (state.context or {}).get("slots") or {}
+                            _collected_keys = set(_cs_area.keys()) | set(_ctx_slots_area.keys())
                         except Exception:
                             _collected_keys = set()
                         _remaining = [s for s in _all_slots if s["key"] not in _collected_keys]

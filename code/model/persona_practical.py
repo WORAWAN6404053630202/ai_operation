@@ -1984,6 +1984,8 @@ Your JSON response:
                         )
                         _slots = state.context.setdefault("slots", {})
                         _slots[slot_key] = _known_val
+                        # Sync to collected_slots so cross-topic memory is consistent
+                        state.save_collected_slot(slot_key, _known_val)
                         _slot_queue = remaining_queue
                         if _slot_queue:
                             state.context["topic_slot_queue"] = _slot_queue
@@ -2064,6 +2066,8 @@ Your JSON response:
                         )
                         _slots = state.context.setdefault("slots", {})
                         _slots[slot_key] = _already_known
+                        # Sync to collected_slots (in case it was only in context["slots"])
+                        state.save_collected_slot(slot_key, _already_known)
                         # Re-invoke handle() with auto-fill guard to produce a real answer
                         state.context["_autofill_guard"] = True
                         _result = self.handle(state, _already_known, _internal=True)
