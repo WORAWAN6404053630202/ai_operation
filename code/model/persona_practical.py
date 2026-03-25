@@ -164,6 +164,8 @@ _LLM_METADATA_WHITELIST = frozenset({
     "research_reference",      # ลิงก์แบบฟอร์ม / คู่มือ / เว็บไซต์ราชการ
     "operation_steps",         # ขั้นตอนการดำเนินการ (สำคัญ — content อาจถูกตัดก่อนถึงส่วนนี้)
     "identification_documents",# รายการเอกสารที่ต้องใช้ (สำคัญ — ต้องเห็นทั้งหมด)
+    "legal_regulatory",        # ข้อกำหนดทางกฎหมาย บทลงโทษ ค่าปรับ
+    "terms_and_conditions",    # เงื่อนไขและหน้าที่ของผู้ประกอบการ
 })
 
 # P0: practical policy "last gate"
@@ -839,14 +841,17 @@ class PracticalPersonaService:
         pairs.sort(key=lambda x: x[0])
         return [lbl for _, lbl in pairs][:max_items]
 
-    def _infer_slot_key_from_question(self, question: str) -> str:
+    def _infer_slot_key_from_question(self, question: str, options: list | None = None) -> str:
         q = self._normalize_for_intent(question)
+        opts_combined = " ".join(str(o) for o in (options or []))
         # Location check FIRST — จังหวัด/เขต are strong signals for location, not area size
         if "จังหวัด" in q or ("เขต" in q and "พื้นที่" not in q) or "เทศบาล" in q:
             return "location_scope"
         if "ตารางเมตร" in q or ("พื้นที่" in q and "จังหวัด" not in q):
             return "area_size"
-        if "บุคคลธรรมดา" in q or "นิติบุคคล" in q or "นิติ" in q:
+        # Check question text OR options for entity_type signals
+        if ("บุคคลธรรมดา" in q or "นิติบุคคล" in q or "นิติ" in q
+                or "บุคคลธรรมดา" in opts_combined or "นิติบุคคล" in opts_combined):
             return "entity_type"
         if "ขายสุรา" in q or "แอลกอฮอล์" in q:
             return "alcohol_business"
@@ -1261,12 +1266,15 @@ class PracticalPersonaService:
             "fees", "operation_duration", "service_channel",
             "research_reference", "operation_steps", "identification_documents",
             "operation_group",
+            "legal_regulatory",     # บทลงโทษ ค่าปรับ ข้อกำหนดทางกฎหมาย
+            "terms_and_conditions", # หน้าที่และเงื่อนไขของผู้ประกอบการ
         })
         _STORE_FIELD_CAPS = {
             # Must be >= the per-field caps used in the handle() prompt loop below,
             # otherwise the storage cut dominates and the prompt cap has no effect.
             "operation_steps": 1000, "identification_documents": 700,
             "research_reference": 3100, "fees": 500, "service_channel": 500,
+            "legal_regulatory": 2000, "terms_and_conditions": 800,
         }
         results: List[Dict[str, Any]] = []
         for d in docs[:max_docs]:
@@ -1646,6 +1654,8 @@ class PracticalPersonaService:
             "fees": 500,
             "operation_duration": 200,
             "service_channel": 500,
+            "legal_regulatory": 2000,      # บทลงโทษ — ข้อมูลจริงยาว ~2000 chars
+            "terms_and_conditions": 800,   # เงื่อนไขผู้ประกอบการ
         }
         _LONG_FIELDS_DEDUP = {"operation_steps", "identification_documents"}
 
@@ -1733,7 +1743,7 @@ class PracticalPersonaService:
                 return f"- {desc}\n  {url}"
             return f"- {url or desc}"
 
-        # Guide links shown only when user explicitly requests links/manuals
+        # Links: inject ตาม intent ของ user เท่านั้น ไม่ inject ทุก section ตลอดเวลา
         _user_wants_links = bool(re.search(
             r"(ขอลิงค์|ขอลิงก์|ส่งลิงค์|ส่งลิงก์|ลิงค์คู่มือ|ลิงก์คู่มือ"
             r"|ขอดูลิงค์|ขอดูลิงก์|URL|ดาวน์โหลด"
@@ -1741,12 +1751,28 @@ class PracticalPersonaService:
             r"|ขอแบบฟอร์ม|ส่งแบบฟอร์ม)",
             user_text or "", re.IGNORECASE,
         ))
+        # Service/registration links: เฉพาะตอน user ถามเรื่องการสมัคร/ลงทะเบียน
+        _user_wants_registration = bool(re.search(
+            r"(สมัคร|ลงทะเบียน|ยื่นขอ|จดทะเบียน|ขอใบ|อยากจด|ต้องการจด"
+            r"|ขั้นตอน(การ|ใน)|วิธี(จด|สมัคร|ยื่น)|ต้องทำยังไง"
+            r"|ลิ้งค์.{0,6}(สมัคร|ลงทะเบียน|กรอก|ไฟล์|API|form)"
+            r"|ลิงค์.{0,6}(สมัคร|ลงทะเบียน|กรอก|ไฟล์|API|form)"
+            r"|link.{0,6}(register|apply|form|sign.?up))",
+            user_text or "", re.IGNORECASE,
+        ))
+        # Form links: เฉพาะตอน user ถามเรื่องเอกสาร/แบบฟอร์ม
+        _user_wants_forms = bool(re.search(
+            r"(แบบฟอร์ม|เอกสาร.{0,8}(ใช้|ที่ต้อง|ต้องใช้)|ต้องใช้.{0,8}เอกสาร"
+            r"|ลิ้งค์.{0,6}(เอกสาร|ฟอร์ม|คำขอ)"
+            r"|link.{0,6}(document|form|template))",
+            user_text or "", re.IGNORECASE,
+        ))
 
         _link_section = ""
-        if _link_service:
+        if _link_service and _user_wants_registration:
             _link_section += "\n🌐 SERVICE_LINKS — copy เหล่านี้ตรงๆ under section '🌐 เว็บลงทะเบียน':\n"
             _link_section += "\n".join(_fmt_prac_link(d, u) for d, u in _link_service) + "\n"
-        if _link_form:
+        if _link_form and (_user_wants_forms or _user_wants_registration):
             _link_section += "\n📄 FORM_LINKS — copy เหล่านี้ตรงๆ under section '📄 แบบฟอร์ม':\n"
             _link_section += "\n".join(_fmt_prac_link(d, u) for d, u in _link_form) + "\n"
         if _link_guide and _user_wants_links:
@@ -2002,7 +2028,7 @@ Your JSON response:
                     elif _inferred_key_check == "location_scope":
                         parsed_opts = ["กรุงเทพฯ", "ต่างจังหวัด"]
                 if parsed_opts:
-                    slot_key = self._infer_slot_key_from_question(question)
+                    slot_key = self._infer_slot_key_from_question(question, options=parsed_opts)
                     allow_multi = True if slot_key == self._PHASE3_SLOT_KEY else False
 
                     # ── AUTO-FILL: if this slot was already answered in an earlier topic,

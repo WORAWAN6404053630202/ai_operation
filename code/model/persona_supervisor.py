@@ -203,18 +203,41 @@ class PersonaSupervisor:
     _LIKELY_SELECTION_RE = re.compile(r"^\s*[\d\s,/-]+\s*$")
 
     _QUESTION_MARKERS_RE = re.compile(
-        r"(\?|\bไหม\b|หรือไม่|หรือเปล่า|ยังไง|ทำไง|อย่างไร|ได้ไหม|ควร|ต้อง|คืออะไร)",
+        r"(\?|\bไหม\b|หรือไม่|หรือเปล่า|ยังไง|ทำไง|อย่างไร|ได้ไหม|ควร|ต้อง|คืออะไร"
+        r"|วิธีการ|วิธี(?!ีเดียว|ีชีวิต))",
         re.IGNORECASE,
     )
 
     _LEGAL_SIGNAL_RE = re.compile(
         r"(ใบอนุญาต|จดทะเบียน|ทะเบียนพาณิชย์|ภาษี|vat|ภพ\.?20|สรรพากร|เทศบาล|สำนักงานเขต|สุขาภิบาล|กรม|ค่าธรรมเนียม|เอกสาร|ขั้นตอน|บทลงโทษ|ประกาศ|พ\.ร\.บ|ประกันสังคม|กองทุน|เปิดร้าน|ขึ้นทะเบียน"
-        r"|qr.?pay|qr.?payment|คิวอาร์|คิวอาเพย|เพย์เมนต์|edc|รูดบัตร|merchant.?id|partner.?id|pos.?id|ระบบชำระเงิน|กสิกร|kbank|ไทยพาณิชย์|scb|ประกอบกิจการ|สุขาภิบาลอาหาร)",
+        r"|qr.?pay|qr.?payment|คิวอาร์|คิวอาเพย|เพย์เมนต์|edc|รูดบัตร|merchant.?id|partner.?id|pos.?id|ระบบชำระเงิน|กสิกร|kbank|ไทยพาณิชย์|scb|ประกอบกิจการ|สุขาภิบาลอาหาร"
+        # Domain entities: company/business types (จดทะเบียน/หุ้น/ห้างฯ all in-scope)
+        r"|หุ้น|นิติบุคคล|บุคคลธรรมดา|บริษัท|มหาชนจำกัด|ห้างหุ้นส่วน|พาณิชยกิจ"
+        # Shop/business operations (in-scope topics about running the business)
+        r"|ร้านค้า|กิจการ|พนักงาน"
+        # Payment / banking topics (QR, refund, mobile banking changes)
+        r"|บัญชีธนาคาร|คืนเงิน|ยกเลิกบิล|ยกเลิกใช้บริการ|refund|wechat"
+        # Document/meeting terms in business registration context
+        r"|หนังสือนัดประชุม|บริคณห์|มอบฉันทะ|มาตรฐานร้านอาหาร|san\b"
+        # Remaining generic operational topics (สุรา/ภาษี context: ชื่อและที่อยู่, เพิ่ม/ลด, สำนักงาน, เบอร์)
+        r"|สำนักงาน|เบอร์มือถือ|แก้ไขเปลี่ยนแปลง|ชื่อและที่อยู่|เพิ่ม.*ลด|ลด.*เพิ่ม|ประเภทสินค้า|จำนวนชื่อ"
+        # Sub-step/case phrases in registration procedures (กรณีเลือก... etc.)
+        r"|กรณี)",
         re.IGNORECASE,
     )
 
     _NOISE_ONLY_RE = re.compile(r"^(?:[a-z]+|[!?.]+)$", re.IGNORECASE)
     _TH_LAUGH_5_RE = re.compile(r"^\s*5{3,}\s*$")
+
+    # Depth/detail requests — signals user wants more elaboration on current topic.
+    # These must NOT be deflected by 2.2c and must be routed to Academic persona.
+    _DEPTH_DETAIL_RE = re.compile(
+        r"(แบบละเอียด|ละเอียดกว่า|ละเอียดหน่อย|ละเอียดขึ้น|เชิงลึก|แบบเต็ม"
+        r"|ครบถ้วน|ทั้งหมดเลย|แบบวิชาการ|อธิบายละเอียด|แบบเต็มๆ"
+        r"|ขอดูแบบละเอียด|ขอรายละเอียด|อธิบายเพิ่ม|อธิบายต่อ|อธิบายให้ชัดเจนขึ้น"
+        r"|ขอเพิ่มเติม|ดูเพิ่มเติม|รายละเอียดเพิ่ม|แบบให้ลึกซึ้งยิ่งขึ้น)",
+        re.IGNORECASE,
+    )
 
     # Follow-up patterns (handled before fallback_safe_return)
     _ELABORATE_RE = re.compile(
@@ -1345,10 +1368,13 @@ class PersonaSupervisor:
             "license_type", "operation_topic", "chunk_type",
             "entity_type_normalized", "registration_type", "department",
             "fees", "operation_duration", "service_channel",
+            "legal_regulatory",     # บทลงโทษ ค่าปรับ ข้อกำหนดทางกฎหมาย
+            "terms_and_conditions", # หน้าที่และเงื่อนไขของผู้ประกอบการ
         })
         _SUPERVISOR_FIELD_CAPS = {
             "operation_steps": 600, "identification_documents": 700,
             "research_reference": 3200, "fees": 120, "service_channel": 200,
+            "legal_regulatory": 2000, "terms_and_conditions": 800,
         }
         for d in (docs or [])[:top_k]:
             raw_md = getattr(d, "metadata", {}) or {}
@@ -1374,9 +1400,13 @@ class PersonaSupervisor:
         r"(ประเภทใด|ประเภทไหน|อะไรบ้าง|คืออะไร|หมายถึงอะไร|"
         r"ใครบ้าง|เงื่อนไข|ข้อยกเว้น|ยกเว้น|ไม่ต้อง|ไม่จำเป็น|"
         r"ต้อง.{0,15}(ไหม|มั้ย|หรือเปล่า|หรือไม่)|"
+        r"ต้องทำ(ยังไง|ไง|อย่างไร|อะไร)|ทำ(ยังไง|ไง|อย่างไร)(?!\s*(การ|ธุรกิจ|บัตร))|"
         r"แตกต่าง|เปรียบเทียบ|อธิบาย|กรณีใด|เมื่อไหร่|เมื่อไร|"
         r"จะเกิดอะไร|เกิดอะไร|จะเป็นอะไร|จะเกิดผล|"
-        r"ต้องโดน|จะถูก|จะมีผล|บทลงโทษ|โทษคือ|ค่าปรับ)",
+        r"ต้องโดน|จะถูก|จะมีผล|บทลงโทษ|โทษคือ|ค่าปรับ|"
+        r"ชำรุด|สูญหาย|ทำหาย|ทำหล่น|เสียหาย|"
+        r"ต้องการติดต่อ|ติดต่อได้ที่|ติดต่อที่ไหน|ติดต่อยังไง|ติดต่ออย่างไร|ที่อยู่|เบอร์โทร|"
+        r"วิธีการ(?!จด|สมัคร|ขอ|ยื่น)|วิธี(?!จด|สมัคร|ขอ|ยื่น|ีเดียว|ีชีวิต))",
         re.IGNORECASE,
     )
     # Action patterns — user wants to perform a registration/application step.
@@ -1814,9 +1844,11 @@ class PersonaSupervisor:
         #   - "topic" slot: a legal phrase IS a valid topic selection
         #   - "operation_group" slot: options contain legal keywords (จดทะเบียน, ต่ออายุ, etc.)
         #   - "registration_type" slot: options contain terms like บริษัทจำกัด that match LEGAL_SIGNAL_RE
+        #   - "department" slot: user naming a dept (e.g. "กรมพัฒนาธุรกิจการค้า") triggers LEGAL_SIGNAL_RE
+        #     but IS a valid slot answer and must not be treated as a new legal question
         _ps = ctx.get("pending_slot")
         pending_key = str((_ps.get("key") if isinstance(_ps, dict) else None) or "")
-        _SLOT_REPLY_ALWAYS = {"topic", "operation_group", "registration_type"}
+        _SLOT_REPLY_ALWAYS = {"topic", "operation_group", "registration_type", "department"}
         if pending_key not in _SLOT_REPLY_ALWAYS and self._looks_like_legal_question(user_input):
             _LOG.info(
                 "[Supervisor] pending_slot(%r) skipped — input looks like new legal question: %r",
@@ -2381,7 +2413,14 @@ class PersonaSupervisor:
             # Non-topic slot (e.g. registration_type=นิติบุคคล) → cross-persona slot memory
             # so Academic mode can read it via state.get_collected_slots()
             try:
-                state.save_collected_slot(pending["key"], str(mapped))
+                _slot_key_sv = pending["key"]
+                _slot_val_sv = str(mapped)
+                state.save_collected_slot(_slot_key_sv, _slot_val_sv)
+                # Normalize: if key='choice' but value is entity type → also save as entity_type
+                # This happens when LLM asks entity_type question but _infer_slot_key falls back to 'choice'
+                if _slot_key_sv == "choice" and _slot_val_sv in ("นิติบุคคล", "บุคคลธรรมดา", "นิติ"):
+                    state.save_collected_slot("entity_type", _slot_val_sv)
+                    _LOG.info("[Supervisor] normalized choice→entity_type: %r", _slot_val_sv)
             except Exception:
                 pass
 
@@ -2539,10 +2578,13 @@ class PersonaSupervisor:
                     "entity_type_normalized", "registration_type", "department",
                     "fees", "operation_duration", "service_channel",
                     "operation_steps", "identification_documents", "research_reference",
+                    "legal_regulatory",     # บทลงโทษ ค่าปรับ ข้อกำหนดทางกฎหมาย
+                    "terms_and_conditions", # หน้าที่และเงื่อนไขของผู้ประกอบการ
                 })
                 _PT_FIELD_CAPS = {
                     "operation_steps": 600, "identification_documents": 700,
                     "research_reference": 3200, "fees": 120, "service_channel": 200,
+                    "legal_regulatory": 2000, "terms_and_conditions": 800,
                 }
                 for _lt_item in _lt_unique:
                     _tq = _TOPIC_QUERIES_PT.get(_lt_item, _lt_item)
@@ -4104,7 +4146,8 @@ class PersonaSupervisor:
         # If input has NO legal/business signal AND is not a number AND is not a greeting,
         # deflect immediately (saves style+typo+fallback_intent+deflect ~4 LLM calls).
         # Conditions to NOT short-circuit: legal signal present, number, question mark (might
-        # be a legal question phrased as question), or looks like greeting/thanks.
+        # be a legal question phrased as question), greeting/thanks, or depth/detail request
+        # (e.g. "ขอแบบละเอียด" "อธิบายละเอียด" "เชิงลึก" — must reach 2.3 to switch to Academic).
         if (
             raw_stripped
             and not self._LEGAL_SIGNAL_RE.search(raw_stripped)
@@ -4113,6 +4156,7 @@ class PersonaSupervisor:
             and not self._QUESTION_MARKERS_RE.search(raw_stripped)
             and not self._looks_like_greeting_or_thanks(raw_stripped)
             and not self._looks_like_legal_question(raw_stripped)
+            and not self._DEPTH_DETAIL_RE.search(raw_stripped)  # ← NEW: depth requests go to Academic
         ):
             _LOG.info("[Supervisor] 2.2c early_offtopic → deflect input=%r", raw_stripped[:60])
             return self._handle_deflect(state, raw_stripped)
@@ -4127,15 +4171,11 @@ class PersonaSupervisor:
         # Heuristic: wants_long + short input (≤10 words) + explicit depth modifier present.
         _raw_is_legal = self._looks_like_legal_question(raw_stripped)
         style = self._infer_user_style_request_hybrid(raw_stripped)
-        _DEPTH_MODIFIER_RE = re.compile(
-            r"(แบบละเอียด|ละเอียดกว่า|ละเอียดหน่อย|ละเอียดขึ้น|เชิงลึก|แบบเต็ม|ครบถ้วน|ทั้งหมดเลย|แบบวิชาการ|อธิบายละเอียด)",
-            re.IGNORECASE,
-        )
         _is_short_depth_followup = (
             style.get("wants_long")
             and _raw_is_legal
             and len(raw_stripped.split()) <= 10
-            and bool(_DEPTH_MODIFIER_RE.search(raw_stripped))
+            and bool(self._DEPTH_DETAIL_RE.search(raw_stripped))
         )
         if style.get("wants_long") and (not _raw_is_legal or _is_short_depth_followup):
             return self._silent_switch_to_academic(state, raw_stripped)
@@ -4256,7 +4296,9 @@ class PersonaSupervisor:
             #   - "topic": a legal phrase IS a valid topic selection
             #   - "operation_group": options contain legal keywords (จดทะเบียน, ต่ออายุ, etc.)
             #   - "registration_type": option text triggers LEGAL_SIGNAL_RE (บริษัทจำกัด etc.)
-            _INTERRUPT_EXEMPT = {"topic", "operation_group", "registration_type"}
+            #   - "department": user naming a dept (e.g. "กรมพัฒนาธุรกิจการค้า") triggers LEGAL_SIGNAL_RE
+            #     but is a valid slot fill — must not clear the dept slot and re-ask
+            _INTERRUPT_EXEMPT = {"topic", "operation_group", "registration_type", "department"}
             _int_ps = (state.context or {}).get("pending_slot")
             if isinstance(_int_ps, dict) and _int_ps.get("key") not in _INTERRUPT_EXEMPT and _int_ps.get("key"):
                 _LOG.info(
