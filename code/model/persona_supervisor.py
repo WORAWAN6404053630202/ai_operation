@@ -1996,11 +1996,20 @@ class PersonaSupervisor:
                 loc = ((md or {}).get("location") or "").strip()
                 if loc and loc not in ("nan", "None"):
                     location_opts.add(loc)
-                    # Use operation_topic as display label if it contains the location name
+                    # Extract clean label from operation_topic:
+                    # topic may be "ร้านค้าตั้งอยู่ในเขต กรุงเทพฯ และปริมณฑล"
+                    # → strip prefix patterns to get just "กรุงเทพฯ และปริมณฑล"
                     topic = ((md or {}).get("operation_topic") or "").strip()
                     if topic and loc in topic and topic != loc:
-                        # topic is more descriptive (e.g. 'กรุงเทพฯ และปริมณฑล') → use it
-                        _loc_display[loc] = topic
+                        import re as _re
+                        # Strip common Thai prefix phrases before the location name
+                        # e.g. "ร้านค้าตั้งอยู่ในเขต กรุงเทพฯ และปริมณฑล" → "กรุงเทพฯ และปริมณฑล"
+                        _clean = _re.sub(
+                            r"^.*?(?:ตั้งอยู่ในเขต|ตั้งอยู่ใน|อยู่ในเขต|อยู่ใน|ในเขต|ในพื้นที่|เขต|พื้นที่|จังหวัด)\s*",
+                            "", topic, flags=_re.IGNORECASE
+                        ).strip()
+                        # If clean result still contains the loc → use it, else fall back to loc itself
+                        _loc_display[loc] = _clean if (loc in _clean and _clean != loc) else loc
             if len(location_opts) >= 2:
                 _display_opts = [_loc_display.get(loc, loc) for loc in sorted(location_opts)]
                 slots.append({
