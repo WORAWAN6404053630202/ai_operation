@@ -4267,22 +4267,22 @@ class PersonaSupervisor:
 
         if fallback_intent == "new_topic":
             _LOG.info("[Supervisor] fallback_llm→new_topic input=%r", raw_stripped[:40])
-            # Guard: LLM may misclassify follow-ups (link/elaborate requests) as new_topic.
-            # If user has active context AND query is link/follow-up → route practical instead.
+            # Option B: if active context AND user didn't explicitly ask for a topic menu
+            # → treat as legal_question (retrieve + practical) instead of opening menu.
+            # Topic menu only when: no active context OR user explicitly says "ขอหัวข้อใหม่" etc.
             _has_active_ctx_nt = bool(
                 (state.context or {}).get("last_user_legal_query")
                 or (state.context or {}).get("last_topic")
                 or state.current_docs
             )
-            if _has_active_ctx_nt and (
-                self._LINK_REQUEST_RE.search(raw_stripped)
-                or self._ELABORATE_RE.search(raw_stripped)
-                or self._FOLLOWUP_CONTEXTUAL_RE.search(raw_stripped)
-            ):
+            _explicitly_wants_menu = bool(self._NEW_TOPIC_RE.search(raw_stripped))
+            if _has_active_ctx_nt and not _explicitly_wants_menu:
                 _last_q_nt = (state.context or {}).get("last_user_legal_query", "").strip()
-                _LOG.info("[Supervisor] new_topic overridden → active context follow-up: %r", raw_stripped[:60])
-                if _last_q_nt:
-                    self._ensure_practical_retrieval_for_legal(state, _last_q_nt)
+                _q_nt = _last_q_nt or raw_stripped
+                _LOG.info("[Supervisor] new_topic → legal_question (active ctx, no explicit menu request): %r", raw_stripped[:60])
+                state.context["last_user_legal_query"] = raw_stripped
+                self._ensure_practical_retrieval_for_legal(state, _q_nt)
+                self._maybe_build_slot_queue_from_docs(state, raw_stripped)
                 st2, reply = self._practical.handle(state, raw_stripped, _internal=False)
                 reply = self._normalize_male(reply)
                 self._add_assistant(st2, reply)
