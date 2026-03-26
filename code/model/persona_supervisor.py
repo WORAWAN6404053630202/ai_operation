@@ -270,10 +270,14 @@ class PersonaSupervisor:
     # Link/document request — user asking for URLs, forms, guides, or downloads
     # Used to override new_topic routing when there's an active context
     _LINK_REQUEST_RE = re.compile(
-        r"(ขอลิงค์|ขอลิงก์|ส่งลิงค์|ส่งลิงก์|ลิงค์คู่มือ|ลิงก์คู่มือ"
+        r"(ขอลิงค์|ขอลิงก์|ขอลิ้งค์|ขอลิ้งก์"
+        r"|ส่งลิงค์|ส่งลิงก์|ส่งลิ้งค์|ส่งลิ้งก์"
+        r"|ลิงค์คู่มือ|ลิงก์คู่มือ|ลิ้งค์คู่มือ|ลิ้งก์คู่มือ"
         r"|ลิงค์แบบฟอร์ม|ลิงก์แบบฟอร์ม|ขอดูลิงค์|ขอดูลิงก์"
-        r"|ลิงค์(ที่|ของ|ด้วย)|ลิงก์(ที่|ของ|ด้วย)|URL"
-        r"|ดาวน์โหลด(เอกสาร|แบบฟอร์ม|คู่มือ|ไฟล์)"
+        r"|ลิงค์(ที่|ของ|ด้วย|สำหรับ)|ลิงก์(ที่|ของ|ด้วย|สำหรับ)"
+        r"|ลิ้งค์(ที่|ของ|ด้วย|สำหรับ)|ลิ้งก์(ที่|ของ|ด้วย|สำหรับ)"
+        r"|ต้องการลิ้งค์|ต้องการลิ้งก์|ต้องการลิงค์|ต้องการลิงก์"
+        r"|URL|ดาวน์โหลด(เอกสาร|แบบฟอร์ม|คู่มือ|ไฟล์)"
         r"|ขอคู่มือ|ขอดูคู่มือ|ส่งคู่มือ|คู่มือ(การ|สำหรับ|ของ)"
         r"|ขอแบบฟอร์ม|ส่งแบบฟอร์ม|แบบฟอร์ม(ที่|ของ|ด้วย))",
         re.IGNORECASE,
@@ -298,6 +302,10 @@ class PersonaSupervisor:
         r"ยกเลิก\s*(การจด|ภาษี|vat|ภพ|ทะเบียน)|เลิก\s*กิจการ|ปิด\s*กิจการ|จะ\s*ยกเลิก",
         re.IGNORECASE,
     )
+
+    # Slot question strings — defined once, reused everywhere
+    _Q_OPERATION_GROUP = "ต้องการดำเนินการเรื่องใดครับ?"
+    _Q_REGISTRATION_TYPE = "รูปแบบการจดทะเบียนของคุณเป็นแบบใดครับ?"
 
     # Multi-topic license detection: maps regex pattern → canonical license_type name in Chroma.
     # Used by _detect_license_types_from_query() to predict which licenses a query covers BEFORE retrieval.
@@ -1196,7 +1204,8 @@ class PersonaSupervisor:
     # Combined with length guard and no-specific-topic check below.
     _GENERIC_FOLLOWUP_KEYWORDS_RE = re.compile(
         r"(ขั้นตอน|การสมัคร|สมัคร|วิธีสมัคร|เอกสาร|ค่าธรรมเนียม|ค่าใช้จ่าย|"
-        r"ระยะเวลา|ช่องทางยื่น|ช่องทาง|สถานที่ยื่น|แบบฟอร์ม|ลิงก์|ลิงค์|ดาวน์โหลด|"
+        r"ระยะเวลา|ช่องทางยื่น|ช่องทาง|สถานที่ยื่น|แบบฟอร์ม"
+        r"|ลิงก์|ลิงค์|ลิ้งก์|ลิ้งค์|ดาวน์โหลด|"
         r"อยากรู้|อยากทราบ|ต้องใช้|ต้องทำ|ต้องเตรียม)",
         re.IGNORECASE,
     )
@@ -1563,7 +1572,7 @@ class PersonaSupervisor:
                         _filtered_lq.append({
                             "key": "registration_type",
                             "options": _ert_lq,
-                            "question": _slot_lq.get("question", "รูปแบบการจดทะเบียนของคุณเป็นแบบใดครับ?"),
+                            "question": _slot_lq.get("question", self._Q_REGISTRATION_TYPE),
                         })
                         _LOG.info(
                             "[Supervisor] legal_q registration_type filtered for entity=%r → %s",
@@ -1593,7 +1602,7 @@ class PersonaSupervisor:
                     remaining.append({
                         "key": "operation_group",
                         "options": _op_grps_lq,
-                        "question": "ต้องการดำเนินการเรื่องใดครับ?",
+                        "question": self._Q_OPERATION_GROUP,
                         "raw_op_map": _raw_op_map_lq,
                     })
                     _LOG.info("[Supervisor] legal_q operation_group appended → %s", _op_grps_lq)
@@ -2170,7 +2179,7 @@ class PersonaSupervisor:
                 slots.append({
                     "key": "registration_type",
                     "options": sorted(rt_opts),
-                    "question": "รูปแบบการจดทะเบียนของคุณเป็นแบบใดครับ?",
+                    "question": self._Q_REGISTRATION_TYPE,
                 })
                 seen_keys.add("registration_type")
                 _LOG.info("[Supervisor] discover_slots[%r]: registration_type → %s", license_type, sorted(rt_opts))
@@ -2761,7 +2770,7 @@ class PersonaSupervisor:
                                     _filtered_nq.append({
                                         "key": "registration_type",
                                         "options": _ert_opts,
-                                        "question": _slot.get("question", "รูปแบบการจดทะเบียนของคุณเป็นแบบใดครับ?"),
+                                        "question": _slot.get("question", self._Q_REGISTRATION_TYPE),
                                     })
                                     _LOG.info(
                                         "[Supervisor] (new-topic) registration_type filtered for entity=%r → %s",
@@ -2794,7 +2803,7 @@ class PersonaSupervisor:
                                 _new_queue.append({
                                     "key": "operation_group",
                                     "options": _op_grps_nt,
-                                    "question": "ต้องการดำเนินการเรื่องใดครับ?",
+                                    "question": self._Q_OPERATION_GROUP,
                                     "raw_op_map": _raw_op_map_nt,
                                 })
                                 _LOG.info(
@@ -3144,7 +3153,7 @@ class PersonaSupervisor:
                                         _filtered_remaining.append({
                                             "key": "registration_type",
                                             "options": _entity_rt_opts,
-                                            "question": _slot.get("question", "รูปแบบการจดทะเบียนของคุณเป็นแบบใดครับ?"),
+                                            "question": _slot.get("question", self._Q_REGISTRATION_TYPE),
                                         })
                                         _LOG.info(
                                             "[Supervisor] registration_type filtered for entity=%r → %s",
@@ -3178,7 +3187,7 @@ class PersonaSupervisor:
                                     _remaining.append({
                                         "key": "operation_group",
                                         "options": _op_groups,
-                                        "question": "ต้องการดำเนินการเรื่องใดครับ?",
+                                        "question": self._Q_OPERATION_GROUP,
                                         "raw_op_map": _raw_op_map,
                                     })
                                     _LOG.info("[Supervisor] operation_group appended to slot_queue → %s", _op_groups)
@@ -4387,11 +4396,20 @@ class PersonaSupervisor:
                 state.context.pop("pending_slot", None)
                 state.context.pop("topic_slot_queue", None)
             elif isinstance(_int_ps, dict) and _int_ps.get("key") in _INTERRUPT_EXEMPT:
-                # "topic" slot is normally exempt, BUT a full informational question
-                # should bypass the menu and be answered directly (same logic as _should_route_pending_slot_now).
-                if _int_ps.get("key") == "topic" and self._INFO_Q_RE.search(raw_stripped):
+                # "topic" slot is normally exempt, BUT bypass the menu when the user asks
+                # a specific question directly (informational, link request, or open-ended
+                # procedure/document query like วิธีการ/ต้องการลิ้งค์/ขั้นตอน).
+                _bypass_topic_slot = (
+                    _int_ps.get("key") == "topic"
+                    and (
+                        self._INFO_Q_RE.search(raw_stripped)
+                        or self._LINK_REQUEST_RE.search(raw_stripped)
+                        or self._GENERIC_FOLLOWUP_KEYWORDS_RE.search(raw_stripped)
+                    )
+                )
+                if _bypass_topic_slot:
                     _LOG.info(
-                        "[Supervisor] 2.9 topic slot: informational question bypasses menu: %r",
+                        "[Supervisor] 2.9 topic slot: direct/link/followup query bypasses menu: %r",
                         raw_stripped[:60],
                     )
                     # fall through to legal question handler below
