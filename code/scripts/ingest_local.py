@@ -23,9 +23,7 @@ SHEET_URL = (
     "edit?gid=657201027#gid=657201027"
 )
 
-# -----------------------------
 # Data normalization (ingest-time)
-# -----------------------------
 _WS_RE = re.compile(r"\s+", re.UNICODE)
 
 # Match "token token" duplicated consecutively WITH whitespace.
@@ -141,7 +139,7 @@ def main():
     dl.load_from_google_sheet(SHEET_URL, source_name="google_sheet")
     docs = dl.documents
 
-    # ✅ Step 1: Normalize text before indexing
+    # Step 1: Normalize text before indexing
     normalize_documents(docs)
 
     print(f"\n[Ingest] Indexing {len(docs)} documents...")
@@ -156,7 +154,7 @@ def main():
     print(f"[Ingest]   area_size field populated: {len(areas)}/{len(docs)} docs")
     print(f"[Ingest]   entity_type_normalized populated: {len(entities)}/{len(docs)} docs")
 
-    ingest_documents(docs, reset=True)  # ✅ wipe old local chroma before rebuild
+    ingest_documents(docs, reset=True)  # wipe old local chroma before rebuild
     print('[Ingest] ✅ Done! Start server: python code/app.py')
 
 
