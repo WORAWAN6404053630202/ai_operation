@@ -73,7 +73,7 @@ class ConversationSummarizer:
         
         self.enabled = True  # สามารถปิดได้ถ้าไม่ต้องการ
     
-    def should_summarize(self, messages: List[Dict[str, Any]], threshold: int = 10) -> bool:
+    def should_summarize(self, messages: List[Dict[str, Any]], threshold: int = 8) -> bool:
         """
         ตัดสินใจว่าควร summarize หรือยัง
         
