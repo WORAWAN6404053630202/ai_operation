@@ -402,21 +402,27 @@ class DataLoader:
         head = self._join_nonempty(head_parts)
 
         # Answer body: all actionable fields
+        # NOTE: legal_regulatory is placed early (position 2) to ensure penalty/law keywords
+        # are always embedded in the vector — they are short but critical for retrieval.
+        # identification_documents is long and can tolerate being partially truncated.
         body_parts = []
+        # NOTE: All three long fields are capped for embedding budget only.
+        # Full values are always available in metadata for the LLM to read.
+        # Caps ensure every field's keywords appear in the vector regardless of doc length.
         if md.get("operation_steps"):
-            body_parts.append(f"ขั้นตอนการดำเนินการ:\n{md['operation_steps']}")
+            body_parts.append(f"ขั้นตอนการดำเนินการ:\n{md['operation_steps'][:600]}")
+        if md.get("legal_regulatory"):
+            body_parts.append(f"ข้อกำหนดกฎหมาย/บทลงโทษ:\n{md['legal_regulatory'][:300]}")
         if md.get("identification_documents"):
-            body_parts.append(f"เอกสารที่ต้องใช้:\n{md['identification_documents']}")
+            body_parts.append(f"เอกสารที่ต้องใช้:\n{md['identification_documents'][:500]}")
         if md.get("fees"):
             body_parts.append(f"ค่าธรรมเนียม:\n{md['fees']}")
         if md.get("operation_duration"):
             body_parts.append(f"ระยะเวลาดำเนินการ: {md['operation_duration']}")
         if md.get("service_channel"):
-            body_parts.append(f"ช่องทางยื่นคำขอ/ติดต่อ:\n{md['service_channel']}")
+            body_parts.append(f"ช่องทางยื่นคำขอ/ติดต่อ:\n{md['service_channel'][:150]}")
         if md.get("terms_and_conditions"):
             body_parts.append(f"เงื่อนไขและหลักเกณฑ์:\n{md['terms_and_conditions']}")
-        if md.get("legal_regulatory"):
-            body_parts.append(f"ข้อกำหนดกฎหมาย:\n{md['legal_regulatory']}")
         if md.get("answer_guideline"):
             body_parts.append(f"แนวคำตอบ:\n{md['answer_guideline']}")
         if md.get("restaurant_ai_document"):

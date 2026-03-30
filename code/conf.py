@@ -72,6 +72,7 @@ LLM_DOCS_MAX_ACADEMIC = _safe_int("LLM_DOCS_MAX_ACADEMIC", 12)    # raised: 5 �
 
 LLM_DOC_CHARS_PRACTICAL = _safe_int("LLM_DOC_CHARS_PRACTICAL", 700)   # reduced 1200→700: metadata fields carry key info
 LLM_DOC_CHARS_ACADEMIC = _safe_int("LLM_DOC_CHARS_ACADEMIC", 700)    # raised: 500 → 700 (need full metadata fields)
+PAGE_CONTENT_MAX_CHARS = _safe_int("PAGE_CONTENT_MAX_CHARS", 2500)    # raised 1800→2500: fit legal_regulatory into embedding
 
 # RAG Quality: Minimum similarity threshold
 RETRIEVAL_MIN_SIMILARITY = _safe_float("RETRIEVAL_MIN_SIMILARITY", 0.6)

@@ -1,6 +1,4 @@
-# ======================================================
 # STAGE: DEVELOP (Development Environment)
-# ======================================================
 FROM python:3.11-slim AS develop
 
 # ติดตั้ง system dependencies สำหรับ sentence-transformers
@@ -32,9 +30,7 @@ EXPOSE 3000
 # รัน uvicorn ด้วย auto-reload สำหรับ development
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3000", "--reload"]
 
-# ======================================================
 # STAGE: STAGING (Pre-production Testing)
-# ======================================================
 FROM python:3.11-slim AS staging
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -59,9 +55,7 @@ EXPOSE 3000
 # Staging: production-like (ไม่มี --reload)
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3000", "--workers", "1"]
 
-# ======================================================
 # STAGE: PRODUCTION (Optimized for Performance & Security)
-# ======================================================
 FROM python:3.11-slim AS prod
 
 # Install system dependencies

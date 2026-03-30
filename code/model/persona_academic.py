@@ -584,104 +584,124 @@ class AcademicPersonaService:
         "conditions_applicability", "entity_type", "location_scope",
     )
 
-    def _build_slot_generation_prompt(self, user_question: str, docs: List[Dict], known_slots: Dict[str, str]) -> str:
-        # Scan ALL docs for fields that vary across docs (= real branching conditions in data)
-        _DIVERSITY_KEYS = (
-            ("entity_type_normalized", "ประเภทผู้ประกอบการ"),
-            ("operation_by_department", "ประเภทการดำเนินการ"),
-            ("operation_topic", "หัวข้อย่อย"),
-            ("location", "ที่ตั้ง"),
-            ("area_size", "ขนาดพื้นที่"),
-            ("registration_type", "ประเภทการจดทะเบียน"),
-        )
-        diversity: Dict[str, set] = {}
+    # Chroma metadata fields that (a) vary across docs and (b) can be used as direct Chroma filters.
+    # Mapped to: (set of semantically-equivalent known_slot keys that mean "already answered").
+    _DIVERSITY_FIELD_EQUIV: Dict[str, frozenset] = {
+        "entity_type_normalized": frozenset({
+            "entity_type", "entity_type_normalized", "business_type",
+            "registration_type", "juristic_type",
+        }),
+        "location": frozenset({"location", "location_scope", "operation_location"}),
+        "area_size": frozenset({"area_size", "shop_area_type"}),
+        # registration_type is a sub-type of entity (e.g. บริษัทจำกัด ⊂ นิติบุคคล).
+        # Knowing entity_type does NOT answer registration_type — they are different levels.
+        # Only skip when registration_type itself is already in collected_slots.
+        "registration_type": frozenset({"registration_type"}),
+        # operation_by_department kept for query-enrichment; excluded from Chroma filter
+        # because full values may not match exactly when LLM shortens them.
+        "operation_by_department": frozenset({
+            "operation_group", "operation_type", "operation_action", "operation_by_department",
+        }),
+    }
+
+    def _compute_diversity_from_docs(
+        self, docs: List[Dict], known_slots: Dict[str, str]
+    ) -> Dict[str, List[str]]:
+        """
+        Scan docs for metadata fields whose values actually VARY across the retrieved documents
+        and are NOT already known from collected_slots.
+        Returns {field_name: [sorted distinct values]} — only Chroma-filterable fields.
+        Empty dict means no questions needed (all dimensions already determined).
+        """
+        raw: Dict[str, set] = {}
         for d in (docs or []):
-            raw_md = d.get("metadata") or {}
-            for field, _ in _DIVERSITY_KEYS:
-                v = raw_md.get(field)
+            md = d.get("metadata") or {}
+            for field in self._DIVERSITY_FIELD_EQUIV:
+                v = md.get(field)
                 if v and str(v).strip() and str(v).lower() not in ("nan", "none", ""):
-                    diversity.setdefault(field, set()).add(str(v).strip()[:80])
+                    raw.setdefault(field, set()).add(str(v).strip()[:80])
 
-        # Mapping: metadata field → set of known_slot keys that are semantically equivalent.
-        # If any equivalent key is already in known_slots, skip showing this as a "varying" field
-        # (prevents LLM from asking for something the user already answered under a different key).
-        _DIVERSITY_SKIP_IF_KNOWN = {
-            "entity_type_normalized": {"entity_type", "entity_type_normalized", "business_type",
-                                       "registration_type", "juristic_type"},
-            "operation_by_department": {"operation_group", "operation_type", "operation_action",
-                                        "operation_by_department"},
-            "registration_type":       {"registration_type", "entity_type"},
-        }
+        known_keys = set(known_slots.keys())
+        result: Dict[str, List[str]] = {}
+        for field, equiv_set in self._DIVERSITY_FIELD_EQUIV.items():
+            vals = raw.get(field)
+            if not vals or len(vals) < 2:
+                continue  # No variation → no question needed
+            if equiv_set & known_keys:
+                continue  # Already answered under some key
+            result[field] = sorted(vals)
 
+        # Merge registration_type choices into entity_type_normalized when both have diversity.
+        # Without this, the LLM creates TWO separate questions:
+        #   Q1: entity_type (บุคคลธรรมดา vs นิติบุคคล)
+        #   Q2: registration_type (บริษัทจำกัด / ห้างหุ้นส่วนจำกัด / ...)
+        # This is wrong because Q2 is conditional on Q1 = นิติบุคคล.
+        # If user picks บุคคลธรรมดา, Q2 has no valid answer.
+        #
+        # Fix: replace broad "นิติบุคคล" label with its sub-types in the combined choices.
+        # Result: ONE question — ก)บุคคลธรรมดา ข)บริษัทจำกัด ค)ห้างหุ้นส่วนจำกัด ง)ห้างหุ้นส่วนสามัญ
+        if "entity_type_normalized" in result and "registration_type" in result:
+            _entity_vals = set(result["entity_type_normalized"])
+            _reg_vals = set(result["registration_type"])
+            # Drop the broad "นิติบุคคล" label — it's replaced by its specific sub-types.
+            # Keep "บุคคลธรรมดา" since it has no sub-types.
+            _combined = {v for v in _entity_vals if v != "นิติบุคคล"}
+            _combined.update(_reg_vals)
+            if len(_combined) >= 2:
+                result["entity_type_normalized"] = sorted(_combined)
+                del result["registration_type"]
+                _LOG.info(
+                    "[Academic] Merged registration_type choices into entity_type_normalized: %s",
+                    sorted(_combined),
+                )
+
+        return result
+
+    def _build_slot_generation_prompt(
+        self,
+        user_question: str,
+        docs: List[Dict],
+        known_slots: Dict[str, str],
+        diversity_data: Dict[str, List[str]],
+    ) -> str:
+        """Build LLM prompt for slot generation. diversity_data must be pre-computed via
+        _compute_diversity_from_docs — only fields with actual variation in docs."""
+
+        # Format diversity data clearly: field → exact values from Chroma
         diversity_lines = []
-        for field, label in _DIVERSITY_KEYS:
-            vals = diversity.get(field)
-            if not vals or len(vals) <= 1:
-                continue
-            # Skip if an equivalent slot is already known
-            equiv = _DIVERSITY_SKIP_IF_KNOWN.get(field, {field})
-            if equiv & set(known_slots.keys()):
-                continue
-            diversity_lines.append(f"- {label}: {sorted(vals)[:8]}")
+        for field, vals in diversity_data.items():
+            diversity_lines.append(f'  "{field}": {json.dumps(vals, ensure_ascii=False)}')
 
-        # Content snippets from first 3 docs (for context on answer shape)
-        doc_summary = []
-        for d in (docs or [])[:3]:
-            raw_md = d.get("metadata") or {}
-            md = {}
-            for key in self._SLOT_PROMPT_META_KEYS:
-                v = raw_md.get(key)
-                if v and str(v).strip() and str(v).lower() != "nan":
-                    md[key] = str(v).strip()[:120]
-            snippet = (d.get("content") or "")[:200].strip()
-            if snippet:
-                md["_content"] = snippet
-            if md:
-                doc_summary.append(md)
+        diversity_section = (
+            "\nField ที่มีค่าต่างกันใน data (นี่คือ ONLY fields ที่ถามได้):\n"
+            + "\n".join(diversity_lines)
+            + "\n"
+        )
 
         known_str = json.dumps(known_slots, ensure_ascii=False) if known_slots else "{}"
-        docs_str = json.dumps(doc_summary, ensure_ascii=False)
+        valid_keys_str = json.dumps(list(diversity_data.keys()), ensure_ascii=False)
 
-        diversity_section = ""
-        if diversity_lines:
-            diversity_section = (
-                "\nตัวแปรที่ทำให้คำตอบต่างกัน (สแกนจากเอกสารทั้งหมด — fields ที่มีหลายค่า):\n"
-                + "\n".join(diversity_lines)
-                + "\n"
-            )
-
-        return f"""หน้าที่: วิเคราะห์คำถามและเอกสาร แล้วสร้าง "ข้อมูลบริบทที่ต้องถาม" เพื่อให้ตอบถูกกรณีตามกฎหมาย
+        return f"""หน้าที่: วิเคราะห์คำถามและข้อมูล แล้วสร้างคำถามที่จำเป็นเพื่อให้ตอบได้ตรงกรณีของผู้ใช้
 
 คำถามผู้ใช้: {user_question}
 
 ข้อมูลที่รู้แล้ว (ห้ามถามซ้ำ): {known_str}
-(หมายเหตุ: key อาจต่างกันแต่ความหมายเหมือนกัน:
-  - registration_type / entity_type / business_type / juristic_type = ประเภทกิจการ
-  - operation_group / operation_type / operation_action / operation_by_department = รูปแบบการดำเนินการ เช่น จดทะเบียนใหม่/แก้ไข/ต่ออายุ/ยกเลิก
-  ถ้า known_slots มี key ใด key หนึ่งในกลุ่มข้างต้นแล้ว ให้ถือว่าทราบทั้งกลุ่ม ห้ามถามซ้ำ)
 {diversity_section}
-ตัวอย่าง metadata + เนื้อหาจากเอกสาร: {docs_str}
+กติกาเคร่งครัด (ห้ามฝ่าฝืน):
+1. `key` ต้องเป็นชื่อ field จาก list นี้เท่านั้น: {valid_keys_str}
+   ห้ามใช้ key อื่นที่ไม่อยู่ใน list — ถ้า key ไม่อยู่ใน list ระบบจะทิ้งคำถามนั้นทิ้งทั้งหมด
+2. `choices` ต้องเป็น values จาก field นั้นในรายการ "Field ที่มีค่าต่างกัน" ด้านบนเท่านั้น
+   ห้ามสร้าง choice ใหม่ที่ไม่มีใน data — คัดลอกค่าตรงๆ จากรายการด้านบน
+3. ถามเฉพาะ field ที่ถ้า user ตอบต่างกัน → จะดึงเอกสารต่างชุดกันจาก database
+   ถ้า user ตอบอย่างไรก็ได้คำตอบเดิม → ห้ามถาม
+4. ห้ามถาม "หัวข้อ/ส่วนที่อยากรู้" เช่น ขั้นตอน/เอกสาร/ค่าธรรมเนียม/ระยะเวลา
+5. ถามได้สูงสุด 4 ข้อ เรียงจาก field ที่แยก case ได้มากที่สุดก่อน
+6. กฎรวม sub-types: ถ้า entity_type_normalized มีทั้ง "บุคคลธรรมดา" และ registration sub-types
+   ให้รวม sub-types ทั้งหมดเป็น choices เดียวโดยตรง ห้ามถามสองชั้น
+7. ถ้าคำถาม user เฉพาะเจาะจงพอแล้ว หรือ fields ทั้งหมดอยู่ใน known_slots แล้ว → return slots: []
 
-กติกา:
-- ถามเฉพาะ "บริบทของผู้ใช้" ที่ทำให้ตอบถูกกรณีกฎหมาย เช่น ประเภทกิจการ, สถานะผู้ใช้, จำนวนลูกจ้าง, ที่ตั้ง, รายได้
-- ถ้า "ตัวแปรที่ทำให้คำตอบต่างกัน" ด้านบนมี field ที่ยังไม่รู้ (ไม่อยู่ใน known_slots) ให้ถาม field นั้น — นี่คือเงื่อนไขจริงในข้อมูล
-- ถ้าเอกสารมีกรณีแยกชัดเจน (เช่น ลูกจ้างใหม่ vs ลูกจ้างที่เคยมีประกันสังคม, ออนไลน์ vs ยื่นตรง, ตั้งใหม่ vs แก้ไข/เปลี่ยนแปลง vs ยกเลิก) ให้ถามว่า user อยู่ในกรณีไหน
-- ห้ามถาม "หัวข้อ/ส่วนที่อยากรู้" เช่น ขั้นตอน/เอกสาร/ค่าธรรมเนียม/ระยะเวลา — ระบบจัดการส่วนนี้แยกต่างหากแล้ว
-- ถ้ามีตัวเลือกชัดเจนจากเอกสาร ให้ใส่ใน choices — ห้ามใส่ตัวอย่าง "(เช่น ...)" ใน question text เด็ดขาด ตัวเลือกต้องอยู่ใน choices เท่านั้น
-- ถ้าไม่มีตัวเลือกชัดเจน ให้ choices เป็น null — และห้ามเพิ่มตัวอย่างใน question text
-- ถ้า known_slots มี registration_type หรือ entity_type อยู่แล้ว ห้ามถามเรื่องประเภทกิจการ/ประเภทธุรกิจ/ประเภทนิติบุคคล/industry ซ้ำอีก ถือว่าทราบแล้ว
-- ถ้า known_slots มี operation_group หรือ operation_type หรือ operation_action อยู่แล้ว ห้ามถามเรื่องรูปแบบการดำเนินการ (จดทะเบียนใหม่/แก้ไข/ต่ออายุ/ยกเลิก) ซ้ำอีก ถือว่าทราบแล้ว
-- ภาษาไทย สุภาพ เข้าใจง่าย เหมาะกับคนทั่วไป (ไม่ใช่ภาษากฎหมาย)
-- ถามได้สูงสุด 4 ข้อ ห้ามถามเกินนี้เด็ดขาด
-- ทุกข้อต้องผ่านเกณฑ์นี้: "ถ้า user ตอบต่างกัน → เนื้อหาคำตอบที่ให้จะต่างกันด้วย" — ถ้าคำตอบไหนของ user ก็ได้รับข้อมูลชุดเดิม ห้ามถามข้อนั้น
-- จัดลำดับก่อน-หลังตามผลกระทบต่อคำตอบ: ถามข้อที่แยก case ได้มากที่สุดก่อน (เช่น location/entity_type ก่อน รายละเอียดปลีกย่อยทีหลัง)
-- ถ้าคำถามที่ user ถามเฉพาะเจาะจงมากพอแล้ว อาจไม่ต้องถาม slot เลยก็ได้ (return slots เป็น list ว่าง)
-- กฎรวม sub-types (สำคัญมาก): ถ้า choices ระดับบนสุด (เช่น "บุคคลธรรมดา" vs "นิติบุคคล") มี sub-types ที่ปรากฏในเอกสารและมีขั้นตอน/เอกสารต่างกัน ให้รวมทุก sub-type เป็น choices เดียวกันโดยตรง ห้ามถามสองชั้น
-  ตัวอย่างดี: choices: ["บุคคลธรรมดา", "บริษัทจำกัด", "ห้างหุ้นส่วนจำกัด", "ห้างหุ้นส่วนสามัญ"]
-  ตัวอย่างห้าม: ถาม "บุคคลธรรมดา หรือ นิติบุคคล?" แล้วค่อยถาม sub-type แยกอีก 1 รอบ
-
-ตอบเป็น JSON เท่านั้น:
-{{"slots": [{{"key": "entity_type", "question": "ร้านของคุณเปิดในนามอะไรครับ?", "choices": ["บุคคลธรรมดา", "บริษัทจำกัด", "ห้างหุ้นส่วนจำกัด", "ห้างหุ้นส่วนสามัญ"]}}, {{"key": "operation_type", "question": "ต้องการดำเนินการด้านใดครับ?", "choices": ["ตั้งใหม่", "แก้ไข/เปลี่ยนแปลง", "ยกเลิก"]}}]}}"""
+ตอบ JSON เท่านั้น:
+{{"slots": [{{"key": "entity_type_normalized", "question": "ร้านของคุณเปิดในนามอะไรครับ?", "choices": ["บุคคลธรรมดา", "บริษัทจำกัด", "ห้างหุ้นส่วนจำกัด"]}}]}}"""
 
     def _parse_slots_llm_response(self, raw: str) -> List[Dict]:
         """Parse LLM JSON response into list of slot dicts. Returns [] on failure."""
@@ -739,16 +759,22 @@ class AcademicPersonaService:
         - already-known slots (from cross-persona memory)
 
         Strategy A (primary): lean prompt → GPT-5.1 with MAX_TOKENS_ACADEMIC_SLOTS
-        Strategy B (retry fallback): question-only prompt → same model, minimal context
-        Returns empty string ONLY when all slots already known / question is specific enough.
-        Never silently skips slots due to LLM error — always retries before giving up.
+        Strategy B (retry fallback): minimal prompt, same diversity constraints
+        Returns empty string when no questions needed (all slots known / no variation in data).
         """
         ctx = state.context or {}
         user_q = ctx.get("academic_question", "")
         known_slots = state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}
 
-        # ── Strategy A: lean prompt (key metadata fields only, 3 docs max) ──
-        prompt_a = self._build_slot_generation_prompt(user_q, state.current_docs or [], known_slots)
+        # Pre-compute which fields actually vary in the docs and are not yet known.
+        # Fast path: if nothing varies → no questions to ask, go straight to sections.
+        diversity_data = self._compute_diversity_from_docs(state.current_docs or [], known_slots)
+        if not diversity_data:
+            _LOG.info("[Academic] No varying data fields beyond known slots — skipping slot questions")
+            return ""
+
+        # ── Strategy A: lean prompt constrained to diversity fields ──
+        prompt_a = self._build_slot_generation_prompt(user_q, state.current_docs or [], known_slots, diversity_data)
         slots_data: List[Dict] = []
         try:
             resp = llm_invoke(self.llm_slots, [HumanMessage(content=prompt_a)], logger=_LOG, label="Academic/slots", state=state)
@@ -756,22 +782,26 @@ class AcademicPersonaService:
         except Exception as e:
             _LOG.warning("[Academic] Slot generation (A) failed: %s — retrying with lean prompt", e)
 
-        # ── Strategy B: question-only prompt (no metadata, smallest possible prompt) ──
+        # ── Strategy B: minimal fallback — also constrained to diversity fields ──
         if not slots_data:
             known_str = json.dumps(known_slots, ensure_ascii=False) if known_slots else "{}"
+            diversity_str = "\n".join(
+                f'  "{field}": {json.dumps(vals, ensure_ascii=False)}'
+                for field, vals in diversity_data.items()
+            )
+            valid_keys_str = json.dumps(list(diversity_data.keys()), ensure_ascii=False)
             prompt_b = (
                 f"หน้าที่: สร้างคำถามที่จำเป็นเพื่อให้ตอบคำถามนี้ได้ตรงกรณี\n"
                 f"คำถามผู้ใช้: {user_q}\n"
                 f"ข้อมูลที่รู้แล้ว (ห้ามถามซ้ำ): {known_str}\n\n"
-                f"กติกา:\n"
-                f"- สร้างเฉพาะคำถามที่จำเป็นต่อหัวข้อนี้ สูงสุด 4 ข้อ เฉพาะที่ทำให้คำตอบแตกต่างกันจริงๆ\n"
-                f"- ถ้าคำถาม user เฉพาะเจาะจงพอแล้ว ให้ return slots เป็น list ว่าง\n"
-                f"- ห้ามถามว่าอยากรู้เรื่องอะไร (ขั้นตอน/เอกสาร/ค่าธรรมเนียม/ระยะเวลา) — ระบบมีเมนูเลือกส่วนแยกไว้แล้ว\n"
-                f"- ถามเฉพาะ 'บริบทของผู้ใช้' ที่ทำให้ตอบถูกกรณีกฎหมาย เช่น ประเภทกิจการ, สถานะ, จำนวนลูกจ้าง, ที่ตั้ง\n"
-                f"- ถ้า known_slots มี operation_group/operation_type/operation_action อยู่แล้ว ห้ามถามรูปแบบการดำเนินการซ้ำ\n"
-                f"ตอบ JSON เท่านั้น:\n"
-                f'[{{"key":"location","question":"ร้านตั้งอยู่ที่ไหนครับ?","choices":["กรุงเทพฯ","ต่างจังหวัด"]}}]'
-                f'\nรูปแบบ: {{"slots": [...]}}'
+                f"Fields ที่มีค่าต่างกันใน data (ถามได้เฉพาะ fields เหล่านี้):\n{diversity_str}\n\n"
+                f"กติกาเคร่งครัด:\n"
+                f"- `key` ต้องเป็น field จาก list นี้เท่านั้น: {valid_keys_str}\n"
+                f"- `choices` ต้องเป็น values จากรายการด้านบนเท่านั้น — คัดลอกค่าตรงๆ\n"
+                f"- ถามเฉพาะที่ทำให้ตอบต่างกันจริงๆ สูงสุด 4 ข้อ\n"
+                f"- ห้ามถามว่าอยากรู้เรื่องอะไร (ขั้นตอน/เอกสาร/ค่าธรรมเนียม)\n"
+                f"- ถ้าไม่จำเป็น return {{\"slots\": []}}\n"
+                f"ตอบ JSON: {{\"slots\": [...]}}"
             )
             try:
                 resp_b = llm_invoke(self.llm_slots, [HumanMessage(content=prompt_b)], logger=_LOG, label="Academic/slots_retry", state=state)
@@ -812,6 +842,13 @@ class AcademicPersonaService:
         _known_has_op_group = bool(known_slots.keys() & _OPERATION_GROUP_KEYS)
         if _known_has_op_group:
             needed = [s for s in needed if s.get("key") not in _OPERATION_GROUP_KEYS]
+
+        # Post-validate: only keep slots whose key is in diversity_data.
+        # Prevents hallucinated keys (e.g. "shop_type", "employee_count") from reaching users.
+        _valid_diversity_keys = set(diversity_data.keys())
+        needed = [s for s in needed if s.get("key") in _valid_diversity_keys]
+        _LOG.info("[Academic] After key validation: %d slots remain (valid keys: %s)",
+                  len(needed), list(_valid_diversity_keys))
 
         # Hard cap: max 4 slots regardless of LLM output
         needed = needed[:4]
@@ -881,6 +918,36 @@ class AcademicPersonaService:
                 per_map = slot_choice_maps.get(key, {})
                 val = per_map.get(label) or per_map.get(label.lower()) or choice_map.get(label) or label
                 if val:
+                    # Special handling for entity_type_normalized when choices were merged with
+                    # registration sub-types (from _compute_diversity_from_docs merge logic).
+                    # If the user's answer is a specific sub-type (e.g. บริษัทจำกัด), we must:
+                    #   1. Save registration_type = original answer (บริษัทจำกัด)
+                    #   2. Normalize entity_type_normalized = "นิติบุคคล" (not บริษัทจำกัด)
+                    # Without this, the Chroma filter would look for entity_type_normalized="บริษัทจำกัด"
+                    # which doesn't exist — it would find 0 docs.
+                    if key == "entity_type_normalized":
+                        try:
+                            from service.data_loader import DataLoader as _DL
+                            _normalized = _DL._normalize_entity_type(val)
+                        except Exception:
+                            _normalized = None
+                        if _normalized and _normalized != val:
+                            # val is a registration sub-type — save both registration_type and normalized entity
+                            slots["registration_type"] = val
+                            slots[key] = _normalized
+                            try:
+                                state.save_collected_slot("registration_type", val)
+                            except Exception as _e:
+                                _LOG.warning("[Academic] save_collected_slot failed key='registration_type' val=%r: %s", val, _e)
+                            try:
+                                state.save_collected_slot(key, _normalized)
+                            except Exception as _e:
+                                _LOG.warning("[Academic] save_collected_slot failed key=%r val=%r: %s", key, _normalized, _e)
+                            _LOG.info(
+                                "[Academic] entity_type_normalized merged-answer: %r → entity=%r reg=%r",
+                                val, _normalized, val,
+                            )
+                            continue
                     slots[key] = val
                     try:
                         state.save_collected_slot(key, val)
@@ -899,6 +966,100 @@ class AcademicPersonaService:
         slots["raw"] = resolved_raw
         ctx["academic_slots"] = slots
         state.context = ctx
+
+    def _re_retrieve_with_slots(self, state: ConversationState) -> None:
+        """
+        After academic slot answers are saved, re-retrieve docs from Chroma using those
+        slot values as metadata filters. Only applies to Chroma-filterable fields
+        (entity_type_normalized, location, area_size, registration_type).
+        operation_by_department is used for query enrichment (not direct filter) because
+        its stored values are long descriptions that may not match the LLM-shortened choices.
+
+        Falls back to existing docs if filtered retrieval returns 0 results.
+        """
+        ctx = state.context or {}
+        slots = ctx.get("academic_slots") or {}
+
+        # Fields that map cleanly to Chroma metadata keys for exact-match filtering
+        _DIRECT_FILTER_FIELDS = frozenset({
+            "entity_type_normalized", "location", "area_size", "registration_type",
+        })
+
+        filter_parts: List[Dict] = []
+        query_enrichments: List[str] = []
+        query = (ctx.get("academic_question") or "").strip()
+
+        for key, val in slots.items():
+            if key == "raw":
+                continue
+            sv = (str(val) if val else "").strip()
+            if not sv or sv.lower() in ("nan", "none", ""):
+                continue
+
+            if key == "entity_type_normalized":
+                # Always include universal docs (entity_type_normalized='')
+                filter_parts.append({
+                    "$or": [
+                        {"entity_type_normalized": sv},
+                        {"entity_type_normalized": ""},
+                    ]
+                })
+            elif key in _DIRECT_FILTER_FIELDS:
+                filter_parts.append({key: sv})
+            elif key == "operation_by_department":
+                # Query enrichment only — stored values may differ from displayed choice text
+                if sv not in query:
+                    query_enrichments.append(sv)
+
+        if not filter_parts and not query_enrichments:
+            return  # Nothing to filter or enrich
+
+        # Enrich query with operation context
+        if query_enrichments:
+            query = f"{query} {' '.join(query_enrichments)}".strip()
+            _LOG.info("[Academic] slot re-retrieve: query enriched with %r", query_enrichments)
+
+        if not filter_parts:
+            if query_enrichments:
+                # No direct Chroma filter but we have query enrichments (e.g. operation_by_department).
+                # Update academic_question so the LLM prompt reflects the operation context,
+                # then do a fresh re-retrieve — the comment "will naturally be included" was wrong:
+                # _finalize_answer uses academic_question as-is without re-retrieving.
+                state.context["academic_question"] = query
+                new_docs_qe = self._retrieve_docs(query)
+                if new_docs_qe:
+                    state.current_docs = new_docs_qe
+                    if hasattr(state, "last_retrieval_query"):
+                        state.last_retrieval_query = query
+                    _LOG.info(
+                        "[Academic] Re-retrieved %d docs with query enrichment (operation_by_department)",
+                        len(new_docs_qe),
+                    )
+                else:
+                    _LOG.info(
+                        "[Academic] Query enrichment re-retrieve 0 docs — keeping existing, academic_question updated"
+                    )
+            return
+
+        # Build combined Chroma filter
+        chroma_filter: Dict = filter_parts[0] if len(filter_parts) == 1 else {"$and": filter_parts}
+
+        # Re-retrieve using _retrieve_docs (handles fallback + logging)
+        new_docs = self._retrieve_docs(query, metadata_filter=chroma_filter)
+        if new_docs:
+            state.current_docs = new_docs
+            # Update stored query so staleness check reflects the new enriched query
+            if hasattr(state, "last_retrieval_query"):
+                state.last_retrieval_query = query
+            _LOG.info(
+                "[Academic] Re-retrieved %d docs after slot answers (filter=%r)",
+                len(new_docs), chroma_filter,
+            )
+        else:
+            _LOG.info(
+                "[Academic] Slot re-retrieval returned 0 docs — keeping existing %d docs",
+                len(state.current_docs or []),
+            )
 
     # Stage 2.2: dynamic section menu (only what exists)
     def _available_sections_from_docs(self, state: ConversationState) -> List[Dict[str, str]]:
@@ -1399,8 +1560,9 @@ Return JSON:
                     return state, q
                 # All slots already known — fall through to sections below
 
-            # Otherwise treat as slot answer (do NOT retrieve again here)
+            # Otherwise treat as slot answer — save then re-retrieve with slot filters
             self._save_slots_best_effort(state, user_text)
+            self._re_retrieve_with_slots(state)
 
             q2 = self._ask_sections(state)
 

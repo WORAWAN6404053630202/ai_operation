@@ -206,7 +206,7 @@ class PracticalPersonaService:
     )
 
     _LEGAL_SIGNAL_RE = re.compile(
-        r"(ใบอนุญาต|จดทะเบียน|ทะเบียนพาณิชย์|ภาษี|vat|ภพ\.?20|สรรพากร|เทศบาล|สำนักงานเขต|สุขาภิบาล|กรม|ค่าธรรมเนียม|เอกสาร|ขั้นตอน|บทลงโทษ|ประกาศ|พ\.ร\.บ|เปิดร้าน|ประกันสังคม|กองทุน)",
+        r"(ใบอนุญาต|จดทะเบียน|ทะเบียนพาณิชย์|ภาษี|vat|ภพ\.?20|สรรพากร|เทศบาล|สำนักงานเขต|สุขาภิบาล|กรม|ค่าธรรมเนียม|เอกสาร|ขั้นตอน|บทลงโทษ|ประกาศ|พ\.ร\.บ|เปิดร้าน|ประกันสังคม|กองทุน|งบการเงิน|ผลกระทบ|ความเสี่ยง)",
         re.IGNORECASE,
     )
 
@@ -438,30 +438,6 @@ class PracticalPersonaService:
             "",
             t,
         )
-        # Preserve newlines — only collapse horizontal whitespace (spaces/tabs)
-        t = re.sub(r"[ \t]+", " ", t)
-        # Convert indented numbered sub-items to bullets
-        # e.g. "   1. ระวางโทษ..." → "   • ระวางโทษ..."
-        t = re.sub(r'(?m)^([ \t]{2,})\d+[).]\s+', r'\1• ', t)
-        # Split emoji section header from first numbered item on the same line
-        # e.g. "📋 ขั้นตอนการดำเนินการ 1. เข้าสู่ระบบ" → split before "1."
-        t = re.sub(
-            r'([\u2600-\u27BF\U0001F300-\U0001FFFF][^\n]*?[ก-๙])\s+(\d+[).]\s)',
-            r'\1\n\2',
-            t,
-        )
-        # Insert newlines before numbered sections (1) or 1. format) and bullet points if missing
-        # Use negative lookahead (?!\d) to avoid splitting sub-steps like 1.1, 1.2 → "1. 1"
-        t = re.sub(r"(?<!\n)\s+(\d+[).])(?!\d)\s*", r"\n\1 ", t)
-        # Insert newlines before sub-steps like 1.1, 1.2, 2.3 (indent with 2 spaces)
-        t = re.sub(r"(?<!\n)\s+(\d+\.\d+)\s+", r"\n  \1 ", t)
-        t = re.sub(r"(?<!\n)\s+([-•*])\s+(?!\d)", r"\n\1 ", t)
-        # Insert newlines before emoji-prefixed steps (✅ ❌ 🔴 etc.) that start a new step
-        t = re.sub(r"(?<!\n)\s+([\u2705\u274c\u26a0\u2139\U0001F4CB\U0001F4CC\U0001F4CD\U0001F4CE\U0001F4CF\U0001F534\U0001F7E2\U0001F7E1\U0001F7E0\U0001F535])", r"\n\1", t)
-        t = "\n".join(ln.strip() for ln in t.split("\n") if ln.strip())
-        # Collapse "label line\nshort-value line" where value is a number/time/unit (≤25 chars).
-        # Fixes LLM splitting "ตัดรอบเวลา\n22.00 น." → "ตัดรอบเวลา 22.00 น."
-        t = re.sub(r"([^\n]+[ก-๙])\n(\d[^\n]{0,24})(?=\n|$)", r"\1 \2", t)
 
         if "?" in t or "？" in t:
             # Only strip at a "?" if what follows looks like a new question sentence or menu option,
@@ -1749,14 +1725,14 @@ class PracticalPersonaService:
 
         self._debug_log("pre_llm", query=user_text, docs_json=docs_json)
 
-        # 🎯 Token: ตัด context ให้เล็กลง — เก็บเฉพาะ keys ที่ LLM ต้องการจริงๆ
+        # Token: ตัด context ให้เล็กลง — เก็บเฉพาะ keys ที่ LLM ต้องการจริงๆ
         _ctx_keys_needed = {"topic", "slots", "pending_slot", "last_user_legal_query",
                             "last_topic", "topic_slot_queue", "topic_operation_groups",
                             "collected_slots", "multi_license_topics"}
         slim_context = {k: v for k, v in (state.context or {}).items()
                         if k in _ctx_keys_needed and v not in (None, {}, [], "")}
 
-        # 🎯 Inject active topic hint so LLM never re-asks what the user already chose
+        # Inject active topic hint so LLM never re-asks what the user already chose
         _active_topic = (
             (state.context or {}).get("last_topic")
             or (state.context or {}).get("last_user_legal_query")
@@ -1994,7 +1970,17 @@ Your JSON response:
                 if not parsed_opts:
                     _inferred_key_check = self._infer_slot_key_from_question(question)
                     if _inferred_key_check == "area_size":
-                        parsed_opts = ["น้อยกว่า 200 ตารางเมตร", "มากกว่า 200 ตารางเมตร"]
+                        # Derive options from current_docs area_size metadata — NOT hardcoded.
+                        # Only use if ≥2 distinct values exist; otherwise this question has no
+                        # differentiating value and should not create a numbered menu.
+                        _area_opts_from_docs: set = set()
+                        for _d in (state.current_docs or []):
+                            _as_val = ((_d.get("metadata") or {}).get("area_size") or "").strip()
+                            if _as_val and _as_val not in ("nan", "None"):
+                                _area_opts_from_docs.add(_as_val)
+                        if len(_area_opts_from_docs) >= 2:
+                            parsed_opts = sorted(_area_opts_from_docs)
+                        # else: leave parsed_opts empty → question shown as free text or skipped
                     elif _inferred_key_check == "location_scope":
                         # Derive options from current_docs operation_topic — NOT hardcoded.
                         # This ensures the display label matches the real data
@@ -2011,9 +1997,7 @@ Your JSON response:
                                     _loc_opts_from_docs.setdefault(_dloc, _dloc)
                         if len(_loc_opts_from_docs) >= 2:
                             parsed_opts = [_loc_opts_from_docs[k] for k in sorted(_loc_opts_from_docs)]
-                        elif _loc_opts_from_docs:
-                            # Only 1 location in docs — no need to ask, but keep as-is
-                            parsed_opts = list(_loc_opts_from_docs.values())
+                        # else: only 1 (or 0) location in docs → no differentiation → skip menu
                 if parsed_opts:
                     slot_key = self._infer_slot_key_from_question(question, options=parsed_opts)
                     allow_multi = True if slot_key == self._PHASE3_SLOT_KEY else False
@@ -2090,6 +2074,69 @@ Your JSON response:
                 # Sanitize: ensure pending_slot is always dict or absent
                 if not isinstance(state.context.get("pending_slot"), (dict, type(None))):
                     state.context.pop("pending_slot", None)
+
+            # Restore truncated URLs: LLM sometimes shortens a full URL to just scheme://domain/
+            # e.g. https://edbr.dbd.go.th/termsconditions → https://edbr.dbd.go.th/
+            #
+            # Build URL pool in 3 tiers (each more expensive but broader):
+            #
+            # Tier 1: classified link lists already built above (from _docs_to_process)
+            # Tier 2: ALL retrieved docs (_all_docs) — catches URLs in docs beyond _prompt_max_docs
+            # Tier 3: Chroma metadata-only query for current license_type — catches URLs in docs
+            #         that were never retrieved at all (e.g. informational queries that retrieve
+            #         generic docs instead of the entity-specific ones with portal URLs)
+            _url_pool: set = set()
+
+            # Tier 1
+            for _, _u in (_link_service + _link_form + _link_guide):
+                if _u:
+                    _url_pool.add(_u)
+
+            # Tier 2
+            for _du in _all_docs:
+                _rr_u = str((_du.get("metadata") or {}).get("research_reference") or "").strip()
+                if _rr_u and _rr_u not in ("nan", "None"):
+                    for _, _u in _parse_link_entries(_rr_u):
+                        if _u:
+                            _url_pool.add(_u)
+
+            # Tier 3: Chroma metadata fetch for current license_type (no embedding — fast)
+            # Only run if the answer contains a URL fragment that isn't already fully known.
+            _lt_for_url = ""
+            for _d_lt in _all_docs:
+                _lt_for_url = ((_d_lt.get("metadata") or {}).get("license_type") or "").strip()
+                if _lt_for_url:
+                    break
+            if not _lt_for_url:
+                _lt_for_url = (state.context or {}).get("last_topic", "") or ""
+            if _lt_for_url:
+                try:
+                    _vs = getattr(self.retriever, "vectorstore", None)
+                    _col = getattr(_vs, "_collection", None) if _vs else None
+                    if _col is not None:
+                        _chroma_res = _col.get(
+                            where={"license_type": {"$eq": _lt_for_url}},
+                            include=["metadatas"],
+                        )
+                        for _m_c in (_chroma_res.get("metadatas") or []):
+                            _rr_c = str(_m_c.get("research_reference") or "").strip()
+                            if _rr_c and _rr_c not in ("nan", "None"):
+                                for _, _u_c in _parse_link_entries(_rr_c):
+                                    if _u_c:
+                                        _url_pool.add(_u_c)
+                except Exception as _e_url:
+                    _LOG.debug("[Practical] URL pool Chroma fetch failed: %s", _e_url)
+
+            # Sort longest first so more specific paths match before their domain prefixes
+            _all_known_urls = sorted(_url_pool, key=len, reverse=True)
+            if _all_known_urls:
+                def _restore_url_match(m: re.Match) -> str:
+                    _found = m.group(0)
+                    for _full in _all_known_urls:
+                        if _full.startswith(_found) and _full != _found:
+                            return _full
+                    return _found
+                ans = re.sub(r'https?://\S+', _restore_url_match, ans)
 
             ans = self._apply_practical_lint(ans, kind="answer")
 

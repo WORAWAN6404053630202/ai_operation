@@ -216,7 +216,9 @@ class PersonaSupervisor:
         # Remaining generic operational topics (สุรา/ภาษี context: ชื่อและที่อยู่, เพิ่ม/ลด, สำนักงาน, เบอร์)
         r"|สำนักงาน|เบอร์มือถือ|แก้ไขเปลี่ยนแปลง|ชื่อและที่อยู่|เพิ่ม.*ลด|ลด.*เพิ่ม|ประเภทสินค้า|จำนวนชื่อ"
         # Sub-step/case phrases in registration procedures (กรณีเลือก... etc.)
-        r"|กรณี)",
+        r"|กรณี"
+        # Consequence/impact/risk topics — user asking about effects/penalties/risks
+        r"|งบการเงิน|ผลกระทบ|ความเสี่ยง)",
         re.IGNORECASE,
     )
 
@@ -226,7 +228,7 @@ class PersonaSupervisor:
     # Depth/detail requests — signals user wants more elaboration on current topic.
     # These must NOT be deflected by 2.2c and must be routed to Academic persona.
     _DEPTH_DETAIL_RE = re.compile(
-        r"(แบบละเอียด|ละเอียดกว่า|ละเอียดมากกว่า|ละเอียดหน่อย|ละเอียดขึ้น|เชิงลึก|แบบเต็ม"
+        r"(แบ.?ละเอียด|ละเอียดกว่า|ละเอียดมากกว่า|ละเอียดหน่อย|ละเอียดขึ้น|เชิงลึก|แบบเต็ม"
         r"|ครบถ้วน|ทั้งหมดเลย|แบบวิชาการ|อธิบายละเอียด|แบบเต็มๆ"
         r"|ขอดูแบบละเอียด|ขอรายละเอียด|อธิบายเพิ่ม|อธิบายต่อ|อธิบายให้ชัดเจนขึ้น"
         r"|ขอเพิ่มเติม|ดูเพิ่มเติม|รายละเอียดเพิ่ม|แบบให้ลึกซึ้งยิ่งขึ้น|มากกว่านี้)",
@@ -1416,7 +1418,7 @@ class PersonaSupervisor:
         r"ต้อง.{0,15}(ไหม|มั้ย|หรือเปล่า|หรือไม่)|"
         r"ต้องทำ(ยังไง|ไง|อย่างไร|อะไร)|ทำ(ยังไง|ไง|อย่างไร)(?!\s*(การ|ธุรกิจ|บัตร))|"
         r"แตกต่าง|เปรียบเทียบ|อธิบาย|กรณีใด|เมื่อไหร่|เมื่อไร|"
-        r"จะเกิดอะไร|เกิดอะไร|จะเป็นอะไร|จะเกิดผล|"
+        r"จะเกิดอะไร|เกิดอะไร|จะเป็นอะไร|จะเกิดผล|ผลกระทบ|ความเสี่ยง|"
         r"ต้องโดน|จะถูก|จะมีผล|บทลงโทษ|โทษคือ|ค่าปรับ|"
         r"ชำรุด|สูญหาย|ทำหาย|ทำหล่น|เสียหาย|"
         r"ต้องการติดต่อ|ติดต่อได้ที่|ติดต่อที่ไหน|ติดต่อยังไง|ติดต่ออย่างไร|ที่อยู่|เบอร์โทร|"
@@ -1430,7 +1432,12 @@ class PersonaSupervisor:
         r"(อยากจด|อยากสมัคร|อยากขอ|อยากยื่น|"
         r"ต้องการจด|ต้องการสมัคร|ต้องการขอ|ต้องการยื่น|"
         r"จะจด|จะสมัคร|จะขอใบ|จะยื่น|"
-        r"วิธีจด|วิธีสมัคร|ขั้นตอนการจด|ขั้นตอนการสมัคร|ขั้นตอนการขอ)",
+        r"วิธีจด|วิธีสมัคร|ขั้นตอนการจด|ขั้นตอนการสมัคร|ขั้นตอนการขอ|"
+        r"ต้องการแก้ไข|ต้องการเปลี่ยนแปลง|ต้องการยกเลิก|ต้องการต่ออายุ|"
+        r"อยากแก้ไข|อยากเปลี่ยนแปลง|อยากยกเลิก|อยากต่ออายุ|"
+        r"จะแก้ไข|จะเปลี่ยนแปลง|จะยกเลิก|จะต่ออายุ|"
+        r"วิธีแก้ไข|วิธีเปลี่ยนแปลง|วิธียกเลิก|วิธีต่ออายุ|"
+        r"ขั้นตอนการแก้ไข|ขั้นตอนการเปลี่ยนแปลง|ขั้นตอนการยกเลิก|ขั้นตอนการต่ออายุ)",
         re.IGNORECASE,
     )
 
@@ -1448,6 +1455,40 @@ class PersonaSupervisor:
         if (state.context or {}).get("_multi_topic_retrieval"):
             _LOG.info("[Supervisor] multi-topic retrieval flag set — skipping slot queue build")
             return
+
+        # Auto-update department slot whenever user explicitly mentions a known dept in ANY query type.
+        # This covers follow-up queries like "ต้องการสมัครธนาคารไทยพาณิชย์" that aren't link requests.
+        _cs_dept_check = state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}
+        _cached_dept_any = (_cs_dept_check.get("department") or
+                            (state.context or {}).get("slots", {}).get("department") or "").strip()
+        if _cached_dept_any:
+            _available_depts_any: list = []
+            for _da in docs:
+                if not isinstance(_da, dict): continue
+                _dv_a = ((_da.get("metadata") or {}).get("department") or "").strip()
+                if _dv_a and _dv_a not in _available_depts_any:
+                    _available_depts_any.append(_dv_a)
+            _query_dept_any = next((d for d in _available_depts_any if d and d in query), None)
+            if _query_dept_any and _query_dept_any != _cached_dept_any:
+                _LOG.info("[Supervisor] dept auto-update %r → %r (from query text)", _cached_dept_any, _query_dept_any)
+                if hasattr(state, "save_collected_slot"):
+                    state.save_collected_slot("department", _query_dept_any)
+                if state.context is not None:
+                    state.context.setdefault("slots", {})["department"] = _query_dept_any
+                    if "collected_slots" in state.context:
+                        state.context["collected_slots"]["department"] = _query_dept_any
+
+        # Always persist entity_type if explicitly stated in query — even for informational/link
+        # queries that skip slot queue — so user is never re-asked on the next topic.
+        _early_et = self._infer_entity_type_from_query(query)
+        if _early_et:
+            _early_cs = state.get_collected_slots() if hasattr(state, "get_collected_slots") else {}
+            if not (_early_cs or {}).get("entity_type"):
+                if hasattr(state, "save_collected_slot"):
+                    state.save_collected_slot("entity_type", _early_et)
+                if state.context is not None:
+                    state.context.setdefault("slots", {})["entity_type"] = _early_et
+                _LOG.info("[Supervisor] entity_type pre-persisted from query text: %r", _early_et)
 
         # Intent check: informational/link-request queries should be answered directly — no slot queue needed.
         # Action signals override: "อยากจด/วิธีจด" always builds slot queue regardless.
@@ -1527,27 +1568,48 @@ class PersonaSupervisor:
                 )
                 license_types_seen = [_top]
             else:
-                _LOG.info(
-                    "[Supervisor] multi-license no dominant (%s) — presenting topic selector",
-                    license_types_seen,
-                )
-                # No dominant license: ask user which one to focus on first.
-                # Reuses "topic" slot routing — selection triggers focused retrieval + slot discovery.
-                # NOTE: do NOT set multi_license_topics; it forces action='answer' in practical
-                # and bypasses the slot-queue ask rule, giving incomplete generic answers.
-                _n_topics = len(license_types_seen[:4])
-                _topic_list_str = " / ".join(license_types_seen[:4])
-                _multi_q = (
-                    f"มีเรื่องที่เกี่ยวข้องกัน {_n_topics} เรื่องที่คุณน่าจะต้องดำเนินการ "
-                    f"({_topic_list_str}) "
-                    f"ต้องการเริ่มจากเรื่องใดก่อนครับ?"
-                )
-                state.context["topic_slot_queue"] = [{
-                    "key": "topic",
-                    "options": list(license_types_seen[:4]),
-                    "question": _multi_q,
-                }]
-                return
+                # Priority 0: if user explicitly named a license type in the query,
+                # use it directly — even when no doc-count dominant exists.
+                # Checks first 8 Thai chars of the core name (after stripping ใบ/แบบ/ระบบ prefix)
+                # to handle minor typos e.g. พาณิชย์ → พานิชย์.
+                _q_thai = re.sub(r'[^\u0E00-\u0E7F]', '', query or "")
+                _strip_pfx = re.compile(r'^(ใบ|แบบ|ระบบ|การ)')
+                _explicit_lt = None
+                for _lt_cand in license_types_seen:
+                    _lt_core = _strip_pfx.sub('', _lt_cand).strip()
+                    _match_key = _lt_core[:8]
+                    if len(_match_key) >= 5 and _match_key in _q_thai:
+                        _explicit_lt = _lt_cand
+                        break
+                if _explicit_lt:
+                    _LOG.info(
+                        "[Supervisor] multi-license: explicit mention %r in query → use as dominant",
+                        _explicit_lt,
+                    )
+                    license_types_seen = [_explicit_lt]
+                    # fall through to slot-queue build below (no return)
+                else:
+                    _LOG.info(
+                        "[Supervisor] multi-license no dominant (%s) — presenting topic selector",
+                        license_types_seen,
+                    )
+                    # No dominant license: ask user which one to focus on first.
+                    # Reuses "topic" slot routing — selection triggers focused retrieval + slot discovery.
+                    # NOTE: do NOT set multi_license_topics; it forces action='answer' in practical
+                    # and bypasses the slot-queue ask rule, giving incomplete generic answers.
+                    _n_topics = len(license_types_seen[:4])
+                    _topic_list_str = " / ".join(license_types_seen[:4])
+                    _multi_q = (
+                        f"มีเรื่องที่เกี่ยวข้องกัน {_n_topics} เรื่องที่คุณน่าจะต้องดำเนินการ "
+                        f"({_topic_list_str}) "
+                        f"ต้องการเริ่มจากเรื่องใดก่อนครับ?"
+                    )
+                    state.context["topic_slot_queue"] = [{
+                        "key": "topic",
+                        "options": list(license_types_seen[:4]),
+                        "question": _multi_q,
+                    }]
+                    return
 
         license_type = license_types_seen[0]
 
@@ -1597,8 +1659,9 @@ class PersonaSupervisor:
         # and apply entity-specific filtering + enriched retrieval + op_group slot
         _known_entity_lq: Optional[str] = None
         if "entity_type" in collected_keys:
-            # Look in both stores
-            _raw_et_lq = _cs_lq.get("entity_type") or _ctx_slots_lq.get("entity_type") or ""
+            # Prefer freshly-inferred value (_inferred_et_lq) over stale snapshots
+            # (_cs_lq / _ctx_slots_lq were loaded before entity_type was auto-saved at Step 2)
+            _raw_et_lq = _inferred_et_lq or _cs_lq.get("entity_type") or _ctx_slots_lq.get("entity_type") or ""
             try:
                 from service.data_loader import DataLoader as _DL_lq
                 _known_entity_lq = _DL_lq._normalize_entity_type(_raw_et_lq)
@@ -2112,7 +2175,7 @@ class PersonaSupervisor:
                 et = ((md or {}).get("entity_type_normalized") or "").strip()
                 if et and et not in ("nan", "None"):
                     entity_opts.add(et)
-            if entity_opts:
+            if len(entity_opts) >= 2:
                 slots.append({
                     "key": "entity_type",
                     "options": sorted(entity_opts),
@@ -2120,6 +2183,11 @@ class PersonaSupervisor:
                 })
                 seen_keys.add("entity_type")
                 _LOG.info("[Supervisor] discover_slots[%r]: entity_type → %s", license_type, sorted(entity_opts))
+            elif entity_opts:
+                _LOG.info(
+                    "[Supervisor] discover_slots[%r]: entity_type SKIPPED — only 1 value %s (no differentiation)",
+                    license_type, entity_opts,
+                )
 
             # Rule 2: shop area dimension (area keywords in registration_type)
             # Only add this slot if there are SEPARATE docs per area option
@@ -2585,6 +2653,37 @@ class PersonaSupervisor:
                 if _slot_key_sv == "choice" and _slot_val_sv in ("นิติบุคคล", "บุคคลธรรมดา", "นิติ"):
                     state.save_collected_slot("entity_type", _slot_val_sv)
                     _LOG.info("[Supervisor] normalized choice→entity_type: %r", _slot_val_sv)
+                elif _slot_key_sv == "choice":
+                    # Value may be an entity sub-type (e.g. บริษัทจำกัด, ห้างหุ้นส่วนจำกัด)
+                    # Save as both entity_type (normalized) and registration_type so slot_queue
+                    # rebuild never re-asks either slot.
+                    try:
+                        from service.data_loader import DataLoader as _DL_cs
+                        _cs_norm = _DL_cs._normalize_entity_type(_slot_val_sv)
+                        if _cs_norm:
+                            state.save_collected_slot("entity_type", _cs_norm)
+                            state.save_collected_slot("registration_type", _slot_val_sv)
+                            _LOG.info(
+                                "[Supervisor] choice sub-type %r → entity_type=%r + registration_type saved",
+                                _slot_val_sv, _cs_norm,
+                            )
+                    except Exception:
+                        pass
+                # Auto-fill registration_type when entity_type was answered with a specific sub-type.
+                # Happens when the LLM merges entity+registration into one question and user picks
+                # e.g. "บริษัทจำกัด" (not "นิติบุคคล") — the sub-type answer implicitly fills both slots.
+                if _slot_key_sv == "entity_type":
+                    try:
+                        from service.data_loader import DataLoader as _DL_at
+                        _et_norm_at = _DL_at._normalize_entity_type(_slot_val_sv)
+                        if _et_norm_at and _et_norm_at != _slot_val_sv:
+                            state.save_collected_slot("registration_type", _slot_val_sv)
+                            _LOG.info(
+                                "[Supervisor] entity_type sub-type %r → auto-fill registration_type",
+                                _slot_val_sv,
+                            )
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -3093,15 +3192,33 @@ class PersonaSupervisor:
                                  if k not in ("operation_group",) and v]
                 enriched_q_area = " ".join(filter(None, [base_q] + _area_q_parts + [_raw])).strip()
 
-                # Build metadata filter: use most specific filter available
-                # Priority: location > area_size > entity (for ใบอนุญาตจัดตั้งสถานที่ use location filter)
+                # Build combined metadata filter from all known filterable slots.
+                # When area_size is filled, also include location from collected_slots (and vice versa)
+                # so the filter targets the exact user path (e.g. กรุงเทพฯ + >200sqm), preventing
+                # ต่างจังหวัด docs from leaking in when only area_size filter is applied.
+                _filter_parts_area: List[Dict] = []
+
+                # Location: current answer takes priority, fallback to previously collected slot
+                _loc_to_use = _location_val
+                if not _loc_to_use:
+                    _collected_loc = (_all_slots_area.get("location") or "").lower()
+                    if "กรุงเทพ" in _collected_loc:
+                        _loc_to_use = "กรุงเทพฯ"
+                    elif "ต่างจังหวัด" in _collected_loc or "ต่างหวัด" in _collected_loc:
+                        _loc_to_use = "ต่างจังหวัด"
+
+                if _loc_to_use:
+                    _filter_parts_area.append({"location": _loc_to_use})
+                if _area_size_val:
+                    _filter_parts_area.append({"area_size": _area_size_val})
+
                 _meta_filter_area: dict | None = None
-                if _location_val:
-                    _meta_filter_area = {"location": _location_val}
-                elif _area_size_val:
-                    _meta_filter_area = {"area_size": _area_size_val}
-                elif _saved_entity2:
+                if not _filter_parts_area and _saved_entity2:
                     _meta_filter_area = {"entity_type_normalized": _saved_entity2}
+                elif len(_filter_parts_area) == 1:
+                    _meta_filter_area = _filter_parts_area[0]
+                elif len(_filter_parts_area) > 1:
+                    _meta_filter_area = {"$and": _filter_parts_area}
 
                 try:
                     _k_for_area = int(getattr(conf, "LLM_DOCS_MAX_PRACTICAL", 6))
@@ -4145,6 +4262,13 @@ class PersonaSupervisor:
             state.context.pop("academic_question", None)
             state.context.pop("academic_resume_available", None)
 
+        # Clear stale Practical docs so Academic always does fresh retrieval.
+        # Without this, Academic reuses docs from Practical's entity_type-filtered
+        # retrieval which may include sub-types (e.g. บริษัทมหาชน) unrelated to the
+        # user's actual registration_type (e.g. บริษัทจำกัด).
+        state.current_docs = []
+        state.last_retrieval_query = ""
+
         # Use user_input if it looks like a legal question; else replay last known topic
         ctx = state.context or {}
         if self._looks_like_legal_question(user_input):
@@ -4575,7 +4699,9 @@ class PersonaSupervisor:
                 return st2, reply
 
             self._ensure_practical_retrieval_for_legal(state, raw_stripped)
-            self._maybe_build_slot_queue_from_docs(state, raw_stripped)
+            # Skip slot queue when user explicitly asks for a link/document — answer directly
+            if not self._LINK_REQUEST_RE.search(raw_stripped):
+                self._maybe_build_slot_queue_from_docs(state, raw_stripped)
             st2, reply = self._practical.handle(state, raw_stripped, _internal=False)
             reply = self._normalize_male(reply)
             self._add_assistant(st2, reply)
@@ -4670,7 +4796,8 @@ class PersonaSupervisor:
                 _LOG.info("[Supervisor] new_topic → legal_question (active ctx, no explicit menu request): %r", raw_stripped[:60])
                 state.context["last_user_legal_query"] = raw_stripped
                 self._ensure_practical_retrieval_for_legal(state, _q_nt)
-                self._maybe_build_slot_queue_from_docs(state, raw_stripped)
+                if not self._LINK_REQUEST_RE.search(raw_stripped):
+                    self._maybe_build_slot_queue_from_docs(state, raw_stripped)
                 st2, reply = self._practical.handle(state, raw_stripped, _internal=False)
                 reply = self._normalize_male(reply)
                 self._add_assistant(st2, reply)
@@ -4694,7 +4821,8 @@ class PersonaSupervisor:
             _LOG.info("[Supervisor] fallback_llm→legal_question q=%r", q_fb[:40])
             state.context["last_user_legal_query"] = q_fb
             self._ensure_practical_retrieval_for_legal(state, q_fb)
-            self._maybe_build_slot_queue_from_docs(state, q_fb)
+            if not self._LINK_REQUEST_RE.search(raw_stripped):
+                self._maybe_build_slot_queue_from_docs(state, q_fb)
             st2, reply = self._practical.handle(state, q_fb, _internal=False)
             reply = self._normalize_male(reply)
             self._add_assistant(st2, reply)

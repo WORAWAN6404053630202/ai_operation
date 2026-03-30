@@ -186,7 +186,7 @@ class ConversationSummarizer:
         return "\n".join(formatted)
 
 
-# 🎯 Helper function สำหรับใช้ใน llm_call.py
+# Helper function สำหรับใช้ใน llm_call.py
 
 def auto_summarize_if_needed(
     state,

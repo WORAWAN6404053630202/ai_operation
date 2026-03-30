@@ -14,8 +14,8 @@ if str(project_root) not in sys.path:
 if str(code_dir) not in sys.path:
     sys.path.insert(0, str(code_dir))
 
-from code.service.data_loader import DataLoader
-from code.service.local_vector_store import ingest_documents
+from service.data_loader import DataLoader
+from service.local_vector_store import ingest_documents
 from langchain_core.documents import Document
 
 SHEET_URL = (
