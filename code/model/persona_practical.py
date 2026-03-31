@@ -1592,7 +1592,7 @@ class PracticalPersonaService:
             "legal_regulatory": 2000,      # บทลงโทษ — ข้อมูลจริงยาว ~2000 chars
             "terms_and_conditions": 800,   # เงื่อนไขผู้ประกอบการ
         }
-        _LONG_FIELDS_DEDUP = {"operation_steps"}  # identification_documents varies by entity_type — never dedup
+        _LONG_FIELDS_DEDUP = {"operation_steps", "legal_regulatory", "terms_and_conditions"}  # identification_documents varies by entity_type — never dedup
 
         # Cap docs sent to LLM: _prompt_max_docs per license_type to control token usage.
         # For multi-license, each license still gets its own metadata via dedup logic below.
